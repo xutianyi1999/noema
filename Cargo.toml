@@ -6,17 +6,16 @@ description = "OpenCode-driven isolated text knowledge-base service"
 license = "MIT"
 
 [dependencies]
-async-trait = "0.1"
 axum = "0.8"
 chrono = { version = "0.4", features = ["serde", "clock"] }
 hex = "0.4"
 opencode_rs = { path = "/mnt/data/code/agentic_auxilary/crates/services/opencode-rs", features = ["http", "sse"] }
 rmcp = { version = "3.1.0", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
-rusqlite = { version = "0.37", features = ["bundled"] }
-schemars = "1.0"
+rusqlite = { version = "0.40", features = ["bundled"] }
+schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-sha2 = "0.10"
+sha2 = "0.11"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
@@ -25,6 +24,8 @@ uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2.5"
 
 [dev-dependencies]
+rmcp = { version = "3.1.0", default-features = false, features = ["client", "transport-streamable-http-client-reqwest"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
 tempfile = "3"
 tower = { version = "0.5", features = ["util"] }
 

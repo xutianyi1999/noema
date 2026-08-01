@@ -565,48 +565,70 @@ impl Storage {
     ) -> Result<Vec<Reference>, AppError> {
         let root = self.library_root(library_id)?;
         let mut references = Vec::new();
-        for line in answer.lines() {
-            for prefix in ["raw/", "wiki/"] {
-                let Some(start) = line.find(prefix) else {
-                    continue;
-                };
-                let candidate = line[start..]
-                    .split_whitespace()
-                    .next()
-                    .unwrap_or_default()
-                    .trim_matches(['`', '*', '[', '(', ')', ',', '.', ';', ':'].as_ref());
-                let path = root.join(candidate);
-                if is_safe_reference(candidate, prefix)
-                    && path.is_file()
-                    && !references
-                        .iter()
-                        .any(|item: &Reference| item.source == candidate)
-                {
-                    let title = Path::new(candidate)
+        // Real answers cite paths with locators and mixed punctuation, e.g.
+        // `raw/abc-source.md:5-7,15；wiki/concept.md:24）`. Take the maximal
+        // run of path-safe characters at every `raw/` / `wiki/` occurrence
+        // instead of splitting on whitespace.
+        let mut occurrences: Vec<(usize, &str)> = ["raw/", "wiki/"]
+            .iter()
+            .flat_map(|prefix| {
+                answer
+                    .match_indices(prefix)
+                    .map(|(start, _)| (start, *prefix))
+            })
+            .collect();
+        occurrences.sort_unstable_by_key(|(start, _)| *start);
+        for (start, prefix) in occurrences {
+            let Some(candidate) = reference_candidate(answer, start) else {
+                continue;
+            };
+            let path = root.join(&candidate);
+            if is_safe_reference(&candidate, prefix)
+                && path.is_file()
+                && !references
+                    .iter()
+                    .any(|item: &Reference| item.source == candidate)
+            {
+                let title = Path::new(&candidate)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(&candidate)
+                    .to_string();
+                let node = if candidate.starts_with("raw/") {
+                    let stem = Path::new(&candidate)
                         .file_stem()
                         .and_then(|value| value.to_str())
-                        .unwrap_or(candidate)
-                        .to_string();
-                    let node = if candidate.starts_with("raw/") {
-                        let stem = Path::new(candidate)
-                            .file_stem()
-                            .and_then(|value| value.to_str())
-                            .unwrap_or_default();
-                        let node = format!("wiki/{stem}.md");
-                        root.join(&node).is_file().then_some(node)
-                    } else {
-                        None
-                    };
-                    references.push(Reference {
-                        title,
-                        source: candidate.into(),
-                        node,
-                    });
-                }
+                        .unwrap_or_default();
+                    let node = format!("wiki/{stem}.md");
+                    root.join(&node).is_file().then_some(node)
+                } else {
+                    None
+                };
+                references.push(Reference {
+                    title,
+                    source: candidate,
+                    node,
+                });
             }
         }
         Ok(references)
     }
+}
+
+/// Extracts a `raw/…` or `wiki/…` file path starting at `start`, stopping at
+/// the first character outside `[A-Za-z0-9/._-]` and dropping any trailing
+/// dots. Line/column locators (`:24`, `:5-7,15`) and surrounding punctuation
+/// are therefore excluded. Returns `None` unless the run ends in an allowed
+/// knowledge-file extension.
+fn reference_candidate(text: &str, start: usize) -> Option<String> {
+    let run: String = text[start..]
+        .chars()
+        .take_while(|character| {
+            character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+        })
+        .collect();
+    let candidate = run.trim_end_matches('.');
+    (candidate.ends_with(".md") || candidate.ends_with(".txt")).then(|| candidate.to_string())
 }
 
 fn init_library_db(path: &Path) -> Result<(), AppError> {
@@ -930,7 +952,16 @@ fn graphify_scope_ignore() -> &'static str {
 }
 
 fn default_schema() -> String {
-    "# Knowledge Schema\n\nUse stable `node_id` values, source paths under `raw/`, explicit relations, and review items for unresolved claims.\n".into()
+    "# Knowledge Schema\n\n\
+     知识节点契约（详见 knowledge-compiler Skill）：frontmatter 恰好包含 9 个键 —— \
+     node_id（库内稳定标识）、canonical_name、kind（concept|entity|process|decision|issue）、\
+     sources（raw/ 下的 path + locator）、relations（depends_on / related_to / opposite_to）、\
+     claim_type（observed|summarized|inferred|unresolved）、confidence（0.0–1.0）、\
+     created_at、updated_at（RFC-3339）；不要添加额外键。\n\n\
+     正文包含 6 个小节：定义、证据/推理、示例或反例、局限性、\
+     RAG Version（100–300 字的高密度压缩摘要，不是版本变更记录）、\
+     引用（raw/... 或 wiki/... 相对路径）。未解决的声明放入 reviews/。\n"
+        .into()
 }
 
 fn default_index(name: &str) -> String {

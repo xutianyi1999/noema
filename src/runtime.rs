@@ -1,6 +1,5 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
-use async_trait::async_trait;
 use opencode_rs::{
     ClientBuilder,
     types::{
@@ -14,7 +13,11 @@ use opencode_rs::{
 use serde::Serialize;
 use tokio::time::timeout;
 
-use crate::{config::Config, error::AppError};
+use crate::{
+    config::Config,
+    error::AppError,
+    transcript::{self, Transcript},
+};
 
 #[derive(Debug, Clone)]
 pub struct AgentRunRequest {
@@ -31,9 +34,18 @@ pub struct AgentRunResult {
     pub tool_events: Vec<serde_json::Value>,
 }
 
-#[async_trait]
-pub trait OpenCodeRuntime: Send + Sync {
-    async fn run_new_session(&self, request: AgentRunRequest) -> Result<AgentRunResult, AppError>;
+/// Every call must create a brand-new OpenCode session; requests carry the
+/// `library_id` and callers never pass an existing session id. The trait is
+/// generic (static dispatch) rather than dyn-dispatched so it can use native
+/// async-trait support (`async fn` in traits is not dyn-compatible on stable
+/// Rust). The RPITIT signature pins the future as `Send` so services can
+/// spawn and serve it across threads; implementations may still be written
+/// with `async fn`.
+pub trait OpenCodeRuntime: Send + Sync + 'static {
+    fn run_new_session(
+        &self,
+        request: AgentRunRequest,
+    ) -> impl Future<Output = Result<AgentRunResult, AppError>> + Send;
 }
 
 #[derive(Clone)]
@@ -47,7 +59,6 @@ impl OpenCodeAgent {
     }
 }
 
-#[async_trait]
 impl OpenCodeRuntime for OpenCodeAgent {
     async fn run_new_session(&self, request: AgentRunRequest) -> Result<AgentRunResult, AppError> {
         let client = ClientBuilder::new()
@@ -75,6 +86,10 @@ impl OpenCodeRuntime for OpenCodeAgent {
             }
         };
 
+        // Server-side live transcript (opt-in via NOEMA_TRANSCRIPT); never
+        // affects the result returned to callers.
+        let mut transcript = Transcript::new(&session.id, &request.title);
+
         let model = parse_model(&self.config.opencode_model);
         let prompt = PromptRequest {
             parts: vec![PromptPart::Text {
@@ -98,7 +113,7 @@ impl OpenCodeRuntime for OpenCodeAgent {
 
         let collected = match timeout(
             Duration::from_secs(self.config.opencode_timeout_secs),
-            collect_events(&mut subscription),
+            collect_events(&mut subscription, &mut transcript),
         )
         .await
         {
@@ -128,9 +143,13 @@ impl OpenCodeRuntime for OpenCodeAgent {
 
 #[derive(Default)]
 struct CollectedEvents {
+    /// Text of the latest assistant message only: earlier messages are
+    /// intermediate steps (planning, tool commentary), not the answer.
     answer: String,
     streamed_text: bool,
+    streamed_message: Option<String>,
     fallback_text: Vec<String>,
+    fallback_message: Option<String>,
     tool_events: Vec<serde_json::Value>,
 }
 
@@ -139,15 +158,35 @@ impl CollectedEvents {
         if !self.streamed_text && !self.fallback_text.is_empty() {
             self.answer = self.fallback_text.join("\n");
         }
+        if let Some(marked) = extract_marked_answer(&self.answer) {
+            self.answer = marked;
+        }
         self
     }
 }
 
+/// The query prompt asks the model to wrap its final answer in these
+/// markers. When a complete pair is present, the content of the last pair is
+/// the answer (marker-free even if the same message also contains narration);
+/// otherwise callers fall back to the raw last-message text, so models that
+/// skip the markers degrade gracefully instead of failing.
+const ANSWER_OPEN: &str = "<noema-answer>";
+const ANSWER_CLOSE: &str = "</noema-answer>";
+
+fn extract_marked_answer(text: &str) -> Option<String> {
+    let close = text.rfind(ANSWER_CLOSE)?;
+    let open = text[..close].rfind(ANSWER_OPEN)?;
+    let inner = text[open + ANSWER_OPEN.len()..close].trim();
+    (!inner.is_empty()).then(|| inner.to_string())
+}
+
 async fn collect_events(
     subscription: &mut opencode_rs::sse::SseSubscription<Event>,
+    transcript: &mut Transcript,
 ) -> Result<CollectedEvents, AppError> {
     let mut collected = CollectedEvents::default();
     while let Some(event) = subscription.recv().await {
+        transcript.event(&event);
         match &event {
             Event::SessionIdle { .. } => break,
             Event::SessionError { properties } => {
@@ -157,13 +196,31 @@ async fn collect_events(
                 )));
             }
             Event::MessagePartDelta { properties } => {
-                if let Some(delta) = properties.delta.as_deref() {
+                // Only visible text deltas feed the answer returned over
+                // HTTP/MCP; reasoning deltas stay transcript-only. A new
+                // assistant message starts a new step, so its first delta
+                // discards the previous message's intermediate text.
+                if transcript::is_text_delta(properties)
+                    && let Some(delta) = properties.delta.as_deref()
+                {
+                    if let Some(message_id) = &properties.message_id
+                        && collected.streamed_message.as_deref() != Some(message_id)
+                    {
+                        collected.answer.clear();
+                        collected.streamed_message = Some(message_id.clone());
+                    }
                     collected.answer.push_str(delta);
                     collected.streamed_text = true;
                 }
             }
             Event::MessagePartUpdated { properties } => {
                 if let Some(Part::Text { text, .. }) = properties.part.as_ref() {
+                    if let Some(message_id) = &properties.message_id
+                        && collected.fallback_message.as_deref() != Some(message_id)
+                    {
+                        collected.fallback_text.clear();
+                        collected.fallback_message = Some(message_id.clone());
+                    }
                     collected.fallback_text.push(text.clone());
                 }
             }
@@ -229,6 +286,26 @@ mod tests {
         assert_eq!(
             rules[1],
             permission("question", "*", PermissionAction::Deny)
+        );
+    }
+
+    #[test]
+    fn marked_answer_extraction_takes_the_last_complete_pair() {
+        let text = "我先查一下。<noema-answer>草稿</noema-answer>补充思考。\
+                    <noema-answer>\n最终答案，引用 raw/a.md:3。\n</noema-answer>收尾旁白";
+        assert_eq!(
+            extract_marked_answer(text).as_deref(),
+            Some("最终答案，引用 raw/a.md:3。")
+        );
+    }
+
+    #[test]
+    fn marked_answer_extraction_requires_a_complete_pair() {
+        assert_eq!(extract_marked_answer("只有旁白，没有标记"), None);
+        assert_eq!(extract_marked_answer("<noema-answer>只有开标签"), None);
+        assert_eq!(
+            extract_marked_answer("<noema-answer>  </noema-answer>"),
+            None
         );
     }
 }

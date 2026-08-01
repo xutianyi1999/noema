@@ -13,29 +13,37 @@ use crate::{
     storage::{Storage, StoredDocument},
 };
 
-#[derive(Clone)]
-pub struct AppService {
+pub struct AppService<R: OpenCodeRuntime> {
     pub storage: Storage,
     config: Arc<Config>,
-    runtime: Arc<dyn OpenCodeRuntime>,
+    runtime: Arc<R>,
 }
 
-impl AppService {
+impl<R: OpenCodeRuntime> Clone for AppService<R> {
+    fn clone(&self) -> Self {
+        Self {
+            storage: self.storage.clone(),
+            config: self.config.clone(),
+            runtime: self.runtime.clone(),
+        }
+    }
+}
+
+impl AppService<OpenCodeAgent> {
     pub fn new(config: Config) -> Result<Self, AppError> {
         let config = Arc::new(config);
         let storage = Storage::open(config.data_dir.clone())?;
-        let runtime: Arc<dyn OpenCodeRuntime> = Arc::new(OpenCodeAgent::new(config.clone()));
+        let runtime = Arc::new(OpenCodeAgent::new(config.clone()));
         Ok(Self {
             storage,
             config,
             runtime,
         })
     }
+}
 
-    pub fn with_runtime(
-        config: Config,
-        runtime: Arc<dyn OpenCodeRuntime>,
-    ) -> Result<Self, AppError> {
+impl<R: OpenCodeRuntime> AppService<R> {
+    pub fn with_runtime(config: Config, runtime: Arc<R>) -> Result<Self, AppError> {
         let config = Arc::new(config);
         let storage = Storage::open(config.data_dir.clone())?;
         Ok(Self {
@@ -277,7 +285,7 @@ impl AppService {
 
 fn format_query_prompt(prompt: &str) -> String {
     format!(
-        "你是 Noema 内容库查询 Agent。只能在当前内容库项目内工作。先阅读 purpose.md 和 schema.md，再阅读 index.md；涉及关系问题时按需运行 graphify query。不要写入、编辑或删除文件，也不要访问项目外路径。只依据内容库证据回答用户的自然语言问题，简洁说明推理过程，并为每个事实性结论引用相对路径，例如 raw/example.md 或 wiki/concept.md。\n\n用户问题：\n{prompt}"
+        "你是 Noema 内容库查询 Agent。只能在当前内容库项目内工作。先阅读 purpose.md 和 schema.md，再阅读 index.md；摘要优先——先读相关 wiki 节点的定义和 RAG Version 压缩摘要，不足时再读完整节点与 raw/ 原文；涉及关系问题时按需运行 graphify query。不要写入、编辑或删除文件，也不要访问项目外路径。只依据内容库证据回答用户的自然语言问题，简洁说明推理过程，并为每个事实性结论引用相对路径，例如 raw/example.md 或 wiki/concept.md。最终答案用 <noema-answer> 与 </noema-answer> 包裹，标记之间只放答案本身。\n\n用户问题：\n{prompt}"
     )
 }
 
@@ -288,6 +296,6 @@ fn format_ingest_prompt(source_path: &str, job_id: &str, incremental: bool) -> S
         "当前 staging 尚无 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify .` 完整首次建图流程。"
     };
     format!(
-        "你是 Noema 摄入任务 {job_id} 的知识编译 Agent。只能在当前暂存内容库项目内工作。先阅读 purpose.md 和 schema.md，再阅读 {source_path}；创建节点前检查已有 wiki 节点，避免重复。创建或更新可追溯的知识节点，使用 YAML frontmatter、稳定 node_id、sources、明确关系、证据、示例/反例、局限性和 RAG Version。将未解决的冲突或低置信度关系放入 reviews/。\n\n{graphify_step} 项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT；让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n\n不要修改 raw 原文、.graphifyignore、.opencode、library.sqlite，也不要访问暂存项目外的路径。\n"
+        "你是 Noema 摄入任务 {job_id} 的知识编译 Agent。只能在当前暂存内容库项目内工作。先阅读 purpose.md 和 schema.md，再阅读 {source_path}；写入节点前先调用 OpenCode 的 `skill` 工具加载 knowledge-compiler Skill 并遵循其节点契约。创建节点前检查已有 wiki 节点，避免重复。创建或更新可追溯的知识节点：frontmatter 恰好包含契约定义的 9 个键，不要添加额外键；正文包含定义、证据/推理、示例或反例、局限性、RAG Version 和引用，其中 RAG Version 是节点 100–300 字的高密度压缩摘要（保留核心推理链，适合直接注入 LLM 上下文），不是版本变更记录。将未解决的冲突或低置信度关系放入 reviews/。\n\n{graphify_step} 项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT；让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n\n不要修改 raw 原文、.graphifyignore、.opencode、library.sqlite，也不要访问暂存项目外的路径。\n"
     )
 }

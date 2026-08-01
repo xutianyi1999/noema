@@ -90,6 +90,29 @@ POST /mcp
 
 MCP 工具都显式接收 `library_id`（健康检查除外）。Noema 不提供 stdio MCP 入口，也不会把自定义知识库 MCP 工具注入 OpenCode；OpenCode 直接使用当前内容库工作区和已安装 Skill。
 
+## 测试
+
+离线端到端测试（`tests/e2e.rs`、`tests/service.rs`）通过假 OpenCode runtime 覆盖 HTTP API、Streamable HTTP MCP（使用 rmcp 官方客户端）、内容库隔离、SHA-256 去重、摄入失败/校验失败的 staging 保留、查询审计和错误路径，不需要模型、网络或 graphify：
+
+```bash
+cargo test
+```
+
+真实端到端测试（`tests/e2e_live.rs`）默认跳过；显式启用后会连接真实 OpenCode Server，执行 graphify 安装、完整摄入建图、知识节点校验和两次新 session 查询：
+
+```bash
+NOEMA_LIVE_E2E=1 OPENCODE_URL=http://127.0.0.1:4096 \
+OPENCODE_TEST_MODEL=opencode/deepseek-v4-flash-free \
+no_proxy=127.0.0.1,localhost \
+cargo test --test e2e_live -- --nocapture
+```
+
+服务端可以流式打印 OpenCode 会话的中间过程（text / thinking / tool / skill 调用与结果、step 统计），仅用于服务端日志，HTTP 与 MCP 接口始终只返回最终文本回答。设置 `NOEMA_TRANSCRIPT=1` 启用（终端下自动带颜色，遵循 `NO_COLOR`）：
+
+```bash
+NOEMA_TRANSCRIPT=1 noema
+```
+
 ## 内容库与 Skill
 
 创建内容库时，Noema 会在该内容库项目中直接运行上游 graphify 安装器，并写入中文的 `kb-ingest`、`kb-query`、`kb-maintain` 和独立设计的 `knowledge-compiler` Skill。LLM-WIKI 只作为设计参考，不原样复制。

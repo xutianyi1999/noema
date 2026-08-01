@@ -8,6 +8,7 @@ pub mod models;
 pub mod runtime;
 pub mod service;
 pub mod storage;
+pub(crate) mod transcript;
 
 pub use config::Config;
 pub use error::AppError;

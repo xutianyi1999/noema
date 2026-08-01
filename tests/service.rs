@@ -9,7 +9,6 @@ use std::{
     time::Duration,
 };
 
-use async_trait::async_trait;
 use axum::{
     body::{Body, to_bytes},
     http::{Request, StatusCode, header},
@@ -29,7 +28,6 @@ struct FakeRuntime {
     requests: Mutex<Vec<AgentRunRequest>>,
 }
 
-#[async_trait]
 impl OpenCodeRuntime for FakeRuntime {
     async fn run_new_session(&self, request: AgentRunRequest) -> Result<AgentRunResult, AppError> {
         let number = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
@@ -91,7 +89,7 @@ fn config(data_dir: PathBuf) -> Config {
     }
 }
 
-async fn service_fixture() -> (TempDir, AppService, Arc<FakeRuntime>) {
+async fn service_fixture() -> (TempDir, AppService<FakeRuntime>, Arc<FakeRuntime>) {
     let tempdir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(FakeRuntime::default());
     let service =
@@ -100,7 +98,7 @@ async fn service_fixture() -> (TempDir, AppService, Arc<FakeRuntime>) {
 }
 
 async fn wait_for_completion(
-    service: &AppService,
+    service: &AppService<FakeRuntime>,
     library_id: &str,
     job_id: &str,
 ) -> noema::models::JobStatus {

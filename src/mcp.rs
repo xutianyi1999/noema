@@ -1,7 +1,7 @@
 use rmcp::{
     ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerInfo},
     tool, tool_handler, tool_router,
     transport::{
         StreamableHttpServerConfig, StreamableHttpService,
@@ -11,17 +11,18 @@ use rmcp::{
 
 use crate::{
     models::{DocumentInput, McpIngestRequest, McpJobRequest, McpQueryRequest},
+    runtime::OpenCodeRuntime,
     service::AppService,
 };
 
 #[derive(Clone)]
-pub struct McpHandler {
-    service: AppService,
+pub struct McpHandler<R: OpenCodeRuntime> {
+    service: AppService<R>,
     tool_router: ToolRouter<Self>,
 }
 
-impl McpHandler {
-    fn new(service: AppService) -> Self {
+impl<R: OpenCodeRuntime> McpHandler<R> {
+    fn new(service: AppService<R>) -> Self {
         Self {
             service,
             tool_router: Self::tool_router(),
@@ -30,7 +31,7 @@ impl McpHandler {
 }
 
 #[tool_router]
-impl McpHandler {
+impl<R: OpenCodeRuntime> McpHandler<R> {
     #[tool(
         description = "Submit one UTF-8 Markdown or TXT document to an isolated Noema content library."
     )]
@@ -49,8 +50,9 @@ impl McpHandler {
                 },
             )
             .await
-            .map_err(to_mcp_error)?;
-        serde_json::to_string(&response).map_err(to_mcp_error)
+            .map_err(|error| to_mcp_error(&error))?;
+        serde_json::to_string(&response)
+            .map_err(|error| to_mcp_error(&crate::AppError::from(error)))
     }
 
     #[tool(
@@ -64,8 +66,9 @@ impl McpHandler {
             .service
             .query(&request.library_id, &request.prompt)
             .await
-            .map_err(to_mcp_error)?;
-        serde_json::to_string(&response).map_err(to_mcp_error)
+            .map_err(|error| to_mcp_error(&error))?;
+        serde_json::to_string(&response)
+            .map_err(|error| to_mcp_error(&crate::AppError::from(error)))
     }
 
     #[tool(description = "Get the status of an ingestion job in one isolated content library.")]
@@ -76,26 +79,38 @@ impl McpHandler {
         let response = self
             .service
             .job_status(&request.library_id, &request.job_id)
-            .map_err(to_mcp_error)?;
-        serde_json::to_string(&response).map_err(to_mcp_error)
+            .map_err(|error| to_mcp_error(&error))?;
+        serde_json::to_string(&response)
+            .map_err(|error| to_mcp_error(&crate::AppError::from(error)))
     }
 
     #[tool(description = "Return Noema service health and the configured OpenCode model.")]
     async fn kb_health(&self) -> Result<String, rmcp::ErrorData> {
-        serde_json::to_string(&self.service.health()).map_err(to_mcp_error)
+        serde_json::to_string(&self.service.health())
+            .map_err(|error| to_mcp_error(&crate::AppError::from(error)))
     }
 }
 
 #[tool_handler(router = self.tool_router)]
-impl ServerHandler for McpHandler {
+impl<R: OpenCodeRuntime> ServerHandler for McpHandler<R> {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(
+                Implementation::new("noema", env!("CARGO_PKG_VERSION"))
+                    .with_title("Noema")
+                    .with_description("OpenCode-driven isolated text knowledge-base service"),
+            )
+            .with_instructions(
+                "Every tool takes an explicit library_id; content libraries are isolated. \
+                 kb_query accepts only a natural-language prompt and always runs in a fresh \
+                 OpenCode session.",
+            )
     }
 }
 
-pub fn streamable_http_service(
-    service: AppService,
-) -> StreamableHttpService<McpHandler, LocalSessionManager> {
+pub fn streamable_http_service<R: OpenCodeRuntime>(
+    service: AppService<R>,
+) -> StreamableHttpService<McpHandler<R>, LocalSessionManager> {
     let config = StreamableHttpServerConfig::default().with_json_response(true);
     StreamableHttpService::new(
         move || Ok(McpHandler::new(service.clone())),
@@ -104,6 +119,21 @@ pub fn streamable_http_service(
     )
 }
 
-fn to_mcp_error(error: impl std::fmt::Display) -> rmcp::ErrorData {
-    rmcp::ErrorData::internal_error(error.to_string(), None)
+/// Maps service errors onto MCP error codes: caller mistakes (unknown
+/// library/job, invalid input) are invalid-params errors, not internal ones;
+/// only genuine runtime/storage failures stay internal.
+fn to_mcp_error(error: &crate::AppError) -> rmcp::ErrorData {
+    match error {
+        crate::AppError::BadRequest(_)
+        | crate::AppError::LibraryNotFound(_)
+        | crate::AppError::JobNotFound(_) => {
+            rmcp::ErrorData::invalid_params(error.to_string(), None)
+        }
+        crate::AppError::QueryFailed(_)
+        | crate::AppError::Runtime(_)
+        | crate::AppError::Storage(_)
+        | crate::AppError::Io(_)
+        | crate::AppError::Sqlite(_)
+        | crate::AppError::Json(_) => rmcp::ErrorData::internal_error(error.to_string(), None),
+    }
 }
