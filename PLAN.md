@@ -41,7 +41,7 @@
 - OpenCode 调用：使用 `/mnt/data/code/agentic_auxilary/crates/services/opencode-rs`。
 - 驱动：由 OpenCode Agent Runtime 执行摄入、检索和回答。
 - 测试模型：OpenCode Zen 的 DeepSeek V4 Flash Free，OpenCode 模型标识默认使用 `opencode/deepseek-v4-flash-free`。
-- 对外协议：首期只支持 HTTP 和 MCP，不提供 WebSocket、GraphQL 或 gRPC。
+- 对外协议：首期只支持 HTTP JSON API 和基于标准 Streamable HTTP 的 MCP，不提供 stdio、WebSocket、GraphQL 或 gRPC。
 - 持久化：原始资料、知识节点、关系图、检索索引和任务状态均可恢复。
 
 核心定位：
@@ -263,9 +263,9 @@ graphify install --platform opencode --project
 
 每个内容库的根目录就是一个独立的 OpenCode project/workspace，服务在该目录内执行上游 `graphify install --platform opencode --project`。这样 graphify 按当前工作目录生成的 `graphify-out/`、`graph.json`、`GRAPH_REPORT.md` 和缓存都会落在对应内容库范围内。Knowledge Service 只负责准备内容库 project、调用已安装的 graphify Skill/CLI、读取产物和把结果纳入内容库索引。
 
-创建 job staging project 时，服务保留该内容库 `.opencode/` 中由上游安装的 graphify 文件；graphify 插件、Skill 和配置不能被服务自定义实现替换。staging 只改变运行目录和待提交产物，不改变 graphify 的来源。
+创建 job staging project 时，服务保留该内容库 `.opencode/` 中由上游安装的 graphify 文件，并复制 `.graphifyignore` 输入边界；graphify 插件、Skill 和配置不能被服务自定义实现替换。staging 只改变运行目录和待提交产物，不改变 graphify 的来源。空内容库只安装 graphify，不强行执行空的 `/graphify .`；首篇文档摄入执行首次全量建图，后续文档摄入执行 `/graphify . --update`。
 
-graphify 的输入范围必须由 Skill 明确限定为当前内容库的 `raw/` 文本目录，以及经过确认的 `wiki/` Markdown 节点；不能直接扫描整个内容库根目录，否则会把 `.opencode`、SQLite、索引和运行时文件误当成知识来源。服务只允许 `.md` 和 `.txt` 进入 graphify 输入，首期不启用代码 AST、网页或二进制解析。
+graphify 的输入范围必须由 Skill 和内容库根目录的 `.graphifyignore` 明确限定为当前内容库的 `raw/` 文本目录，以及经过确认的 `wiki/` Markdown 节点；Agent 仍执行上游 `/graphify .` 或 `/graphify . --update` 完整流程，但不能把 `.opencode`、SQLite、索引和运行时文件误当成知识来源。服务只允许 `.md` 和 `.txt` 进入 graphify 输入，首期不启用代码 AST、网页或二进制解析。
 
 graphify 提供：
 
@@ -362,7 +362,7 @@ data/
 - 原文、Wiki、graph 和 index 使用 `data/libraries/{library_id}/` 独立目录，禁止跨目录读取。
 - HTTP 路由使用 `/v1/libraries/{library_id}/...`。
 - MCP 工具必须接收并校验 `library_id`，不能默认使用全局当前内容库。
-- OpenCode session 创建时绑定一个 `library_id`，查询 Agent 只能访问该内容库；摄入/维护 Agent 只能访问对应 job staging 和其提交目标。
+- OpenCode session 创建时绑定一个 `library_id`，查询、摄入和维护 Agent 都显式使用除 `question` 外的全量允许权限；工作目录和服务侧的任务提交流程仍按 `library_id`、job staging 和校验结果组织。
 - 查询、摄入、维护任务只能操作自己的内容库。
 - 首期禁止跨内容库搜索、跨内容库关系和跨内容库节点引用。
 - 删除内容库时只删除该内容库的数据、索引、任务和 session 审计，不影响其他内容库。
@@ -447,7 +447,7 @@ POST /v1/libraries/{library_id}/query
 
 ## 6.1 MCP 接口
 
-MCP 是首期第二种对外协议，提供与 HTTP API 相同的核心能力。MCP 工具名保持稳定，内部实现复用 Knowledge Service 的 Rust application service 层。
+MCP 是首期第二种对外协议，使用标准 Streamable HTTP transport，挂载在独立的 `/mcp` 端点，提供与 HTTP API 相同的核心能力。MCP 工具名保持稳定，内部实现复用 Knowledge Service 的 Rust application service 层；不把 stdio 作为服务对外接口。
 
 首期对外 MCP 工具：
 
@@ -460,17 +460,17 @@ kb_health
 
 其中 `kb_query` 只接受一个自然语言 `prompt` 和 `library_id`；不开放结构化图查询参数。OpenCode Agent 不依赖自定义知识库 MCP 工具读取内容，而是使用自身的文件工具和 graphify CLI 操作当前内容库 workspace。
 
-这里的 MCP 是 Knowledge Service 对外暴露的协议：外部 MCP Client 调用 `kb_query` 后，由 Rust 服务内部创建 OpenCode session 并返回结果。不会把 `kb_query`、`kb_search` 或其他知识库 MCP 工具注入给 OpenCode Agent；Agent 只使用自身原生工具、已安装的 Skills 和 graphify CLI。
+这里的 MCP 是 Knowledge Service 对外暴露的 Streamable HTTP 协议：外部 MCP Client 连接 `/mcp` 并调用 `kb_query` 后，由 Rust 服务内部创建 OpenCode session 并返回结果。不会把 `kb_query`、`kb_search` 或其他知识库 MCP 工具注入给 OpenCode Agent；Agent 只使用自身原生工具、已安装的 Skills 和 graphify CLI。
 
 ## 6.2 Rust 技术栈与 OpenCode SDK
 
 - 服务主体使用 Rust，采用 Tokio 异步运行时。
 - HTTP 层使用 Rust HTTP Web 框架，首期只实现 JSON API。
-- MCP 层使用 Rust MCP SDK，并复用同一 application service 层。
+- MCP 层使用 Rust MCP SDK 的 Streamable HTTP server，并复用同一 application service 层。
 - OpenCode 调用统一封装在 `opencode_rs` adapter 中。
 - SDK 源码路径固定为：`/mnt/data/code/agentic_auxilary/crates/services/opencode-rs`。
 - OpenCode SDK 负责 session 创建、内容库绑定、prompt 投递、事件订阅、idle/error 判断和 session 清理。
-- 每个 graphify session 都显式设置按 `library_id` 分隔的查询日志路径，避免上游默认用户缓存目录成为跨库共享状态。
+- 每个 graphify session 都应显式设置按 `library_id` 分隔的查询日志路径，避免上游默认用户缓存目录成为跨库共享状态。
 - Knowledge Service 不直接拼接 OpenCode HTTP 请求，避免 SDK 调用散落在业务代码中。
 
 ### 测试模型配置
@@ -577,7 +577,7 @@ Knowledge Service 不为 OpenCode 重造 `kb_read_node`、`kb_upsert_node` 等�
 
 本方案把 `data/libraries/{library_id}` 作为该内容库的 OpenCode project/workspace 根目录。创建内容库时，在这个目录执行上游 graphify 安装，并放置本项目的 `kb-*` 和 `knowledge-compiler` Skills。这样 OpenCode 的 Skill 发现、graphify 的相对路径产物和文件工具都指向同一个内容库边界。
 
-查询可以直接在内容库根目录运行，因为它是只读的。摄入和维护不能直接把未验证的 Agent 修改写入正式目录；服务应创建 `staging/{job_id}` 下的 job-scoped project/worktree，复制或挂载当前内容库的只读基线，允许 Agent 在 staging 中生成节点和 graphify 产物，校验通过后再把允许的 `wiki/`、`graph/`、`index/`、`manifest.json` 等变更原子提交到内容库根目录。失败任务只保留 staging 和审计，不污染正式知识。
+查询可以直接在内容库根目录运行。MVP 对 OpenCode session 只关闭交互式 `question` 工具，其余工具不设置权限限制；摄入和维护不能直接把未验证的 Agent 修改写入正式目录，因此服务应创建 `staging/{job_id}` 下的 job-scoped project/worktree，复制或挂载当前内容库的只读基线，允许 Agent 在 staging 中生成节点和 graphify 产物，校验通过后再把允许的 `wiki/`、`graph/`、`index/`、`manifest.json` 等变更原子提交到内容库根目录。失败任务只保留 staging 和审计，不污染正式知识。
 
 OpenCode 在 workspace 中直接使用：
 
@@ -592,8 +592,7 @@ bash       执行 graphify CLI 和必要的本地命令
 
 工作约束：
 
-- 查询 session 使用只读 Agent 权限，禁止 `write`、`edit` 和破坏性命令。
-- 摄入和维护 session 使用可写 Agent 权限，但工作目录固定为当前 `library_id` 的 job staging workspace，不能直接指向服务根目录或其他内容库。
+- MVP 只通过 OpenCode session permission 禁止 `question` 工具；查询、摄入和维护 session 对其余工具均使用全量允许权限。工作目录仍固定到当前 `library_id` 的 project 或 job staging workspace，服务侧负责提交前校验。
 - `knowledge-compiler` 指导文件结构、节点格式、关系规则和审核规则，不实现文件读写工具。
 - graphify 直接通过其上游插件、Skill 和 CLI 读写当前 project 根目录下的 `graphify-out/`。
 - Knowledge Service 在 session 开始前设置 workspace，在 session 结束后校验变更范围和生成结果。
@@ -636,7 +635,7 @@ bash       执行 graphify CLI 和必要的本地命令
 - 禁止通过 `..`、绝对路径或符号链接逃逸内容库目录。
 - MCP 工具不能访问未授权内容库。
 - Agent 写操作必须绑定 `job_id` 或 `query_id` 及 `library_id`。
-- 查询默认只读，不允许修改知识库。
+- 查询语义默认是只读问答，但 MVP 不依靠 OpenCode permission 阻止 Agent 修改（仅关闭 `question`）；如果要面向不受信任租户，必须增加主机级沙箱并单独实现查询写入防护。
 - 外部 API 使用 token 鉴权。
 - 每次查询记录 `query_id`、`session_id`、`library_id`、引用和工具调用。
 
@@ -644,7 +643,7 @@ bash       执行 graphify CLI 和必要的本地命令
 
 首期如果只面向受信任的单机部署，采用“内容库独立 project + Agent 权限配置 + 固定工作目录 + session 前后路径/变更校验”的隔离等级，并在文档中明确不支持不受信任租户。若服务要面向不受信任的外部租户，必须把每个内容库 session 放进独立的 OS 用户、容器或沙箱进程，限制文件系统根、网络和进程能力；这属于上线前置条件，不由 `library_id` 字段替代。
 
-查询 session 只读且禁止外部目录；摄入/维护 session 只允许写入当前内容库的 job staging，正式根目录只能由服务在校验后提交。服务在 session 结束后校验 git/diff 或文件清单，发现越界写入、符号链接逃逸或不符合任务类型的修改时，任务失败并隔离产物。
+MVP 只关闭 OpenCode session 的 `question` 工具，其余工具权限全部允许。摄入/维护 session 默认写入当前内容库的 job staging，正式根目录仍由服务在校验后提交。由于 OpenCode 原生 bash 和全量权限不是主机级沙箱，面向不受信任租户时必须增加 OS/container/sandbox 边界；服务在 session 结束后仍应校验 git/diff 或文件清单，发现符号链接逃逸或不符合任务类型的修改时，任务失败并隔离产物。
 
 ## 13. MVP 实施阶段
 
@@ -672,7 +671,7 @@ bash       执行 graphify CLI 和必要的本地命令
 - 实现知识节点 schema。
 - 实现节点校验和来源回链。
 - 实现关系图、置信度和全文索引。
-- 实现对外 MCP handler，并复用 application service；不向 OpenCode 注入知识库内部 MCP 工具。
+- 实现 `/mcp` Streamable HTTP MCP handler，并复用 application service；不向 OpenCode 注入知识库内部 MCP 工具，也不提供 stdio 对外入口。
 
 ### Phase 4：查询输出
 
