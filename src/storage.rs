@@ -118,8 +118,6 @@ impl Storage {
             ".opencode",
             "raw",
             "wiki",
-            "graph",
-            "index",
             "reviews",
             "staging",
             "graphify-out",
@@ -437,8 +435,6 @@ impl Storage {
             "index.md",
             "raw",
             "wiki",
-            "graph",
-            "index",
             "reviews",
             "manifest.json",
             "graphify-out",
@@ -460,7 +456,7 @@ impl Storage {
                 "missing staging directory {job_id}"
             )));
         }
-        for entry in ["wiki", "graph", "index", "reviews", "graphify-out"] {
+        for entry in ["wiki", "reviews", "graphify-out"] {
             let source = staging.join(entry);
             let destination = root.join(entry);
             if source.exists() {
@@ -517,8 +513,6 @@ impl Storage {
             "index.md",
             "raw",
             "wiki",
-            "graph",
-            "index",
             "reviews",
             "manifest.json",
             "graphify-out",

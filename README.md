@@ -211,8 +211,6 @@ data/
     ├── .opencode/
     ├── raw/
     ├── wiki/
-    ├── graph/
-    ├── index/
     ├── reviews/
     ├── staging/
     ├── graphify-out/
