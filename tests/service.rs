@@ -34,16 +34,16 @@ impl OpenCodeRuntime for FakeRuntime {
         let session_id = format!("fake-session-{number}");
         let is_ingest = request.title.contains("ingestion");
         self.requests.lock().unwrap().push(request.clone());
+        let source = fs::read_dir(request.workdir.join("raw"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .to_string();
 
         if is_ingest {
-            let source = fs::read_dir(request.workdir.join("raw"))
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .to_string();
             let node = format!(
                 "---\nnode_id: session-context\ncanonical_name: Session Context\nkind: concept\nsources:\n  - path: raw/{source}\nrelations:\n  depends_on: []\n  related_to: []\n  opposite_to: []\nclaim_type: observed\nconfidence: 1.0\ncreated_at: 2026-08-01T00:00:00Z\nupdated_at: 2026-08-01T00:00:00Z\n---\n\n# Session Context\n\nA test knowledge node.\n\n## Evidence\n\n- raw/{source}\n"
             );
@@ -58,15 +58,22 @@ impl OpenCodeRuntime for FakeRuntime {
         let answer = if is_ingest {
             "摄入完成".into()
         } else {
-            let source = fs::read_dir(request.workdir.join("raw"))
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .file_name()
-                .to_string_lossy()
-                .to_string();
-            format!("答案见 `raw/{source}` 和 `wiki/session-context.md`。")
+            let content = fs::read_to_string(request.workdir.join("raw").join(&source)).unwrap();
+            let good = serde_json::to_string(content.lines().next().unwrap_or_default()).unwrap();
+            if request.prompt.contains("bad-contract") {
+                format!("答案见 `raw/{source}`，这不是契约 JSON。")
+            } else if request.prompt.contains("bad-quote") {
+                // First citation's quote is not verbatim in the source and
+                // must be dropped along with its [1] marker; the second is
+                // honest and survives.
+                format!(
+                    "{{\"answer\": \"错误结论[1]。正确结论[2]。\", \"references\": [{{\"source\": \"raw/{source}\", \"quote\": \"文件中不存在的引文\"}}, {{\"source\": \"raw/{source}\", \"quote\": {good}, \"locator\": \"第一条\"}}]}}"
+                )
+            } else {
+                format!(
+                    "{{\"answer\": \"答案依据原文[1]。\", \"references\": [{{\"source\": \"raw/{source}\", \"quote\": {good}, \"locator\": \"第一条\"}}]}}"
+                )
+            }
         };
 
         Ok(AgentRunResult {
@@ -391,6 +398,144 @@ async fn concurrent_submissions_to_one_library_are_serialized() {
     assert_eq!(prompts.len(), 2);
     assert!(prompts[0].contains("/graphify .` 完整首次建图流程"));
     assert!(prompts[1].contains("/graphify . --update"));
+}
+
+#[tokio::test]
+async fn citations_are_verified_and_unverified_markers_are_stripped() {
+    let (_tempdir, service, _runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "引文库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let submitted = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "source.md".into(),
+                content: "# Session Context\n\nTest source.".into(),
+                title: Some("来源文档".into()),
+            },
+        )
+        .await
+        .unwrap();
+    wait_for_completion(&service, &library.id, &submitted.job_id).await;
+
+    // The first declared citation quotes text the source does not contain:
+    // it is dropped and its [1] marker stripped; the honest second citation
+    // keeps its id (no renumbering) and carries server-computed offsets.
+    let answer = service.query(&library.id, "bad-quote 场景").await.unwrap();
+    assert_eq!(answer.answer, "错误结论。正确结论[2]。");
+    assert_eq!(answer.references.len(), 1);
+    let reference = &answer.references[0];
+    assert_eq!(reference.id, 2);
+    assert_eq!(reference.title, "来源文档");
+    assert_eq!(reference.locator.as_deref(), Some("第一条"));
+    assert_eq!(reference.quote.as_deref(), Some("# Session Context"));
+    assert_eq!(reference.start, Some(0));
+    assert_eq!(reference.end, Some(17));
+    assert_eq!(reference.lines, Some((1, 1)));
+}
+
+#[tokio::test]
+async fn non_contract_answer_degrades_to_plain_text_without_references() {
+    let (_tempdir, service, _runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "降级库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let submitted = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "source.md".into(),
+                content: "# Session Context\n\nTest source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    wait_for_completion(&service, &library.id, &submitted.job_id).await;
+
+    let answer = service
+        .query(&library.id, "bad-contract 场景")
+        .await
+        .unwrap();
+    assert!(
+        answer.answer.contains("这不是契约 JSON"),
+        "{}",
+        answer.answer
+    );
+    assert!(
+        answer.references.is_empty(),
+        "unverified citations never reach the client"
+    );
+}
+
+#[tokio::test]
+async fn knowledge_files_are_served_with_safety_checks() {
+    let (_tempdir, service, _runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "fileslib".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "source.md".into(),
+                content: "# Session Context\n\nTest source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    let app = http_api::router(service);
+
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/libraries/fileslib/files/raw/source.md")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response.headers().get(header::CONTENT_TYPE).unwrap(),
+        "text/markdown; charset=utf-8"
+    );
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    assert_eq!(body, "# Session Context\n\nTest source.");
+
+    // Outside raw/|wiki/ → 400; inside but missing → 404.
+    for (uri, status) in [
+        (
+            "/v1/libraries/fileslib/files/library.sqlite",
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "/v1/libraries/fileslib/files/raw/absent.md",
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), status, "{uri}");
+    }
 }
 
 #[tokio::test]

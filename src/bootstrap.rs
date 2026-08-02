@@ -51,7 +51,8 @@ pub(crate) fn install_graphify(root: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-/// Refresh the four Noema skills to this binary's versions.
+/// Refresh the four Noema skills and the generated contract block in
+/// `AGENTS.md` to this binary's versions.
 pub(crate) fn write_skills(root: &Path) -> Result<(), AppError> {
     for (relative, contents) in skill_files() {
         let path = root.join(".opencode").join("skills").join(relative);
@@ -60,6 +61,43 @@ pub(crate) fn write_skills(root: &Path) -> Result<(), AppError> {
         }
         fs::write(path, contents)?;
     }
+    write_agents_contract(root)
+}
+
+const CONTRACT_BEGIN: &str = "<!-- noema-contract -->";
+const CONTRACT_END: &str = "<!-- /noema-contract -->";
+
+/// Idempotently install the generated Noema contract (ingest discipline +
+/// query contract with the schema and example) into the project's
+/// `AGENTS.md`. OpenCode injects `AGENTS.md` into the system prompt of every
+/// session, so the contract reaches the Agent as system-level instruction
+/// and the per-query / per-ingest user messages carry no policy text. The
+/// block is delimited by markers and replaced in place on refresh; anything
+/// else in the file (e.g. the graphify installer's content) is preserved.
+pub(crate) fn write_agents_contract(root: &Path) -> Result<(), AppError> {
+    let path = root.join("AGENTS.md");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let block = format!(
+        "{CONTRACT_BEGIN}\n{}\n{CONTRACT_END}",
+        crate::answer::agents_contract()
+    );
+    let updated = match (existing.find(CONTRACT_BEGIN), existing.find(CONTRACT_END)) {
+        (Some(begin), Some(end)) if end > begin => format!(
+            "{}{}{}",
+            &existing[..begin],
+            block,
+            &existing[end + CONTRACT_END.len()..]
+        ),
+        _ => {
+            let trimmed = existing.trim_end();
+            if trimmed.is_empty() {
+                format!("{block}\n")
+            } else {
+                format!("{trimmed}\n\n{block}\n")
+            }
+        }
+    };
+    fs::write(path, updated)?;
     Ok(())
 }
 

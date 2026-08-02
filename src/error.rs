@@ -18,6 +18,8 @@ pub enum AppError {
     LibraryNotFound(String),
     #[error("job not found: {0}")]
     JobNotFound(String),
+    #[error("file not found: {0}")]
+    FileNotFound(String),
     #[error("query failed: {0}")]
     QueryFailed(String),
     #[error("agent runtime failed: {0}")]
@@ -38,7 +40,9 @@ impl AppError {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
             Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Conflict(_) => StatusCode::CONFLICT,
-            Self::LibraryNotFound(_) | Self::JobNotFound(_) => StatusCode::NOT_FOUND,
+            Self::LibraryNotFound(_) | Self::JobNotFound(_) | Self::FileNotFound(_) => {
+                StatusCode::NOT_FOUND
+            }
             Self::QueryFailed(_) | Self::Runtime(_) => StatusCode::BAD_GATEWAY,
             Self::Storage(_) | Self::Io(_) | Self::Sqlite(_) | Self::Json(_) => {
                 StatusCode::INTERNAL_SERVER_ERROR

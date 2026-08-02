@@ -1,5 +1,6 @@
 //! Noema: an OpenCode-driven, isolated text knowledge-base service.
 
+pub(crate) mod answer;
 pub(crate) mod bootstrap;
 pub mod config;
 pub mod error;

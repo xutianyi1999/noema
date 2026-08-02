@@ -17,7 +17,7 @@ canonical_name: Canonical concept name
 kind: concept | entity | process | decision | issue
 sources:
   - path: raw/source.md
-    locator: heading or line range when available
+    locator: 按来源自身编号标注，如 第三十三条第二款 或 5.2.1
 relations:
   depends_on: []
   related_to: []
@@ -35,9 +35,11 @@ frontmatter 只包含上述 9 个键，不要添加额外键。正文必须包�
 - 示例或反例
 - 局限性：来源未覆盖或未确认的部分
 - RAG Version：本节点 100–300 字的高密度压缩版本，保留核心推理链，适合直接注入 LLM 上下文；不是版本变更记录
-- 引用：来源文档与相关节点的相对路径，如 `raw/example.md:3-9` 或 `wiki/concept.md`
+- 引用：来源文档与相关节点的相对路径，如 `raw/example.md`（第三十三条）或 `wiki/concept.md`
 
 `node_id` 是一个 `library_id` 内的身份标识；文件名可以变化。
+
+法条、合同条款、公文与标准原文等规范文本必须从 `raw/` 原文逐字引用并标注 locator（按来源自身编号，如 第三十三条第二款 或 5.2.1），不得改写；RAG Version 只压缩节点的评述与关系，不改写规范文本。新旧文本矛盾、未解决的声明放入 `reviews/`，用 `opposite_to` 表达。
 
 ## 工作流
 

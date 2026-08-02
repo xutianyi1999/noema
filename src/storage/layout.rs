@@ -71,7 +71,7 @@ pub(super) fn scaffold_library(root: &Path, name: &str) -> Result<(), AppError> 
 
 fn default_purpose(name: &str) -> String {
     format!(
-        "# {name}\n\nDefine the purpose, scope, key questions, terminology, and update policy for this content library.\n"
+        "# {name}\n\nDefine this content library's purpose, scope, key questions, and terminology. State the authority ranking of its sources (e.g. statutes and regulations > judicial interpretations > standards and guides > other documents) and the update policy, including how superseded or amended texts are flagged and kept distinguishable from the texts in force.\n"
     )
 }
 
@@ -83,12 +83,16 @@ fn default_schema() -> String {
     "# Knowledge Schema\n\n\
      知识节点契约（详见 knowledge-compiler Skill）：frontmatter 恰好包含 9 个键 —— \
      node_id（库内稳定标识）、canonical_name、kind（concept|entity|process|decision|issue）、\
-     sources（raw/ 下的 path + locator）、relations（depends_on / related_to / opposite_to）、\
+     sources（raw/ 下的 path + locator，locator 按来源自身编号标注，如 第三十三条第二款 或 5.2.1）、\
+     relations（depends_on / related_to / opposite_to）、\
      claim_type（observed|summarized|inferred|unresolved）、confidence（0.0–1.0）、\
      created_at、updated_at（RFC-3339）；不要添加额外键。\n\n\
      正文包含 6 个小节：定义、证据/推理、示例或反例、局限性、\
      RAG Version（100–300 字的高密度压缩摘要，不是版本变更记录）、\
-     引用（raw/... 或 wiki/... 相对路径）。未解决的声明放入 reviews/。\n"
+     引用（相对路径 + locator，如 raw/law.md 第三十三条 或 wiki/concept.md）。\
+     法条、合同条款、公文与标准原文等规范文本必须从 raw/ 原文逐字引用，不得改写；\
+     RAG Version 只压缩节点的评述与关系，不改写规范文本。\
+     未解决的声明、新旧文本矛盾放入 reviews/，并用 opposite_to 表达。\n"
         .into()
 }
 

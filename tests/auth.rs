@@ -41,9 +41,11 @@ fn config(data_dir: PathBuf, auth_token: Option<&str>) -> Config {
 /// Router plus the TempDir backing its storage — keep both alive together.
 fn fixture(auth_token: Option<&str>) -> (Router, TempDir) {
     let tempdir = tempfile::tempdir().unwrap();
-    let service =
-        AppService::with_runtime(config(tempdir.path().join("data"), auth_token), Arc::new(IdleRuntime))
-            .unwrap();
+    let service = AppService::with_runtime(
+        config(tempdir.path().join("data"), auth_token),
+        Arc::new(IdleRuntime),
+    )
+    .unwrap();
     (http_api::router(service), tempdir)
 }
 

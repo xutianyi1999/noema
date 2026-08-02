@@ -52,6 +52,10 @@ pub fn router<R: OpenCodeRuntime>(service: AppService<R>) -> Router {
             get(job_status::<R>),
         )
         .route("/v1/libraries/{library_id}/query", post(query::<R>))
+        .route(
+            "/v1/libraries/{library_id}/files/{*path}",
+            get(knowledge_file::<R>),
+        )
         .nest_service("/mcp", crate::mcp::streamable_http_service(service.clone()))
         .with_state(service);
     // Without a configured token the API stays open: the historical
@@ -231,6 +235,35 @@ async fn query<R: OpenCodeRuntime>(
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, AppError> {
     Ok(Json(service.query(&library_id, &request.prompt).await?))
+}
+
+/// Serve one knowledge file (`raw/` or `wiki/`) for client-side rendering —
+/// e.g. a regulation page highlighting a verified citation's `[start, end)`
+/// span. Prefix, traversal and symlink containment are enforced by the
+/// service layer; anything outside the tree is a uniform 404.
+async fn knowledge_file<R: OpenCodeRuntime>(
+    State(service): State<AppService<R>>,
+    Path((library_id, path)): Path<(String, String)>,
+) -> Result<Response, AppError> {
+    let resolved = service.knowledge_file(&library_id, &path)?;
+    let metadata = tokio::fs::metadata(&resolved).await?;
+    let content_type = match resolved.extension().and_then(|value| value.to_str()) {
+        Some("md") => "text/markdown; charset=utf-8",
+        _ => "text/plain; charset=utf-8",
+    };
+    let file = tokio::fs::File::open(&resolved).await?;
+    Response::builder()
+        .header(header::CONTENT_TYPE, content_type)
+        .header(header::CONTENT_LENGTH, metadata.len())
+        .header(header::LAST_MODIFIED, http_date(metadata.modified()?))
+        .body(Body::from_stream(ReaderStream::new(file)))
+        .map_err(|error| AppError::Storage(error.to_string()))
+}
+
+/// RFC 1123 date for `Last-Modified`.
+fn http_date(time: std::time::SystemTime) -> String {
+    let datetime: chrono::DateTime<chrono::Utc> = time.into();
+    datetime.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
 }
 
 /// Streams the temporary export archive to the client; dropping the body

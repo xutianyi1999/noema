@@ -119,7 +119,9 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
                 reqwest::header::AUTHORIZATION,
                 format!("Bearer {token}").parse()?,
             );
-            reqwest::Client::builder().default_headers(headers).build()?
+            reqwest::Client::builder()
+                .default_headers(headers)
+                .build()?
         }
         None => reqwest::Client::new(),
     };
@@ -373,10 +375,18 @@ async fn cmd_query(
         for item in references.unwrap() {
             let title = string_field(item, "title");
             let source = string_field(item, "source");
-            let line = match item["node"].as_str() {
-                Some(node) => format!("  · {title}  {source} → {node}"),
-                None => format!("  · {title}  {source}"),
-            };
+            // `  · [2] 中华人民共和国担保法  第十八条  raw/担保法.md#char=812,848 → wiki/连带责任保证.md`
+            let mut line = format!("  · [{}] {title}", item["id"].as_u64().unwrap_or(0));
+            if let Some(locator) = item["locator"].as_str() {
+                line.push_str(&format!("  {locator}"));
+            }
+            line.push_str(&format!("  {source}"));
+            if let (Some(start), Some(end)) = (item["start"].as_u64(), item["end"].as_u64()) {
+                line.push_str(&format!("#char={start},{end}"));
+            }
+            if let Some(node) = item["node"].as_str() {
+                line.push_str(&format!(" → {node}"));
+            }
             let _ = writeln!(stdout(), "{}", paint(DIM, &line));
         }
     }

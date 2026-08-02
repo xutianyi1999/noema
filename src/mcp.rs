@@ -132,7 +132,8 @@ fn to_mcp_error(error: &crate::AppError) -> rmcp::ErrorData {
         | crate::AppError::Unauthorized
         | crate::AppError::Conflict(_)
         | crate::AppError::LibraryNotFound(_)
-        | crate::AppError::JobNotFound(_) => {
+        | crate::AppError::JobNotFound(_)
+        | crate::AppError::FileNotFound(_) => {
             rmcp::ErrorData::invalid_params(error.to_string(), None)
         }
         crate::AppError::QueryFailed(_)

@@ -35,8 +35,11 @@ fn spawn_server(data_dir: &Path) -> Server {
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
-    // Startup includes spawning the OpenCode Server child, so allow time.
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Startup includes spawning the OpenCode Server child. Both tests in
+    // this binary run in parallel and each spawns one, so a cold node
+    // runtime can lose a CPU race; allow generous time (serial startup is
+    // ~1s).
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
             break;

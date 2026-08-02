@@ -8,13 +8,14 @@ use std::{
 use tokio::sync::Semaphore;
 
 use crate::{
+    answer,
     config::Config,
     error::AppError,
     models::{
         CreateLibraryRequest, DocumentInput, HealthResponse, JobKind, JobState, JobStatus, Library,
         QueryResponse, SubmitDocumentResponse,
     },
-    references,
+    references::safe_knowledge_path,
     runtime::{AgentRunRequest, OpenCodeAgent, OpenCodeRuntime},
     storage::{Storage, StoredDocument},
 };
@@ -64,7 +65,7 @@ impl AppService<OpenCodeAgent> {
             ingest_locks: Arc::new(Mutex::new(HashMap::new())),
             sessions,
         };
-        service.reconcile_staging();
+        service.startup_maintenance();
         Ok(service)
     }
 }
@@ -81,7 +82,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             ingest_locks: Arc::new(Mutex::new(HashMap::new())),
             sessions,
         };
-        service.reconcile_staging();
+        service.startup_maintenance();
         Ok(service)
     }
 
@@ -115,22 +116,26 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .clone()
     }
 
-    /// Drop leftover staging workspaces whose jobs no longer need them (see
-    /// [`Storage::reconcile_staging`]). Runs at startup so residue from
-    /// previous runs — including directories OpenCode's session write-back
-    /// resurrected — converges away; per-library failures only log and
-    /// never block startup.
-    fn reconcile_staging(&self) {
+    /// Startup sweep, per library: drop leftover staging workspaces whose
+    /// jobs no longer need them (see [`Storage::reconcile_staging`]), then
+    /// refresh the Noema skills and the generated `AGENTS.md` contract to
+    /// this binary's versions — which is also what converges libraries
+    /// created by older binaries onto the current system-prompt contract.
+    /// Per-library failures only log and never block startup.
+    fn startup_maintenance(&self) {
         match self.storage.list_libraries() {
             Ok(libraries) => {
                 for library in libraries {
                     if let Err(error) = self.storage.reconcile_staging(&library.id) {
                         tracing::warn!(library_id = %library.id, %error, "staging reconcile failed");
                     }
+                    if let Err(error) = crate::bootstrap::write_skills(Path::new(&library.root)) {
+                        tracing::warn!(library_id = %library.id, %error, "skills and contract refresh failed");
+                    }
                 }
             }
             Err(error) => {
-                tracing::warn!(%error, "staging reconcile skipped: cannot list libraries")
+                tracing::warn!(%error, "startup maintenance skipped: cannot list libraries")
             }
         }
     }
@@ -231,11 +236,15 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .await
             .map_err(|_| AppError::Runtime("session semaphore closed".into()))?;
         let query_id = self.storage.record_query(&library_id)?;
+        // The user question goes in unmodified: all policy (the answer
+        // contract, citation discipline, library boundaries) reaches the
+        // Agent through the system prompt from the library's generated
+        // AGENTS.md contract.
         let request = AgentRunRequest {
             library_id: library_id.clone(),
             workdir: root.clone(),
             title: format!("Noema query {query_id}"),
-            prompt: format_query_prompt(prompt),
+            prompt: prompt.to_string(),
         };
 
         let result = match self.runtime.run_new_session(request).await {
@@ -256,15 +265,38 @@ impl<R: OpenCodeRuntime> AppService<R> {
             Some(&result.session_id),
             None,
         )?;
-        let cited = references::extract_references(&root, &result.answer);
+        let (answer, references) = answer::present_answer(&root, &result.answer);
         Ok(QueryResponse {
             query_id,
             library_id,
             session_id: result.session_id,
-            answer: result.answer,
-            references: cited,
+            answer,
+            references,
             tool_events: result.tool_events,
         })
+    }
+
+    /// Resolve one knowledge file for reading: `library` accepts an id or a
+    /// unique name; `relative` must stay inside the library under `raw/` or
+    /// `wiki/`. Canonicalization rejects symlink escapes; missing files and
+    /// paths outside the tree are the same `FileNotFound` to the client.
+    pub fn knowledge_file(&self, library: &str, relative: &str) -> Result<PathBuf, AppError> {
+        let library_id = self.storage.resolve_library(library)?.id;
+        if !safe_knowledge_path(relative) {
+            return Err(AppError::BadRequest(format!(
+                "not a raw/ or wiki/ knowledge path: {relative}"
+            )));
+        }
+        let root = self.storage.library_root(&library_id)?;
+        let not_found = || AppError::FileNotFound(relative.to_string());
+        let canonical = root
+            .join(relative)
+            .canonicalize()
+            .map_err(|_| not_found())?;
+        let contained = root
+            .canonicalize()
+            .is_ok_and(|root| canonical.starts_with(root) && canonical.is_file());
+        contained.then_some(canonical).ok_or_else(not_found)
     }
 
     async fn process_ingest(
@@ -310,7 +342,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             library_id: library_id.into(),
             workdir: staging,
             title: format!("Noema ingestion {job_id}"),
-            prompt: format_ingest_prompt(&stored.record.path, job_id, incremental),
+            prompt: format_ingest_task(&stored.record.path, job_id, incremental),
         };
         let result = match self.runtime.run_new_session(request).await {
             Ok(result) => result,
@@ -374,19 +406,17 @@ impl<R: OpenCodeRuntime> AppService<R> {
     }
 }
 
-fn format_query_prompt(prompt: &str) -> String {
-    format!(
-        "你是 Noema 内容库查询 Agent。只能在当前内容库项目内工作。先阅读 purpose.md 和 schema.md，再阅读 index.md；摘要优先——先读相关 wiki 节点的定义和 RAG Version 压缩摘要，不足时再读完整节点与 raw/ 原文；涉及关系问题时按需运行 graphify query。不要写入、编辑或删除文件，也不要访问项目外路径。只依据内容库证据回答用户的自然语言问题，简洁说明推理过程，并为每个事实性结论引用相对路径，例如 raw/example.md 或 wiki/concept.md。最终答案用 <noema-answer> 与 </noema-answer> 包裹，标记之间只放答案本身。\n\n用户问题：\n{prompt}"
-    )
-}
-
-fn format_ingest_prompt(source_path: &str, job_id: &str, incremental: bool) -> String {
+/// The ingest task message (user role): job-specific facts only. All policy
+/// — the node contract, citation discipline, library boundaries — lives in
+/// the library's generated `AGENTS.md` contract and reaches the Agent
+/// through OpenCode's system prompt.
+fn format_ingest_task(source_path: &str, job_id: &str, incremental: bool) -> String {
     let graphify_step = if incremental {
         "当前 staging 已有 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify . --update`。这是上游 Skill 的文档/文本增量流程；不要替换成裸 `graphify update .`，后者主要只更新代码 AST。"
     } else {
         "当前 staging 尚无 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify .` 完整首次建图流程。"
     };
     format!(
-        "你是 Noema 摄入任务 {job_id} 的知识编译 Agent。只能在当前暂存内容库项目内工作。先阅读 purpose.md 和 schema.md，再阅读 {source_path}；写入节点前先调用 OpenCode 的 `skill` 工具加载 knowledge-compiler Skill 并遵循其节点契约。创建节点前检查已有 wiki 节点，避免重复。创建或更新可追溯的知识节点：frontmatter 恰好包含契约定义的 9 个键，不要添加额外键；正文包含定义、证据/推理、示例或反例、局限性、RAG Version 和引用，其中 RAG Version 是节点 100–300 字的高密度压缩摘要（保留核心推理链，适合直接注入 LLM 上下文），不是版本变更记录。将未解决的冲突或低置信度关系放入 reviews/。\n\n{graphify_step} 项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT；让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n\n不要修改 raw 原文、.graphifyignore、.opencode、library.sqlite，也不要访问暂存项目外的路径。\n"
+        "摄入任务 {job_id}。先阅读 purpose.md 和 schema.md，再阅读源文档 {source_path}；节点落盘后同步更新 index.md。项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT。\n\n{graphify_step} 让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
     )
 }

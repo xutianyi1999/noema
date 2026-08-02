@@ -153,6 +153,45 @@ pub struct QueryRequest {
     pub prompt: String,
 }
 
+/// The JSON contract the query Agent must output inside its `<noema-answer>`
+/// marker. The JSON Schema embedded in the query prompt is generated from
+/// this type (`schemars`) and incoming answers are validated against the
+/// same schema (`jsonschema`), so prompt and validator never drift apart.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentAnswer {
+    /// The answer body, in whatever format the user's question asks for
+    /// (Markdown or otherwise). Every factual claim ends with an `[n]`
+    /// marker whose n is the 1-based index into `references`.
+    pub answer: String,
+    /// The sources the answer draws on.
+    #[serde(default)]
+    pub references: Vec<AgentReference>,
+}
+
+/// One source citation declared by the Agent. Only `source` and `quote` are
+/// required; offsets are an optional accelerator the server verifies before
+/// trusting and recomputes otherwise.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AgentReference {
+    /// Library-relative path under `raw/` or `wiki/`.
+    pub source: String,
+    /// The cited passage, copied verbatim from the source file; verified
+    /// server-side to be an exact substring.
+    pub quote: String,
+    /// The source's own address for the passage, in the source's own
+    /// numbering (e.g. `第三十三条第二款`, `5.2.1`); a human-facing label
+    /// the server passes through without interpreting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub locator: Option<String>,
+    /// Unicode character offset of the quote's first character (optional).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub start: Option<usize>,
+    /// Unicode character offset just past the quote's last character
+    /// (optional, exclusive).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub end: Option<usize>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpQueryRequest {
     pub library_id: String,
@@ -174,10 +213,32 @@ pub struct McpJobRequest {
     pub job_id: String,
 }
 
+/// One verified citation attached to a query response. The Agent declares
+/// only `source` + `quote` (plus optional offsets); every other field is
+/// computed and verified server-side against the library's files.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Reference {
+    /// Stable 1-based citation id matching the `[n]` markers in the answer;
+    /// ids of citations that failed verification are skipped, never reused.
+    pub id: u32,
+    /// Display name: the document's registered title for `raw/` sources
+    /// (filename stem as fallback), the node stem for `wiki/` sources.
     pub title: String,
+    /// Library-relative path, under `raw/` or `wiki/`.
     pub source: String,
+    /// The source's own address for the cited passage (e.g. `第三十三条`),
+    /// exactly as the Agent declared it; not interpreted by the server.
+    pub locator: Option<String>,
+    /// The cited passage, verified to be a verbatim substring of the source;
+    /// `None` only for fallback text-scanned citations.
+    pub quote: Option<String>,
+    /// RFC 5147 style Unicode character offsets into the source file
+    /// (`end` exclusive); `None` only for fallback citations.
+    pub start: Option<usize>,
+    pub end: Option<usize>,
+    /// 1-based inclusive line range covering the quote; `None` for fallback.
+    pub lines: Option<(usize, usize)>,
+    /// The compiled wiki node matching a `raw/` source, when one exists.
     pub node: Option<String>,
 }
 
