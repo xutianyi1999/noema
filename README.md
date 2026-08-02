@@ -6,203 +6,178 @@ Noema 是由 OpenCode 驱动的文本知识库服务。服务负责内容库、�
 
 ## 架构
 
-### 系统总览
+### 设计原则
+
+- **一库一世界**：每个内容库拥有独立的整套文件、独立的数据库和独立的 OpenCode 项目；库与库不共享文件、不互相引用，跨库的唯一途径是"导出 → 导入"副本。
+- **三方分工**：Noema 管边界与规则（协议、任务、校验、提交、进出库）；OpenCode Agent 负责知识生产（编译节点、建图、回答问题）；graphify 作为 Agent 的技能提供图谱构建与查询。
+- **先校验后入库**：Agent 只在暂存副本上工作，知识产物经服务端校验后才进入正式内容库；失败时正式库不受任何影响。
+- **唯一对外入口**：所有管理能力都经 HTTP API；MCP 与 noema-cli 是同一套能力的两种形态，命令行可以远程操作服务。
+- **证据可追溯**：知识节点声明来源，回答携带引用，服务端把引用映射回知识节点；任务与查询在控制面留下可审计历史。
+
+### 分层与依赖层级
 
 ```mermaid
 flowchart TB
-    HC["HTTP 客户端<br/>/v1/health · /libraries · /documents · /jobs · /query · export/import"]
-    MC["MCP 客户端<br/>Streamable HTTP · /mcp"]
-    CLI["noema-cli 命令行客户端<br/>create · list · export · import ·<br/>submit · query · job"]
-
-    subgraph SVC["Noema 服务进程"]
-        API["axum HTTP + rmcp MCP 协议层"]
-        APP["AppService<br/>内容库 / 异步摄入任务 / 查询编排"]
-        RT["OpenCodeAgent 运行时<br/>每次请求创建全新 session"]
-        STO["Storage<br/>控制库 + 内容库目录"]
-        TR["Transcript<br/>NOEMA_TRANSCRIPT 服务端日志"]
+    subgraph L1["客户端层"]
+        HC["HTTP 客户端"]
+        MC["MCP 客户端（AI 工具）"]
+        CLI["noema-cli 命令行（可远程）"]
     end
 
-    subgraph DATA["数据目录 data/"]
-        CTL[("control.sqlite<br/>libraries · jobs · query_runs")]
-        subgraph LIB["单个内容库 libraries/library_id/ — 库间完全隔离"]
-            OC[".opencode/<br/>kb-ingest / kb-query / kb-maintain /<br/>knowledge-compiler + graphify 插件"]
-            RAW["raw/ 原文<br/>SHA-256 去重 · 只读"]
-            WIKI["wiki/ 知识节点<br/>LLM-WIKI 契约 · 9 键 frontmatter"]
-            REV["reviews/ 未决声明"]
-            GOUT["graphify-out/<br/>graph.json · 报告 · HTML"]
-            STG["staging/job_id/<br/>摄入暂存 · 校验后才提交"]
-            LDB[("library.sqlite<br/>documents · nodes · FTS")]
-        end
+    subgraph L2["协议接入层 — 唯一对外入口"]
+        HTTP["HTTP API /v1/*"]
+        MCPE["MCP Streamable HTTP · /mcp"]
     end
 
-    subgraph OCD["OpenCode Server 子进程<br/>由 noema 拉起，随服务停止"]
-        SES["Agent session<br/>读取工作区 · 执行 skill"]
+    subgraph L3["业务编排层 — Noema 服务进程"]
+        direction LR
+        LIB["内容库管理"]
+        ING["摄入任务编排"]
+        QRY["查询编排"]
+        SNAP["快照进出库"]
     end
-    GCLI["graphify CLI<br/>/graphify . 建图"]
 
-    HC --> API
-    MC --> API
-    API --> APP
-    APP --> RT
-    APP --> STO
-    STO --> CTL
-    STO --> LDB
-    RT <-->|"SSE 事件流 / 最终文本"| SES
-    SES -->|"在库工作目录内读写"| STG
-    STG -->|"validate → promote"| WIKI
-    STG -->|"validate → promote"| GOUT
-    SES -->|"skill 调用"| GCLI
-    GCLI --> GOUT
-    RT -.->|"text / thinking / tool / skill"| TR
-    SVC -.->|"拉起 / 等待就绪 / 随服务停止"| OCD
-    CLI -->|"HTTP API（可与服务不在同一台机器）"| API
+    subgraph L4["Agent 运行时层"]
+        RT["每次请求一个一次性 OpenCode session<br/>收集答案与中间过程"]
+    end
+
+    subgraph L5["数据层 — 目录与文件结构见下节"]
+        CTL[("control.sqlite<br/>内容库注册 · 摄入任务 · 查询历史")]
+        FS[("libraries/{library_id}/<br/>每库一套完整文件与库内数据库")]
+    end
+
+    subgraph L6["受管外部进程"]
+        OC["OpenCode Server — 服务拉起的子进程 · 随服务停止"]
+        GF["graphify — 由 OpenCode 以 skill 调用"]
+    end
+
+    L1 --> L2 --> L3
+    LIB --> CTL
+    LIB --> FS
+    ING --> RT
+    QRY --> RT
+    ING --> FS
+    SNAP --> FS
+    RT <-->|"session 与事件流"| OC
+    OC -.->|"skill 调用"| GF
+    OC -->|"只在被服务的内容库内读写"| FS
+    GF -->|"产物落在被服务的内容库内"| FS
 ```
 
-三条进程边界：Noema 服务、OpenCode Server、graphify CLI。OpenCode Server 是 noema 拉起的子进程（启动时等待就绪、Ctrl-C 时一并停止）。Noema 管理内容库、任务与对外协议，并校验摄入产物后才提交；OpenCode Agent 只在一个内容库的工作目录内读写；graphify 产物按库生成。所有管理操作（添加文档、导入导出、查询）都经 HTTP API（`/v1/...`）进行，命令行客户端 `noema-cli` 是对它的封装，允许在与服务不同的机器上操作；快照是单个内容库的完整副本，库与库之间不共享任何文件。
+依赖关系单向向下：客户端只与协议层交互，协议层只做协议翻译，业务规则只存在于业务编排层。三个进程协作——Noema 服务负责编排与校验；OpenCode Server 是服务拉起并管理的子进程（启动等待就绪、Ctrl-C 一并停止），且只在被服务的内容库目录内读写；graphify 平时由 OpenCode 以 skill 调用，建库与快照导入时由 Noema 运行其安装器。
 
-### 摄入流水线
+### 内容库目录与文件结构
+
+```text
+data/                                  数据根目录（NOEMA_DATA_DIR）
+├── control.sqlite                     控制面：内容库注册、摄入任务、查询历史
+├── jobs/                              快照导入临时目录（导入结束必定清理）
+└── libraries/{library_id}/            一个内容库 —— 与其他库完全隔离
+    ├── purpose.md                     内容库定位：范围、关键问题、术语、更新政策
+    ├── schema.md                      知识节点契约的人类可读声明
+    ├── index.md                       全库知识索引（派生，提交后重建）
+    ├── manifest.json                  原文清单（派生）
+    ├── .graphifyignore                graphify 输入边界：只含 raw/ 与 wiki/
+    ├── AGENTS.md                      Agent 行为说明（graphify 安装器写入）
+    ├── library.sqlite                 库内数据库：原文去重、节点注册、全文检索
+    ├── .opencode/                     OpenCode 项目：四个 Noema Skill、graphify 插件与配置
+    ├── raw/                           原文：.md/.txt、单级文件名、SHA-256 去重、入库后只读
+    ├── wiki/                          知识节点：LLM-WIKI 契约、9 键 frontmatter
+    ├── reviews/                       未解决的声明与低置信度关系
+    ├── graphify-out/                  图谱产物：graph.json、报告、交互 HTML、增量缓存
+    └── staging/{job_id}/              摄入工作区：库根输入的副本，校验通过才提交
+```
+
+读写职责与边界：
+
+| 目录 / 文件 | 业务角色 | 写入方 | 边界约束 |
+| --- | --- | --- | --- |
+| `raw/` | 事实来源，一切知识的证据基础 | Noema（提交文档） | SHA-256 去重、写入后只读；Agent 不得修改 |
+| `wiki/` | 编译后的知识节点 | Agent（经 staging 提交） | frontmatter 恰好 9 键；正文含定义 / 证据 / 示例 / 局限 / RAG 压缩摘要 / 引用 |
+| `reviews/` | 未解决的冲突与低置信度结论 | Agent（经 staging 提交） | 与正式知识分离，留待人工或后续任务处理 |
+| `graphify-out/` | 知识图谱、报告与增量缓存 | graphify（经 staging 提交） | 输入被限定为 `raw/` + `wiki/`；与 raw/wiki 同级，只服务图谱查询 |
+| `index.md` · `manifest.json` · `library.sqlite` | 派生索引与去重记录 | Noema 自动重建 | 不手写；永远由原文、知识节点和库内数据库再生 |
+| `staging/{job_id}/` | 摄入隔离工作区 | Noema 创建与清理 | 成功则提交允许的知识产物并清理；失败则保留备查，库不受影响 |
+| `purpose.md` · `schema.md` · `.graphifyignore` | 内容库契约与边界 | 建库时种入 | 摄入校验要求逐字节未变；Agent 与 graphify 都在其划定的范围内活动 |
+| `.opencode/` · `AGENTS.md` | Agent 能力与行为说明 | Noema 与 graphify 安装器 | 建库与快照导入时写入/刷新；不属于知识提交物 |
+
+知识进入正式库的唯一路径：Agent 在 `staging/{job_id}/` 内写入 → Noema 校验 → 只把白名单内的知识产物（`wiki/`、`reviews/`、`graphify-out/`、`index.md`、`manifest.json`）提交到库根。
+
+### 摄入业务流
 
 ```mermaid
 flowchart TB
-    REQ["POST /v1/libraries/{id}/documents<br/>filename · title? · content"] --> STORE["store_document<br/>写入 raw/ · SHA-256 去重 ·<br/>登记 library.sqlite · 同步 manifest.json"]
-    STORE --> JOB["create_job → queued"]
-    JOB --> DUP{"内容已存在？"}
-    DUP -->|"是（重复提交）"| SKIP["job → skipped<br/>同步返回 document_path"]
-    DUP -->|"否"| TASK["tokio 异步任务<br/>job → running"]
-
-    subgraph STAGE["staging/{job_id}/ — 库根输入副本（prepare_staging）"]
-        AGENT["OpenCode session（工作目录 = staging）<br/>knowledge-compiler Skill 写 wiki 节点 ·<br/>/graphify .（首次）或 /graphify . --update（增量）"]
-    end
-
-    TASK --> STAGE
-
-    subgraph GATE["validate_staging — 服务端提交校验"]
-        direction TB
-        V1["无符号链接（.opencode 运行时树除外）"]
-        V2["顶层路径白名单（布局常量单一来源）"]
-        V3["受保护路径逐字节不变<br/>.graphifyignore · raw/ · purpose.md · schema.md"]
-        V4["wiki/*.md 恰好 9 键 YAML frontmatter"]
-        V5["不得含 library.sqlite"]
-    end
-
-    STAGE --> GATE
-    GATE -->|"全部通过"| PROMOTE["promote_staging<br/>整体替换 wiki/ · reviews/ · graphify-out/<br/>覆盖 index.md · manifest.json"]
-    PROMOTE --> REBUILD["rebuild_index<br/>library.sqlite 索引 + 全文检索"]
-    REBUILD --> CLEAN["cleanup_staging · job → completed"]
-    GATE -->|"任一失败"| FAIL["job → failed · staging 保留备查"]
+    S1["提交文档"] --> S2["去重判定（SHA-256）<br/>新原文写入 raw/ 并登记"]
+    S2 --> S3{"内容是否已入库？"}
+    S3 -->|"是"| S4["任务记为 skipped"]
+    S3 -->|"否"| S5["创建摄入任务<br/>库根输入整套复制进隔离的 staging 工作区"]
+    S5 --> S6["OpenCode Agent 在 staging 内工作：<br/>按节点契约编译知识节点 ·<br/>首次完整建图，此后增量更新图谱"]
+    S6 --> S7{"服务端提交校验<br/>工作区边界干净 · 受保护文件逐字节未变 ·<br/>节点契约完整 · 无禁入文件"}
+    S7 -->|"通过"| S8["仅允许的知识产物提交回库根"]
+    S8 --> S9["重建库内索引与全文检索"]
+    S9 --> S10["任务完成 · 工作区清理"]
+    S7 -->|"失败"| S11["任务失败 · 工作区保留备查 · 正式库不受影响"]
 ```
 
-Agent 始终只看到库根输入的副本：首次摄入时 staging 没有 `graphify-out/graph.json`，提示词走完整 `/graphify .`；此后的摄入会把库内已有图谱一并复制进 staging，触发 `--update` 增量建图。失败的任务不删除 staging，错误原因记录在 job 的 error 字段。
+提交是"Agent 产出"与"库内知识"的分界线：Agent 完成前正式库一个字节不变，校验失败后同样不变。失败的工作区留在磁盘上，配合任务的错误信息可反复排查。
 
-### 查询时序
+### 查询业务流
 
 ```mermaid
 sequenceDiagram
-    participant C as 客户端 HTTP / MCP / noema-cli
-    participant S as AppService
-    participant DB as SQLite 控制库 + 库内库
-    participant OC as OpenCode Server · session 工作目录 = 库根
-    participant G as graphify CLI
+    participant U as 提问方 HTTP / MCP / CLI
+    participant N as Noema
+    participant A as OpenCode Agent · 工作在内容库根目录
+    participant G as graphify
 
-    C->>S: POST /v1/libraries/{id}/query · prompt
-    S->>DB: record_query → running
-    S->>OC: 新建 session · 允许全部权限 · 禁用 question
-    Note over OC: 读 purpose.md / schema.md → index.md<br/>摘要优先：wiki 节点的 RAG Version，<br/>不足时再读完整节点与 raw/ 原文
-    opt 关系类问题
-        OC->>G: graphify query（只读）
-        G-->>OC: 作用域子图
+    U->>N: 自然语言问题
+    N->>A: 创建一次性 session
+    Note over A: 先读内容库契约，再读索引；<br/>摘要优先 —— 先读相关知识节点的 RAG 压缩摘要，<br/>不足时再读完整节点与 raw/ 原文
+    opt 涉及关系的问题
+        A->>G: 图谱查询（只读）
+        G-->>A: 作用域子图
     end
-    OC-->>S: SSE 事件流，直至 SessionIdle
-    S->>OC: 删除 session · 一次性 · 所有退出路径都清理
-    Note over S: 只有 text 增量构成答案；thinking 仅进服务端 transcript；<br/>成对 noema-answer 标记之间为最终答案（缺失则回退整段）
-    S->>DB: update_query → completed
-    Note over S: extract_references：raw/ 与 wiki/ 引用，<br/>raw 来源映射到同名 wiki 节点（存在时）
-    S-->>C: answer · references · tool_events
-
-    alt session 出错 / 超时
-        S->>DB: update_query → failed
-        S-->>C: 502 · query failed
-    end
+    A-->>N: 带相对路径引用的证据化答案
+    N->>N: 规整答案格式 · 引用映射回知识节点
+    N-->>U: 答案 · 被引来源 · 对应知识节点
 ```
 
-查询是只读编排：服务侧不写知识文件，只在控制库记录查询历史，并从答案文本中回抽引用。OpenCode session 的中间过程（thinking、tool 调用）不进响应体，仅可选地落在服务端 transcript 日志。
+查询全程不写任何知识文件；session 用完即销毁，只在控制面留下查询历史。引用指向原文时，服务端同时附上对应的知识节点（若存在），形成"原文 → 节点"两级追溯。
 
-### 任务状态机
+### 摄入任务与查询状态
 
 ```mermaid
 stateDiagram-v2
-    [*] --> queued: create_job
-    queued --> skipped: 文档 SHA-256 重复
-    queued --> running: 异步摄入任务开始
-    running --> completed: 校验 → 提交 → 重建索引
-    running --> failed: OpenCode / 校验 / 提交任一环节出错
+    [*] --> queued: 任务创建
+    queued --> skipped: 文档内容重复
+    queued --> running: 开始处理
+    running --> completed: 编译 → 校验 → 提交 → 重建索引
+    running --> failed: 任一环节出错
     skipped --> [*]
     completed --> [*]
     failed --> [*]
 ```
 
-查询历史 `query_runs` 复用这个状态机的 `running / completed / failed` 子集（没有 queued 与 skipped 阶段）。
+查询历史复用其中 `running / completed / failed` 子集。任务错误信息、以及失败时保留的 staging 工作区，是排障依据。
 
-### 模块结构
-
-```mermaid
-flowchart LR
-    MAIN["main<br/>CLI 参数 → Config"] --> SUP["supervisor<br/>拉起 OpenCode 子进程 · 等待就绪 ·<br/>对外服务 · Ctrl-C 一并停止"]
-    SUP --> SVC["service::AppService<br/>库管理 · 摄入任务 · 查询编排 · 提示词契约"]
-
-    HTTP["http<br/>axum /v1/* · 快照流式收发"] --> SVC
-    MCP["mcp<br/>rmcp Streamable HTTP · /mcp"] --> SVC
-    CLI["bin/noema-cli<br/>reqwest HTTP 客户端"] -.->|"HTTP（可远程）"| HTTP
-
-    SVC --> RT["runtime::OpenCodeAgent<br/>session 生命周期 · 事件收集 · 答案契约"]
-    SVC --> SNAP["snapshot<br/>导出打包 · 导入校验 / 解包 / 修复"]
-    SVC --> BOOT["bootstrap<br/>graphify 安装器 · 四个 Skill"]
-    SVC --> REF["references<br/>答案引用抽取"]
-    RT -.->|"NOEMA_TRANSCRIPT"| TR["transcript<br/>服务端彩色日志"]
-
-    subgraph STO["storage/ — 持久层"]
-        SM["mod<br/>Storage · control.sqlite"]
-        SC["control<br/>库 / 任务 / 查询 CRUD · slugify"]
-        SD["documents<br/>library.sqlite · raw 写入 · 索引重建"]
-        SS["staging<br/>prepare / validate / promote / cleanup"]
-        SL["layout<br/>布局常量 · 建库种子模板"]
-        SF["fsutil<br/>copy_path · write_atomic"]
-    end
-    SVC --> SM
-```
-
-`storage/` 的五个子模块以 impl 块共享 `mod.rs` 中的 `Storage`；布局常量（建库、暂存输入、提交白名单、受保护路径）只定义在 `layout` 一处。`error` / `models` / `config` 横切所有模块，图中未画。
-
-### 快照导出 / 导入
+### 内容库隔离与快照复用
 
 ```mermaid
 flowchart LR
-    subgraph EXP["导出 GET /v1/libraries/{id}/export"]
-        direction TB
-        E1["写入 noema-snapshot.json 清单<br/>format v1 · 名称 · 来源库 id"]
-        E2["遍历库根目录"]
-        E3["排除 staging/ · library.sqlite-* 边车 ·<br/>.opencode/node_modules · .opencode/opencode-loop ·<br/>所有符号链接"]
-        E4["gzip tar 流式返回"]
-        E1 --> E2 --> E3 --> E4
-    end
-
-    subgraph IMP["导入 POST /v1/libraries/import"]
-        direction TB
-        I1["解包到 data/jobs/import-* 临时目录<br/>拒绝绝对路径 / .. / 符号链接 / 硬链接（400）"]
-        I2["校验清单格式与版本<br/>create_library：新 id · 新目录 · 新控制记录"]
-        I3["覆盖拷贝 → rebuild_index 重建全部派生产物"]
-        I4{"归档含 .opencode/？"}
-        I5["graphify 安装器补齐"]
-        I6["刷新四个 Noema Skill → 201 新库 JSON"]
-        I1 --> I2 --> I3 --> I4
-        I4 -->|"否"| I5 --> I6
-        I4 -->|"是"| I6
-    end
-
-    E4 -.->|"归档可分发到其他机器 / 其他用户"| I1
+    BASE["基础内容库<br/>共享文档 + 编译好的知识 + 图谱"] -->|"导出快照：单库完整副本"| FILE[("快照归档<br/>gzip tar")]
+    FILE -->|"分发（可离线）"| IMpa["用户 A 导入"]
+    FILE --> IMpb["用户 B 导入"]
+    IMpa --> NEWA["全新内容库 A<br/>新 id · 新目录 · 独立数据库"]
+    IMpb --> NEWB["全新内容库 B<br/>新 id · 新目录 · 独立数据库"]
+    NEWA --> ADDA["正常摄入流程添加自有文档<br/>图谱自动增量更新"]
+    NEWB --> ADDB["正常摄入流程添加自有文档<br/>图谱自动增量更新"]
 ```
 
-`library.sqlite` 本身随快照导出（只存库内相对路径，可移植），排除的只是进程边车文件。导入始终新建内容库：名称可改可重名（知识身份由节点 `node_id` 承载），任一步失败都完整回滚（删新库目录、撤控制记录），临时目录无论如何都会清理。
+隔离与复用规则：
+
+- 库是完全隔离的单位：不共享文件、不互引；跨库只有"导出 → 导入"副本这一条路。
+- 快照是单个内容库的完整副本（含图谱产物与库内数据库，不含 staging 工作区与运行时状态）；含路径穿越、符号链接或硬链接的归档一律拒绝。
+- 导入始终新建内容库，失败完整回滚；名称只是别名，可改可重名，知识的身份由节点内 `node_id` 承载。
 
 ## 依赖
 
@@ -348,24 +323,4 @@ NOEMA_TRANSCRIPT=1 noema
 
 内容库的 graphify 生命周期是：空内容库只安装插件和 Skill；首篇文本文档摄入时由 OpenCode 执行完整的 `/graphify .`；已有图谱后，新文档或变更文档摄入时执行 `/graphify . --update` 增量更新。
 
-数据默认位于：
-
-```text
-data/
-├── control.sqlite
-└── libraries/{library_id}/
-    ├── .opencode/
-    ├── raw/
-    ├── wiki/
-    ├── reviews/
-    ├── staging/
-    ├── graphify-out/
-    ├── purpose.md
-    ├── schema.md
-    ├── .graphifyignore    # 上游 graphify 的输入边界：只包含 raw/ 和 wiki/
-    ├── index.md
-    ├── manifest.json
-    └── library.sqlite
-```
-
-`raw/` 中只接收单文件名的 `.md` 和 `.txt` 文档，原文按 SHA-256 去重并保持不变。摄入 Agent 在 `staging/{job_id}` 中工作，成功后服务才提交允许的知识产物。
+目录与文件结构、各路径的读写职责见上文「架构 → 内容库目录与文件结构」。
