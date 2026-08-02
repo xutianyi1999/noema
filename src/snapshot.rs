@@ -110,8 +110,9 @@ fn import_inner(
 
     let manifest = read_snapshot_manifest(scratch)?;
     let had_opencode = scratch.join(".opencode").is_dir();
-    // The library name is an alias, not an identity: callers may rename
-    // freely and duplicate names are allowed (node_id carries the identity).
+    // The snapshot records the source library's name; importers keep it
+    // unless they pass an explicit one. Names are unique, so re-importing
+    // a snapshot of a library that still exists requires a new name.
     let name = name
         .map(str::to_string)
         .or_else(|| manifest.as_ref().map(|item| item.name.clone()))

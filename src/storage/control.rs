@@ -5,6 +5,7 @@ use std::{fs, path::PathBuf};
 
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 
 use super::{Storage, layout, parse_timestamp_or_now};
@@ -15,27 +16,41 @@ use crate::{
 
 impl Storage {
     pub fn create_library(&self, request: &CreateLibraryRequest) -> Result<Library, AppError> {
-        let name = request.name.trim();
-        if name.is_empty() {
-            return Err(AppError::BadRequest("library name cannot be empty".into()));
+        // The name is the identity: it becomes the library id and the
+        // directory name verbatim, so names are unique and path-safe.
+        let name: String = request.name.trim().nfc().collect();
+        validate_library_id(&name)?;
+        let taken = self
+            .db()?
+            .query_row(
+                "SELECT 1 FROM libraries WHERE name = ?1",
+                params![name],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if taken {
+            return Err(AppError::Conflict(format!(
+                "a library named {name} already exists"
+            )));
         }
 
-        let id = format!(
-            "{}-{}",
-            slugify(name),
-            &Uuid::new_v4().simple().to_string()[..12]
-        );
+        let id = name.clone();
         let root = self.root.join("libraries").join(&id);
         let now = Utc::now();
+
+        if let Err(error) = layout::scaffold_library(&root, &name) {
+            let _ = fs::remove_dir_all(&root);
+            return Err(error);
+        }
+
         let library = Library {
             id: id.clone(),
-            name: name.into(),
+            name,
             description: request.description.clone(),
             root: root.display().to_string(),
             created_at: now,
         };
-
-        layout::scaffold_library(&root, name)?;
 
         let result = self.db()?.execute(
             "INSERT INTO libraries (id, name, description, root, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -111,9 +126,13 @@ impl Storage {
     }
 
     /// Resolve a protocol-layer library selector: an exact id first, then an
-    /// unambiguous name. CLI and HTTP callers may pass either; storage
-    /// internals always receive the resolved id.
+    /// unambiguous name. New libraries use their name verbatim as the id and
+    /// names are unique, so for them the two match; the name fallback still
+    /// covers legacy libraries whose ids carry a random suffix. CLI and HTTP
+    /// callers may pass either; storage internals always receive the
+    /// resolved id.
     pub fn resolve_library(&self, selector: &str) -> Result<Library, AppError> {
+        let selector: String = selector.trim().nfc().collect();
         let libraries = self.list_libraries()?;
         if let Some(library) = libraries.iter().find(|item| item.id == selector) {
             return Ok(library.clone());
@@ -123,7 +142,7 @@ impl Storage {
             .filter(|item| item.name == selector)
             .collect();
         match by_name.as_slice() {
-            [] => Err(AppError::LibraryNotFound(selector.into())),
+            [] => Err(AppError::LibraryNotFound(selector)),
             [library] => Ok((*library).clone()),
             many => {
                 let ids = many
@@ -256,27 +275,20 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobStatus> {
     })
 }
 
-fn slugify(value: &str) -> String {
-    // Unicode-aware (CJK names transliterate to pinyin instead of
-    // collapsing to the empty-string fallback).
-    let slug = slug::slugify(value);
-    if slug.is_empty() {
-        return "library".into();
-    }
-    slug.chars()
-        .take(48)
-        .collect::<String>()
-        .trim_matches('-')
-        .into()
-}
-
+/// Library ids are the library names themselves (legacy ids with a random
+/// suffix remain valid), so the id character set is whatever is safe as a
+/// single directory-name component: non-empty, within the filesystem's
+/// 255-byte limit, no path separators, control characters or dot-names.
+/// Unicode letters and digits — CJK names included — are allowed; URLs
+/// travel percent-encoded and SQLite keys are plain TEXT.
 fn validate_library_id(value: &str) -> Result<(), AppError> {
-    if value.is_empty()
-        || value.len() > 80
-        || !value.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-' || byte == b'_'
-        })
-    {
+    let invalid = value.is_empty()
+        || value.len() > 255
+        || matches!(value, "." | "..")
+        || value
+            .chars()
+            .any(|character| character.is_control() || matches!(character, '/' | '\\'));
+    if invalid {
         return Err(AppError::BadRequest("invalid library_id".into()));
     }
     Ok(())

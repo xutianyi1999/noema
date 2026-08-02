@@ -127,6 +127,7 @@ fn json_response<T: serde::Serialize>(value: &T) -> Result<String, rmcp::ErrorDa
 fn to_mcp_error(error: &crate::AppError) -> rmcp::ErrorData {
     match error {
         crate::AppError::BadRequest(_)
+        | crate::AppError::Conflict(_)
         | crate::AppError::LibraryNotFound(_)
         | crate::AppError::JobNotFound(_) => {
             rmcp::ErrorData::invalid_params(error.to_string(), None)

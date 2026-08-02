@@ -7,6 +7,7 @@ use std::{fs, path::Path};
 use chrono::Utc;
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
+use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -24,7 +25,11 @@ impl Storage {
         content: &str,
     ) -> Result<StoredDocument, AppError> {
         let root = self.library_root(library_id)?;
-        validate_filename(filename)?;
+        // Filenames are kept verbatim (NFC-normalized so visually identical
+        // names share one spelling), so they must stay single-component and
+        // citation-safe.
+        let filename: String = filename.nfc().collect();
+        validate_filename(&filename)?;
         let mut hasher = Sha256::new();
         hasher.update(content.as_bytes());
         let sha256 = hex::encode(hasher.finalize());
@@ -45,23 +50,40 @@ impl Storage {
             });
         }
 
+        // The content is new; a document with the same name is therefore a
+        // different file — raw/ names are stable identities, not a namespace
+        // for versions, so the uploader must rename rather than clobber.
+        let name_taken = connection
+            .query_row(
+                "SELECT 1 FROM documents WHERE filename = ?1",
+                params![filename],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if name_taken {
+            return Err(AppError::Conflict(format!(
+                "a document named {filename} already exists with different content"
+            )));
+        }
+
         let id = Uuid::new_v4().to_string();
-        let safe_name = format!("{}-{}", &sha256[..12], filename);
-        let relative_path = format!("raw/{safe_name}");
+        let relative_path = format!("raw/{filename}");
         write_atomic(&root.join(&relative_path), content.as_bytes())?;
+        let title = title
+            .filter(|value| !value.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| {
+                Path::new(&filename)
+                    .file_stem()
+                    .and_then(|value| value.to_str())
+                    .unwrap_or(&filename)
+                    .to_string()
+            });
         let record = DocumentRecord {
             id,
-            filename: filename.into(),
-            title: title
-                .filter(|value| !value.trim().is_empty())
-                .map(ToOwned::to_owned)
-                .unwrap_or_else(|| {
-                    Path::new(filename)
-                        .file_stem()
-                        .and_then(|value| value.to_str())
-                        .unwrap_or(filename)
-                        .to_string()
-                }),
+            filename,
+            title,
             path: relative_path,
             sha256,
             created_at: now,
@@ -226,10 +248,12 @@ fn validate_filename(value: &str) -> Result<(), AppError> {
         .and_then(|value| value.to_str())
         .unwrap_or_default();
     if value.is_empty()
+        || value != value.trim()
         || value.contains('/')
         || value.contains('\\')
         || value == "."
         || value == ".."
+        || value.chars().any(char::is_control)
         || !matches!(extension.to_ascii_lowercase().as_str(), "md" | "txt")
     {
         return Err(AppError::BadRequest(

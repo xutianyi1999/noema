@@ -94,7 +94,7 @@ fn run(command: &mut Command) -> (bool, String, String) {
 }
 
 /// Read one value out of the CLI's `key  value` output blocks, e.g. the
-/// `ID  fa-gui-ku-…` row that `create` and `import` print.
+/// `ID  法规库` row that `create` and `import` print.
 fn field<'a>(stdout: &'a str, key: &str) -> &'a str {
     stdout
         .lines()

@@ -143,7 +143,8 @@ async fn library_ingestion_query_and_session_isolation_work() {
     let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
     assert_eq!(status.status, JobState::Completed, "{status:?}");
     assert!(status.session_id.is_some());
-    assert!(root.join("raw").read_dir().unwrap().next().is_some());
+    // Documents keep their original names: no hash prefix, no rewrite.
+    assert!(root.join("raw/source.md").is_file());
     assert!(root.join("wiki/session-context.md").is_file());
 
     let second = service
@@ -239,6 +240,31 @@ async fn libraries_are_isolated_and_invalid_documents_are_rejected() {
         .await;
     assert!(matches!(invalid, Err(AppError::BadRequest(_))));
     assert!(service.job_status(&first.id, "missing").is_err());
+
+    // Filenames are stable identities: the same name with different content
+    // is rejected instead of coexisting under a hash prefix.
+    service
+        .submit_document(
+            &first.id,
+            DocumentInput {
+                filename: "note.md".into(),
+                content: "first version".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    let conflict = service
+        .submit_document(
+            &first.id,
+            DocumentInput {
+                filename: "note.md".into(),
+                content: "second, different version".into(),
+                title: None,
+            },
+        )
+        .await;
+    assert!(matches!(conflict, Err(AppError::Conflict(_))));
 }
 
 #[tokio::test]
@@ -251,6 +277,9 @@ async fn libraries_are_addressable_by_unique_name() {
         })
         .await
         .unwrap();
+    // The name is the id and the directory name, verbatim.
+    assert_eq!(library.id, "法规库");
+    assert!(PathBuf::from(&library.root).ends_with("libraries/法规库"));
 
     let submitted = service
         .submit_document(
@@ -269,30 +298,34 @@ async fn libraries_are_addressable_by_unique_name() {
     let answer = service.query("法规库", "这个概念是什么？").await.unwrap();
     assert_eq!(answer.library_id, library.id);
 
-    // A duplicated name makes the selector ambiguous: callers must fall
-    // back to the id, which always keeps working.
-    service
+    // Names are unique identities now: a second library under the same name
+    // is rejected instead of making the selector ambiguous.
+    let duplicate = service
         .create_library(CreateLibraryRequest {
             name: "法规库".into(),
             description: None,
         })
-        .await
-        .unwrap();
-    let ambiguous = service
-        .submit_document(
-            "法规库",
-            DocumentInput {
-                filename: "other.md".into(),
-                content: "content".into(),
-                title: None,
-            },
-        )
         .await;
-    assert!(matches!(ambiguous, Err(AppError::BadRequest(_))));
+    assert!(matches!(duplicate, Err(AppError::Conflict(_))));
     assert!(service.job_status(&library.id, &submitted.job_id).is_ok());
     assert!(matches!(
         service.job_status("no-such-library", "missing"),
         Err(AppError::LibraryNotFound(_))
+    ));
+
+    // NFC and NFD spellings of one name are one identity: a library created
+    // with a decomposed name is addressable in composed form.
+    let decomposed = service
+        .create_library(CreateLibraryRequest {
+            name: "cafe\u{301}".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    assert_eq!(decomposed.id, "caf\u{e9}");
+    assert!(matches!(
+        service.job_status("caf\u{e9}", "missing"),
+        Err(AppError::JobNotFound(_))
     ));
 }
 

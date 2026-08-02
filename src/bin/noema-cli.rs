@@ -42,7 +42,7 @@ enum Command {
     Status,
     /// 创建内容库（服务工作目录与 Skill 由服务端生成）
     Create {
-        /// 内容库名称（只是别名，可重复）
+        /// 内容库名称（唯一；原样用作内容库 id 与目录名）
         name: String,
         /// 内容库描述
         #[arg(long)]
@@ -62,7 +62,7 @@ enum Command {
     Import {
         /// 本地快照归档路径（.tar.gz）
         archive: PathBuf,
-        /// 新内容库名称（默认用快照记录的原名；名称只是别名，可重复）
+        /// 新内容库名称（默认用快照记录的原名；与已有库重名会被拒绝）
         #[arg(long)]
         name: Option<String>,
         /// 新内容库描述

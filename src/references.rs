@@ -60,15 +60,16 @@ pub(crate) fn extract_references(root: &Path, answer: &str) -> Vec<Reference> {
 }
 
 /// Extracts a `raw/…` or `wiki/…` file path starting at `start`, stopping at
-/// the first character outside `[A-Za-z0-9/._-]` and dropping any trailing
-/// dots. Line/column locators (`:24`, `:5-7,15`) and surrounding punctuation
-/// are therefore excluded. Returns `None` unless the run ends in an allowed
-/// knowledge-file extension.
+/// the first character that is neither alphanumeric (Unicode, so CJK
+/// filenames stay intact) nor one of `/._-`, and dropping any trailing dots.
+/// Line/column locators (`:24`, `:5-7,15`), whitespace and surrounding
+/// punctuation (ASCII or full-width) are therefore excluded. Returns `None`
+/// unless the run ends in an allowed knowledge-file extension.
 fn reference_candidate(text: &str, start: usize) -> Option<String> {
     let run: String = text[start..]
         .chars()
         .take_while(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
+            character.is_alphanumeric() || matches!(character, '/' | '.' | '_' | '-')
         })
         .collect();
     let candidate = run.trim_end_matches('.');
@@ -123,6 +124,16 @@ mod tests {
         let (_directory, root) = library_with_files();
         let references = extract_references(&root, "raw/source-a.md 再看 raw/source-a.md:3");
         assert_eq!(references.len(), 1);
+    }
+
+    #[test]
+    fn extracts_cjk_filenames_with_locators_and_punctuation() {
+        let (_directory, root) = library_with_files();
+        fs::write(root.join("raw/评估指南.md"), "e").unwrap();
+        let references =
+            extract_references(&root, "详见 raw/评估指南.md:5-7；另见 raw/评估指南.md。");
+        let sources: Vec<&str> = references.iter().map(|item| item.source.as_str()).collect();
+        assert_eq!(sources, ["raw/评估指南.md"]);
     }
 
     #[test]
