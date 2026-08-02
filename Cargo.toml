@@ -18,7 +18,7 @@ futures-util = "0.3"
 hex = "0.4"
 opencode_rs = { git = "https://github.com/allisoneer/agentic_auxilary.git", features = ["http", "sse", "server"] }
 percent-encoding = "2"
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 rmcp = { version = "3.1.0", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
 schemars = "1.2"
