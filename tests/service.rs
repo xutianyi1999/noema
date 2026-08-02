@@ -85,6 +85,7 @@ fn config(data_dir: PathBuf) -> Config {
         opencode_model: "opencode/deepseek-v4-flash-free".into(),
         opencode_timeout_secs: 5,
         transcript: false,
+        max_sessions: 4,
     }
 }
 
@@ -327,6 +328,68 @@ async fn libraries_are_addressable_by_unique_name() {
         service.job_status("caf\u{e9}", "missing"),
         Err(AppError::JobNotFound(_))
     ));
+}
+
+#[tokio::test]
+async fn concurrent_submissions_to_one_library_are_serialized() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "并发库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+
+    // Two documents in without waiting: both jobs are accepted at once.
+    let first = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "one.md".into(),
+                content: "# One\n\nFirst source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    let second = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "two.md".into(),
+                content: "# Two\n\nSecond source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let first_status = wait_for_completion(&service, &library.id, &first.job_id).await;
+    let second_status = wait_for_completion(&service, &library.id, &second.job_id).await;
+    assert_eq!(first_status.status, JobState::Completed, "{first_status:?}");
+    assert_eq!(
+        second_status.status,
+        JobState::Completed,
+        "{second_status:?}"
+    );
+
+    // The ingest lock made the second job prepare its staging after the
+    // first job's promotion, so the second prompt takes the incremental
+    // path. Without the lock both jobs would prepare while the library
+    // still has no graph (two full builds) and the later promotion would
+    // drop the earlier job's nodes.
+    let prompts: Vec<String> = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.title.contains("ingestion"))
+        .map(|request| request.prompt.clone())
+        .collect();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[0].contains("/graphify .` 完整首次建图流程"));
+    assert!(prompts[1].contains("/graphify . --update"));
 }
 
 #[tokio::test]

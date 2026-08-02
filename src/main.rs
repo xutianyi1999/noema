@@ -33,6 +33,9 @@ struct Cli {
     /// 单个 Agent session 超时（秒）
     #[arg(long, env = "OPENCODE_TIMEOUT_SECS", default_value_t = 1800)]
     opencode_timeout_secs: u64,
+    /// 全局并发 Agent session 上限（摄入与查询之和），超出的请求排队等待
+    #[arg(long, env = "NOEMA_MAX_SESSIONS", default_value_t = 4)]
+    max_sessions: usize,
     /// 流式打印 OpenCode 会话的中间过程（仅服务端日志；接口始终只返回最终答案）。
     /// 裸 `--transcript` 即开启，也可带值 `--transcript=false`。
     #[arg(
@@ -70,6 +73,9 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    if cli.max_sessions == 0 {
+        return Err("--max-sessions must be at least 1".into());
+    }
     let bind = cli.bind;
     let managed = noema::supervisor::spawn().await?;
     let config = Config {
@@ -80,6 +86,7 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         opencode_model: cli.model,
         opencode_timeout_secs: cli.opencode_timeout_secs,
         transcript: cli.transcript,
+        max_sessions: cli.max_sessions,
     };
     let service = AppService::new(config)?;
     let app = http::router(service);

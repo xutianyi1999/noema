@@ -5,14 +5,15 @@
 use std::{fs, path::Path};
 
 use chrono::Utc;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use unicode_normalization::UnicodeNormalization;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
 use super::{
-    DocumentRecord, Storage, StoredDocument, fsutil::write_atomic, parse_timestamp_or_now,
+    DocumentRecord, Storage, StoredDocument, fsutil::write_atomic, open_library_db,
+    parse_timestamp_or_now,
 };
 use crate::error::AppError;
 
@@ -34,7 +35,7 @@ impl Storage {
         hasher.update(content.as_bytes());
         let sha256 = hex::encode(hasher.finalize());
         let now = Utc::now();
-        let connection = Connection::open(root.join("library.sqlite"))?;
+        let connection = open_library_db(&root.join("library.sqlite"))?;
 
         if let Some(existing) = connection
             .query_row(
@@ -108,7 +109,7 @@ impl Storage {
 
     pub fn write_manifest(&self, library_id: &str) -> Result<(), AppError> {
         let root = self.library_root(library_id)?;
-        let connection = Connection::open(root.join("library.sqlite"))?;
+        let connection = open_library_db(&root.join("library.sqlite"))?;
         let mut statement = connection.prepare(
             "SELECT id, filename, title, path, sha256, created_at FROM documents ORDER BY created_at",
         )?;
@@ -162,7 +163,7 @@ impl Storage {
 }
 
 pub(super) fn init_library_db(path: &Path) -> Result<(), AppError> {
-    let connection = Connection::open(path)?;
+    let connection = open_library_db(path)?;
     connection.execute_batch(
         "
         PRAGMA foreign_keys = ON;
@@ -187,7 +188,7 @@ pub(super) fn init_library_db(path: &Path) -> Result<(), AppError> {
 }
 
 fn rebuild_content_fts(root: &Path) -> Result<(), AppError> {
-    let connection = Connection::open(root.join("library.sqlite"))?;
+    let connection = open_library_db(&root.join("library.sqlite"))?;
     connection.execute("DELETE FROM content_fts", [])?;
 
     for directory in ["raw", "wiki"] {

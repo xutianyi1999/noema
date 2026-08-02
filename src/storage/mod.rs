@@ -12,6 +12,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
+    time::Duration,
 };
 
 use chrono::{DateTime, Utc};
@@ -113,4 +114,15 @@ fn parse_timestamp_or_now(value: &str) -> DateTime<Utc> {
     DateTime::parse_from_rfc3339(value)
         .map(|value| value.with_timezone(&Utc))
         .unwrap_or_else(|_| Utc::now())
+}
+
+/// Open a library-local database connection with the busy timeout shared by
+/// every connection to the same file. Per-library ingest serialization
+/// removes most contention, but an upload can still race an index rebuild;
+/// a short retry window turns that collision into a wait instead of a
+/// `database is locked` failure.
+fn open_library_db(path: &Path) -> Result<Connection, AppError> {
+    let connection = Connection::open(path)?;
+    connection.busy_timeout(Duration::from_secs(5))?;
+    Ok(connection)
 }

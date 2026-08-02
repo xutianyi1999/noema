@@ -14,7 +14,7 @@ Noema 是由 OpenCode 驱动的文本知识库服务：提交 `.md`/`.txt` 文�
 | `opencode` | 可执行文件在 PATH 上 | noema 启动时自行拉起并管理 OpenCode Server 子进程（`opencode serve`，127.0.0.1 自动选空闲端口），Ctrl-C 时一并停止 |
 | OpenCode 模型凭据 | 已通过 `opencode` 配置 | 凭据由 OpenCode 自身管理，noema 不接触任何 API key |
 | `graphify` | 可执行文件在 PATH 上 | 创建内容库与导入缺 `.opencode/` 的快照时，noema 运行其安装器（`graphify install --platform opencode --project`）；摄入过程中由 Agent 以 skill 调用 |
-| `opencode_rs` | 本地 crate：`/mnt/data/code/agentic_auxilary/crates/services/opencode-rs` | Cargo.toml 中的 path 依赖，构建机上必须存在该路径 |
+| `opencode_rs` | git 依赖：GitHub `allisoneer/agentic_auxilary` | Cargo.toml 中经 git 源引入，构建机能访问 GitHub 即可 |
 
 平台：Linux（服务依赖 Unix 信号与 UTF-8 文件系统；内容库名与文档名支持中文）。
 
@@ -54,7 +54,7 @@ noema-cli query 产品知识库 "Session Context 是怎么设计的？"
 
 ```bash
 noema [--bind 127.0.0.1:8787] [--data-dir data] [--model <MODEL>] \
-      [--opencode-timeout-secs 1800] [--transcript]
+      [--opencode-timeout-secs 1800] [--max-sessions 4] [--transcript]
 ```
 
 所有参数都是"命令行标志 → 环境变量 → 内置默认"三级回退：
@@ -65,6 +65,7 @@ noema [--bind 127.0.0.1:8787] [--data-dir data] [--model <MODEL>] \
 | `--data-dir` | `NOEMA_DATA_DIR` | `data` | 数据目录（控制库 + 所有内容库） |
 | `--model` | `OPENCODE_MODEL` | `opencode/deepseek-v4-flash-free` | Agent 使用的模型标识 |
 | `--opencode-timeout-secs` | `OPENCODE_TIMEOUT_SECS` | `1800` | 单个 Agent session 超时（秒） |
+| `--max-sessions` | `NOEMA_MAX_SESSIONS` | `4` | 全局并发 Agent session 上限（摄入 + 查询），超出的排队等待 |
 | `--transcript` | `NOEMA_TRANSCRIPT` | `false` | 实时打印会话中间过程（见下） |
 
 日志走 `RUST_LOG`（缺省 `noema=info,tower_http=info`）。
@@ -256,6 +257,8 @@ stateDiagram-v2
 ```
 
 查询历史复用其中 `running / completed / failed` 子集。任务错误信息与失败时保留的 staging 工作区是排障依据。
+
+同一内容库的摄入作业串行执行：后到的作业等前一个完成后再开始，等待期间保持 `queued`（轮询 job 状态可见排队），因此每次摄入都在上一次提交的图谱之上增量更新，并行提交不会相互覆盖。不同内容库之间完全并行；查询不受摄入排队影响，只与摄入共享全局 `--max-sessions` 上限。
 
 ### 隔离与快照复用
 

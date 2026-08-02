@@ -8,4 +8,7 @@ pub struct Config {
     pub opencode_model: String,
     pub opencode_timeout_secs: u64,
     pub transcript: bool,
+    /// Global cap on concurrently running OpenCode sessions (ingests plus
+    /// queries); further requests queue until a slot frees up.
+    pub max_sessions: usize,
 }

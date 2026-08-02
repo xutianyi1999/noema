@@ -1,8 +1,11 @@
 use std::{
+    collections::HashMap,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
+
+use tokio::sync::Semaphore;
 
 use crate::{
     config::Config,
@@ -20,6 +23,14 @@ pub struct AppService<R: OpenCodeRuntime> {
     pub storage: Storage,
     config: Arc<Config>,
     runtime: Arc<R>,
+    /// One running ingest per library: promotion replaces `wiki/` and the
+    /// graph wholesale, so same-library ingests must not overlap. Queued
+    /// jobs wait on their library's lock and stay `queued` meanwhile.
+    ingest_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Global cap on concurrently running OpenCode sessions (ingests and
+    /// queries alike), keeping bursts from swamping the managed server and
+    /// the model backend behind it.
+    sessions: Arc<Semaphore>,
 }
 
 impl<R: OpenCodeRuntime> Clone for AppService<R> {
@@ -28,6 +39,8 @@ impl<R: OpenCodeRuntime> Clone for AppService<R> {
             storage: self.storage.clone(),
             config: self.config.clone(),
             runtime: self.runtime.clone(),
+            ingest_locks: self.ingest_locks.clone(),
+            sessions: self.sessions.clone(),
         }
     }
 }
@@ -43,10 +56,13 @@ impl AppService<OpenCodeAgent> {
         let config = Arc::new(config);
         let storage = Storage::open(config.data_dir.clone())?;
         let runtime = Arc::new(OpenCodeAgent::new(config.clone()));
+        let sessions = Arc::new(Semaphore::new(config.max_sessions));
         let service = Self {
             storage,
             config,
             runtime,
+            ingest_locks: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
         };
         service.reconcile_staging();
         Ok(service)
@@ -57,10 +73,13 @@ impl<R: OpenCodeRuntime> AppService<R> {
     pub fn with_runtime(config: Config, runtime: Arc<R>) -> Result<Self, AppError> {
         let config = Arc::new(config);
         let storage = Storage::open(config.data_dir.clone())?;
+        let sessions = Arc::new(Semaphore::new(config.max_sessions));
         let service = Self {
             storage,
             config,
             runtime,
+            ingest_locks: Arc::new(Mutex::new(HashMap::new())),
+            sessions,
         };
         service.reconcile_staging();
         Ok(service)
@@ -78,6 +97,17 @@ impl<R: OpenCodeRuntime> AppService<R> {
     /// Data directory this service manages (control plane + library roots).
     pub fn data_dir(&self) -> &Path {
         &self.config.data_dir
+    }
+
+    /// The serialization lock for one content library, created on first
+    /// use and shared by every ingest task targeting that library.
+    fn ingest_lock(&self, library_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        self.ingest_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .entry(library_id.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Drop leftover staging workspaces whose jobs no longer need them (see
@@ -187,6 +217,14 @@ impl<R: OpenCodeRuntime> AppService<R> {
         }
         let library_id = self.storage.resolve_library(library)?.id;
         let root = self.storage.library_root(&library_id)?;
+        // Queries never queue behind ingests — readers keep the library
+        // usable mid-ingestion — but they share the global session cap;
+        // the run is only recorded once a permit is held.
+        let _session_permit = self
+            .sessions
+            .acquire()
+            .await
+            .map_err(|_| AppError::Runtime("session semaphore closed".into()))?;
         let query_id = self.storage.record_query(&library_id)?;
         let request = AgentRunRequest {
             library_id: library_id.clone(),
@@ -230,6 +268,23 @@ impl<R: OpenCodeRuntime> AppService<R> {
         job_id: &str,
         stored: StoredDocument,
     ) -> Result<(), AppError> {
+        // One ingest at a time per library: promotion replaces wiki/,
+        // reviews/ and the graph wholesale, so two overlapping ingests
+        // would each promote over the other's nodes. The waiter stays
+        // `queued` (visible via job status) until it holds both the
+        // library lock and a session permit; because it prepares its
+        // staging only then, the incremental check below sees the
+        // predecessor's graph and takes the --update path. Ingests on
+        // different libraries never contend here.
+        let _ingest_guard = self.ingest_lock(library_id).lock_owned().await;
+        // Global admission control: bound how many OpenCode sessions run
+        // at once across all libraries.
+        let _session_permit = self
+            .sessions
+            .acquire()
+            .await
+            .map_err(|_| AppError::Runtime("session semaphore closed".into()))?;
+
         self.storage
             .update_job(library_id, job_id, JobState::Running, None, None)?;
         let staging = match self.storage.prepare_staging(library_id, job_id) {
