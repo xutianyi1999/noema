@@ -1,9 +1,9 @@
 use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
 
 use opencode_rs::{
-    ClientBuilder,
+    Client, ClientBuilder,
     types::{
-        event::Event,
+        event::{Event, MessagePartEventProps},
         message::{Part, PromptPart, PromptRequest},
         permission::{PermissionAction, PermissionRule, Ruleset},
         project::ModelRef,
@@ -13,11 +13,7 @@ use opencode_rs::{
 use serde::Serialize;
 use tokio::time::timeout;
 
-use crate::{
-    config::Config,
-    error::AppError,
-    transcript::{self, Transcript},
-};
+use crate::{config::Config, error::AppError, transcript::Transcript};
 
 #[derive(Debug, Clone)]
 pub struct AgentRunRequest {
@@ -78,19 +74,32 @@ impl OpenCodeRuntime for OpenCodeAgent {
             .await
             .map_err(|error| AppError::Runtime(error.to_string()))?;
 
-        let mut subscription = match client.subscribe_session(&session.id) {
-            Ok(subscription) => subscription,
-            Err(error) => {
-                let _ = client.sessions().delete(&session.id).await;
-                return Err(AppError::Runtime(error.to_string()));
-            }
-        };
+        let result = self.drive_session(&client, &session.id, request).await;
+
+        // Every session is single-use: delete it on every exit path, and
+        // surface cleanup failures instead of silently dropping them.
+        if let Err(error) = client.sessions().delete(&session.id).await {
+            tracing::warn!(session_id = %session.id, error = %error, "failed to delete OpenCode session");
+        }
+        result
+    }
+}
+
+impl OpenCodeAgent {
+    async fn drive_session(
+        &self,
+        client: &Client,
+        session_id: &str,
+        request: AgentRunRequest,
+    ) -> Result<AgentRunResult, AppError> {
+        let mut subscription = client
+            .subscribe_session(session_id)
+            .map_err(|error| AppError::Runtime(error.to_string()))?;
 
         // Server-side live transcript (opt-in via NOEMA_TRANSCRIPT); never
         // affects the result returned to callers.
-        let mut transcript = Transcript::new(&session.id, &request.title);
+        let mut transcript = Transcript::new(session_id, &request.title);
 
-        let model = parse_model(&self.config.opencode_model);
         let prompt = PromptRequest {
             parts: vec![PromptPart::Text {
                 text: request.prompt,
@@ -99,17 +108,17 @@ impl OpenCodeRuntime for OpenCodeAgent {
                 metadata: None,
             }],
             message_id: None,
-            model: Some(model),
+            model: Some(parse_model(&self.config.opencode_model)),
             agent: None,
             no_reply: None,
             system: None,
             variant: None,
         };
-
-        if let Err(error) = client.messages().prompt(&session.id, &prompt).await {
-            let _ = client.sessions().delete(&session.id).await;
-            return Err(AppError::Runtime(error.to_string()));
-        }
+        client
+            .messages()
+            .prompt(session_id, &prompt)
+            .await
+            .map_err(|error| AppError::Runtime(error.to_string()))?;
 
         let collected = match timeout(
             Duration::from_secs(self.config.opencode_timeout_secs),
@@ -117,24 +126,12 @@ impl OpenCodeRuntime for OpenCodeAgent {
         )
         .await
         {
-            Ok(Ok(collected)) => collected,
-            Ok(Err(error)) => {
-                let _ = client.sessions().delete(&session.id).await;
-                return Err(error);
-            }
-            Err(_) => {
-                let _ = client.sessions().delete(&session.id).await;
-                return Err(AppError::Runtime("OpenCode session timed out".into()));
-            }
+            Ok(collected) => collected?,
+            Err(_) => return Err(AppError::Runtime("OpenCode session timed out".into())),
         };
 
-        let cleanup_result = client.sessions().delete(&session.id).await;
-        if let Err(error) = cleanup_result {
-            tracing::warn!(session_id = %session.id, error = %error, "failed to delete OpenCode session");
-        }
-
         Ok(AgentRunResult {
-            session_id: session.id,
+            session_id: session_id.to_string(),
             answer: collected.answer,
             tool_events: collected.tool_events,
         })
@@ -154,6 +151,47 @@ struct CollectedEvents {
 }
 
 impl CollectedEvents {
+    /// Accumulate one streamed text delta. A new assistant message starts a
+    /// new step, so its first delta discards the previous message's
+    /// intermediate text.
+    fn apply_delta(&mut self, properties: &MessagePartEventProps) {
+        if !is_text_delta(properties) {
+            return;
+        }
+        let Some(delta) = properties.delta.as_deref() else {
+            return;
+        };
+        if let Some(message_id) = &properties.message_id
+            && self.streamed_message.as_deref() != Some(message_id)
+        {
+            self.answer.clear();
+            self.streamed_message = Some(message_id.clone());
+        }
+        self.answer.push_str(delta);
+        self.streamed_text = true;
+    }
+
+    /// Accumulate one part snapshot into the fallback used when no deltas
+    /// were streamed at all.
+    fn apply_part_update(&mut self, properties: &MessagePartEventProps) {
+        let Some(Part::Text { text, .. }) = properties.part.as_ref() else {
+            return;
+        };
+        if let Some(message_id) = &properties.message_id
+            && self.fallback_message.as_deref() != Some(message_id)
+        {
+            self.fallback_text.clear();
+            self.fallback_message = Some(message_id.clone());
+        }
+        self.fallback_text.push(text.clone());
+    }
+
+    fn push_tool_event(&mut self, event: &Event) {
+        if let Ok(value) = serde_json::to_value(event) {
+            self.tool_events.push(value);
+        }
+    }
+
     fn finish(mut self) -> Self {
         if !self.streamed_text && !self.fallback_text.is_empty() {
             self.answer = self.fallback_text.join("\n");
@@ -180,6 +218,41 @@ fn extract_marked_answer(text: &str) -> Option<String> {
     (!inner.is_empty()).then(|| inner.to_string())
 }
 
+/// Which streamed field a part delta carries.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum DeltaKind {
+    /// Visible assistant text.
+    Text,
+    /// Reasoning / "thinking" content.
+    Thinking,
+}
+
+/// Classify a `message.part.delta` event. The SDK models the streamed field
+/// either through the updated `part` variant or, for bare deltas, through the
+/// flattened `field` property ("text" / "reasoning"); absent both, the delta
+/// is treated as visible text.
+pub(crate) fn delta_kind(properties: &MessagePartEventProps) -> Option<DeltaKind> {
+    match properties.part.as_ref() {
+        Some(Part::Text { .. }) => Some(DeltaKind::Text),
+        Some(Part::Reasoning { .. }) => Some(DeltaKind::Thinking),
+        Some(_) => None,
+        None => match properties
+            .extra
+            .get("field")
+            .and_then(serde_json::Value::as_str)
+        {
+            Some("reasoning") | Some("thinking") => Some(DeltaKind::Thinking),
+            _ => Some(DeltaKind::Text),
+        },
+    }
+}
+
+/// Whether a delta belongs to the visible answer. Only these deltas feed the
+/// answer returned over HTTP and MCP; reasoning deltas are transcript-only.
+pub(crate) fn is_text_delta(properties: &MessagePartEventProps) -> bool {
+    matches!(delta_kind(properties), Some(DeltaKind::Text))
+}
+
 async fn collect_events(
     subscription: &mut opencode_rs::sse::SseSubscription<Event>,
     transcript: &mut Transcript,
@@ -195,50 +268,19 @@ async fn collect_events(
                     properties.error
                 )));
             }
-            Event::MessagePartDelta { properties } => {
-                // Only visible text deltas feed the answer returned over
-                // HTTP/MCP; reasoning deltas stay transcript-only. A new
-                // assistant message starts a new step, so its first delta
-                // discards the previous message's intermediate text.
-                if transcript::is_text_delta(properties)
-                    && let Some(delta) = properties.delta.as_deref()
-                {
-                    if let Some(message_id) = &properties.message_id
-                        && collected.streamed_message.as_deref() != Some(message_id)
-                    {
-                        collected.answer.clear();
-                        collected.streamed_message = Some(message_id.clone());
-                    }
-                    collected.answer.push_str(delta);
-                    collected.streamed_text = true;
-                }
-            }
-            Event::MessagePartUpdated { properties } => {
-                if let Some(Part::Text { text, .. }) = properties.part.as_ref() {
-                    if let Some(message_id) = &properties.message_id
-                        && collected.fallback_message.as_deref() != Some(message_id)
-                    {
-                        collected.fallback_text.clear();
-                        collected.fallback_message = Some(message_id.clone());
-                    }
-                    collected.fallback_text.push(text.clone());
-                }
-            }
+            // Only visible text deltas feed the answer returned over
+            // HTTP/MCP; reasoning deltas stay transcript-only.
+            Event::MessagePartDelta { properties } => collected.apply_delta(properties),
+            Event::MessagePartUpdated { properties } => collected.apply_part_update(properties),
             Event::MessageUpdated { properties } => {
-                if properties.info.role == "assistant"
-                    && let Ok(value) = serde_json::to_value(&event)
-                {
-                    collected.tool_events.push(value);
+                if properties.info.role == "assistant" {
+                    collected.push_tool_event(&event);
                 }
             }
             Event::CommandExecuted { .. }
             | Event::FileEdited { .. }
             | Event::McpToolsChanged { .. }
-            | Event::PermissionAsked { .. } => {
-                if let Ok(value) = serde_json::to_value(&event) {
-                    collected.tool_events.push(value);
-                }
-            }
+            | Event::PermissionAsked { .. } => collected.push_tool_event(&event),
             _ => {}
         }
     }
@@ -307,5 +349,49 @@ mod tests {
             extract_marked_answer("<noema-answer>  </noema-answer>"),
             None
         );
+    }
+
+    fn props(field: Option<&str>, part: Option<Part>) -> MessagePartEventProps {
+        MessagePartEventProps {
+            session_id: None,
+            message_id: None,
+            index: None,
+            part,
+            delta: None,
+            extra: field
+                .map(|value| serde_json::json!({ "field": value }))
+                .unwrap_or(serde_json::json!({})),
+        }
+    }
+
+    fn part(json: serde_json::Value) -> Part {
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn delta_kind_prefers_the_part_variant_then_the_field() {
+        let text = part(serde_json::json!({ "type": "text", "text": "hi" }));
+        let reasoning = part(serde_json::json!({ "type": "reasoning", "text": "hm" }));
+        assert_eq!(delta_kind(&props(None, Some(text))), Some(DeltaKind::Text));
+        assert_eq!(
+            delta_kind(&props(None, Some(reasoning))),
+            Some(DeltaKind::Thinking)
+        );
+        assert_eq!(
+            delta_kind(&props(Some("reasoning"), None)),
+            Some(DeltaKind::Thinking)
+        );
+        assert_eq!(
+            delta_kind(&props(Some("text"), None)),
+            Some(DeltaKind::Text)
+        );
+        assert_eq!(delta_kind(&props(None, None)), Some(DeltaKind::Text));
+    }
+
+    #[test]
+    fn only_text_deltas_feed_the_answer() {
+        assert!(is_text_delta(&props(Some("text"), None)));
+        assert!(is_text_delta(&props(None, None)));
+        assert!(!is_text_delta(&props(Some("reasoning"), None)));
     }
 }

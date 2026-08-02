@@ -31,8 +31,8 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// 服务健康检查
-    Health,
+    /// 服务状态（健康检查 + 数据目录与模型配置）
+    Status,
     /// 创建内容库（服务工作目录与 Skill 由服务端生成）
     Create {
         /// 内容库名称（只是别名，可重复）
@@ -105,122 +105,187 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
     let client = reqwest::Client::new();
     let base = cli.server.trim_end_matches('/').to_string();
     match cli.command {
-        Command::Health => {
-            let response = send(client.get(format!("{base}/v1/health"))).await?;
-            let value = response.json::<Value>().await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-        }
+        Command::Status => cmd_status(&client, &base).await,
         Command::Create { name, description } => {
-            let response = send(
-                client
-                    .post(format!("{base}/v1/libraries"))
-                    .json(&json!({ "name": name, "description": description })),
-            )
-            .await?;
-            print_library_line(&response.json::<Value>().await?);
+            cmd_create(&client, &base, name, description.as_deref()).await
         }
-        Command::List => {
-            let response = send(client.get(format!("{base}/v1/libraries"))).await?;
-            let libraries = response.json::<Vec<Value>>().await?;
-            if libraries.is_empty() {
-                println!("(no content libraries) server={base}");
-                return Ok(());
-            }
-            for library in libraries {
-                print_library_line(&library);
-            }
-        }
-        Command::Export { library, output } => {
-            let url = format!("{base}/v1/libraries/{}/export", encode(&library));
-            let mut response = send(client.get(url)).await?;
-            let output = output.unwrap_or_else(|| {
-                PathBuf::from(format!("{}.tar.gz", library.replace(['/', '\\'], "-")))
-            });
-            let mut file = tokio::fs::File::create(&output).await?;
-            let mut bytes = 0u64;
-            while let Some(chunk) = response.chunk().await? {
-                bytes += chunk.len() as u64;
-                file.write_all(&chunk).await?;
-            }
-            file.flush().await?;
-            println!("exported {library} -> {} ({bytes} bytes)", output.display());
-        }
+        Command::List => cmd_list(&client, &base).await,
+        Command::Export { library, output } => cmd_export(&client, &base, library, output).await,
         Command::Import {
             archive,
             name,
             description,
         } => {
-            let bytes = tokio::fs::read(&archive)
-                .await
-                .map_err(|error| format!("cannot read {}: {error}", archive.display()))?;
-            let mut query: Vec<(&str, String)> = Vec::new();
-            if let Some(name) = name {
-                query.push(("name", name));
-            }
-            if let Some(description) = description {
-                query.push(("description", description));
-            }
-            let response = send(
-                client
-                    .post(format!("{base}/v1/libraries/import"))
-                    .query(&query)
-                    .header(reqwest::header::CONTENT_TYPE, "application/gzip")
-                    .body(bytes),
+            cmd_import(
+                &client,
+                &base,
+                archive,
+                name.as_deref(),
+                description.as_deref(),
             )
-            .await?;
-            print_library_line(&response.json::<Value>().await?);
+            .await
         }
         Command::Submit {
             library,
             file,
             title,
-        } => {
-            let filename = file
-                .file_name()
-                .and_then(|value| value.to_str())
-                .ok_or_else(|| format!("invalid file name: {}", file.display()))?
-                .to_string();
-            let content = tokio::fs::read_to_string(&file)
-                .await
-                .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
-            let response = send(
-                client
-                    .post(format!(
-                        "{base}/v1/libraries/{}/documents",
-                        encode(&library)
-                    ))
-                    .json(&json!({ "filename": filename, "content": content, "title": title })),
-            )
-            .await?;
-            let value = response.json::<Value>().await?;
-            println!(
-                "submitted\t{}\tduplicate={}\tjob_id={}",
-                value["document_path"].as_str().unwrap_or("-"),
-                value["duplicate"],
-                value["job_id"].as_str().unwrap_or("-"),
-            );
-        }
-        Command::Job { library, job_id } => {
-            let response = send(client.get(format!(
-                "{base}/v1/libraries/{}/jobs/{}",
-                encode(&library),
-                encode(&job_id)
-            )))
-            .await?;
-            let value = response.json::<Value>().await?;
-            println!("{}", serde_json::to_string_pretty(&value)?);
-        }
-        Command::Query { library, prompt } => {
-            let response = send(
-                client
-                    .post(format!("{base}/v1/libraries/{}/query", encode(&library)))
-                    .json(&json!({ "prompt": prompt })),
-            )
-            .await?;
-            let value = response.json::<Value>().await?;
-            println!("{}", value["answer"].as_str().unwrap_or_default());
-        }
+        } => cmd_submit(&client, &base, library, file, title.as_deref()).await,
+        Command::Job { library, job_id } => cmd_job(&client, &base, library, job_id).await,
+        Command::Query { library, prompt } => cmd_query(&client, &base, library, prompt).await,
     }
+}
+
+async fn cmd_status(client: &reqwest::Client, base: &str) -> Result<(), BoxError> {
+    let response = send(client.get(format!("{base}/v1/health"))).await?;
+    let value = response.json::<Value>().await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+async fn cmd_create(
+    client: &reqwest::Client,
+    base: &str,
+    name: String,
+    description: Option<&str>,
+) -> Result<(), BoxError> {
+    let response = send(
+        client
+            .post(format!("{base}/v1/libraries"))
+            .json(&json!({ "name": name, "description": description })),
+    )
+    .await?;
+    print_library_line(&response.json::<Value>().await?);
+    Ok(())
+}
+
+async fn cmd_list(client: &reqwest::Client, base: &str) -> Result<(), BoxError> {
+    let response = send(client.get(format!("{base}/v1/libraries"))).await?;
+    let libraries = response.json::<Vec<Value>>().await?;
+    if libraries.is_empty() {
+        println!("(no content libraries) server={base}");
+        return Ok(());
+    }
+    for library in libraries {
+        print_library_line(&library);
+    }
+    Ok(())
+}
+
+async fn cmd_export(
+    client: &reqwest::Client,
+    base: &str,
+    library: String,
+    output: Option<PathBuf>,
+) -> Result<(), BoxError> {
+    let url = format!("{base}/v1/libraries/{}/export", encode(&library));
+    let mut response = send(client.get(url)).await?;
+    let output = output
+        .unwrap_or_else(|| PathBuf::from(format!("{}.tar.gz", library.replace(['/', '\\'], "-"))));
+    let mut file = tokio::fs::File::create(&output).await?;
+    let mut bytes = 0u64;
+    while let Some(chunk) = response.chunk().await? {
+        bytes += chunk.len() as u64;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    println!("exported {library} -> {} ({bytes} bytes)", output.display());
+    Ok(())
+}
+
+async fn cmd_import(
+    client: &reqwest::Client,
+    base: &str,
+    archive: PathBuf,
+    name: Option<&str>,
+    description: Option<&str>,
+) -> Result<(), BoxError> {
+    let bytes = tokio::fs::read(&archive)
+        .await
+        .map_err(|error| format!("cannot read {}: {error}", archive.display()))?;
+    let mut query: Vec<(&str, &str)> = Vec::new();
+    if let Some(name) = name {
+        query.push(("name", name));
+    }
+    if let Some(description) = description {
+        query.push(("description", description));
+    }
+    let response = send(
+        client
+            .post(format!("{base}/v1/libraries/import"))
+            .query(&query)
+            .header(reqwest::header::CONTENT_TYPE, "application/gzip")
+            .body(bytes),
+    )
+    .await?;
+    print_library_line(&response.json::<Value>().await?);
+    Ok(())
+}
+
+async fn cmd_submit(
+    client: &reqwest::Client,
+    base: &str,
+    library: String,
+    file: PathBuf,
+    title: Option<&str>,
+) -> Result<(), BoxError> {
+    let filename = file
+        .file_name()
+        .and_then(|value| value.to_str())
+        .ok_or_else(|| format!("invalid file name: {}", file.display()))?
+        .to_string();
+    let content = tokio::fs::read_to_string(&file)
+        .await
+        .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+    let response = send(
+        client
+            .post(format!(
+                "{base}/v1/libraries/{}/documents",
+                encode(&library)
+            ))
+            .json(&json!({ "filename": filename, "content": content, "title": title })),
+    )
+    .await?;
+    let value = response.json::<Value>().await?;
+    println!(
+        "submitted\t{}\tduplicate={}\tjob_id={}",
+        value["document_path"].as_str().unwrap_or("-"),
+        value["duplicate"],
+        value["job_id"].as_str().unwrap_or("-"),
+    );
+    Ok(())
+}
+
+async fn cmd_job(
+    client: &reqwest::Client,
+    base: &str,
+    library: String,
+    job_id: String,
+) -> Result<(), BoxError> {
+    let response = send(client.get(format!(
+        "{base}/v1/libraries/{}/jobs/{}",
+        encode(&library),
+        encode(&job_id)
+    )))
+    .await?;
+    let value = response.json::<Value>().await?;
+    println!("{}", serde_json::to_string_pretty(&value)?);
+    Ok(())
+}
+
+async fn cmd_query(
+    client: &reqwest::Client,
+    base: &str,
+    library: String,
+    prompt: String,
+) -> Result<(), BoxError> {
+    let response = send(
+        client
+            .post(format!("{base}/v1/libraries/{}/query", encode(&library)))
+            .json(&json!({ "prompt": prompt })),
+    )
+    .await?;
+    let value = response.json::<Value>().await?;
+    println!("{}", value["answer"].as_str().unwrap_or_default());
     Ok(())
 }
 

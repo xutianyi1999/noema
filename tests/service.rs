@@ -15,7 +15,7 @@ use axum::{
 };
 use noema::{
     AppError, AppService, Config, http as http_api,
-    models::{CreateLibraryRequest, DocumentInput},
+    models::{CreateLibraryRequest, DocumentInput, JobState},
     runtime::{AgentRunRequest, AgentRunResult, OpenCodeRuntime},
 };
 use tempfile::TempDir;
@@ -102,7 +102,7 @@ async fn wait_for_completion(
 ) -> noema::models::JobStatus {
     for _ in 0..100 {
         let status = service.job_status(library_id, job_id).unwrap();
-        if status.status == "completed" || status.status == "failed" {
+        if matches!(status.status, JobState::Completed | JobState::Failed) {
             return status;
         }
         sleep(Duration::from_millis(10)).await;
@@ -140,7 +140,7 @@ async fn library_ingestion_query_and_session_isolation_work() {
         .unwrap();
     assert!(!submitted.duplicate);
     let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
-    assert_eq!(status.status, "completed", "{status:?}");
+    assert_eq!(status.status, JobState::Completed, "{status:?}");
     assert!(status.session_id.is_some());
     assert!(root.join("raw").read_dir().unwrap().next().is_some());
     assert!(root.join("wiki/session-context.md").is_file());
@@ -158,7 +158,11 @@ async fn library_ingestion_query_and_session_isolation_work() {
         .await
         .unwrap();
     let second_status = wait_for_completion(&service, &library.id, &second.job_id).await;
-    assert_eq!(second_status.status, "completed", "{second_status:?}");
+    assert_eq!(
+        second_status.status,
+        JobState::Completed,
+        "{second_status:?}"
+    );
 
     let duplicate = service
         .submit_document(
@@ -177,7 +181,7 @@ async fn library_ingestion_query_and_session_isolation_work() {
             .job_status(&library.id, &duplicate.job_id)
             .unwrap()
             .status,
-        "skipped"
+        JobState::Skipped
     );
 
     let first = service

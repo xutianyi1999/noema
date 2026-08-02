@@ -63,3 +63,15 @@ impl From<opencode_rs::OpencodeError> for AppError {
         Self::Runtime(error.to_string())
     }
 }
+
+impl From<walkdir::Error> for AppError {
+    fn from(error: walkdir::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}
+
+impl From<std::path::StripPrefixError> for AppError {
+    fn from(error: std::path::StripPrefixError) -> Self {
+        Self::Storage(error.to_string())
+    }
+}

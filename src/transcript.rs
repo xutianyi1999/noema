@@ -11,62 +11,28 @@
 use std::{
     collections::HashSet,
     env,
-    io::{IsTerminal, Write as _},
+    io::Write as _,
     sync::{
         Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
 
+use anstyle::{AnsiColor, Style};
 use opencode_rs::types::{
     event::{Event, MessagePartEventProps},
     message::{Part, ToolState},
 };
 
-const DIM: &str = "\x1b[2m";
-const BOLD: &str = "\x1b[1m";
-const RED: &str = "\x1b[31m";
-const GREEN: &str = "\x1b[32m";
-const YELLOW: &str = "\x1b[33m";
-const CYAN: &str = "\x1b[36m";
-const MAGENTA: &str = "\x1b[35m";
-const RESET: &str = "\x1b[0m";
+use crate::runtime::{DeltaKind, delta_kind};
 
-/// Which streamed field a part delta carries.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum DeltaKind {
-    /// Visible assistant text.
-    Text,
-    /// Reasoning / "thinking" content.
-    Thinking,
-}
-
-/// Classify a `message.part.delta` event. The SDK models the streamed field
-/// either through the updated `part` variant or, for bare deltas, through the
-/// flattened `field` property ("text" / "reasoning"); absent both, the delta
-/// is treated as visible text.
-pub(crate) fn delta_kind(properties: &MessagePartEventProps) -> Option<DeltaKind> {
-    match properties.part.as_ref() {
-        Some(Part::Text { .. }) => Some(DeltaKind::Text),
-        Some(Part::Reasoning { .. }) => Some(DeltaKind::Thinking),
-        Some(_) => None,
-        None => match properties
-            .extra
-            .get("field")
-            .and_then(serde_json::Value::as_str)
-        {
-            Some("reasoning") | Some("thinking") => Some(DeltaKind::Thinking),
-            _ => Some(DeltaKind::Text),
-        },
-    }
-}
-
-/// Whether a delta belongs to the visible answer. The runtime appends only
-/// these to the answer returned over HTTP and MCP; reasoning deltas are
-/// transcript-only.
-pub(crate) fn is_text_delta(properties: &MessagePartEventProps) -> bool {
-    matches!(delta_kind(properties), Some(DeltaKind::Text))
-}
+const DIM: Style = Style::new().dimmed();
+const BOLD: Style = Style::new().bold();
+const RED: Style = AnsiColor::Red.on_default();
+const GREEN: Style = AnsiColor::Green.on_default();
+const YELLOW: Style = AnsiColor::Yellow.on_default();
+const CYAN: Style = AnsiColor::Cyan.on_default();
+const MAGENTA: Style = AnsiColor::Magenta.on_default();
 
 /// The currently open streamed line, if any. Text and thinking deltas are
 /// written without a trailing newline so they read as live output; anything
@@ -90,7 +56,6 @@ fn lock_open_line() -> std::sync::MutexGuard<'static, Option<OpenLine>> {
 /// Per-session transcript renderer.
 pub(crate) struct Transcript {
     enabled: bool,
-    color: bool,
     id: usize,
     announced: HashSet<String>,
     finished: HashSet<String>,
@@ -104,10 +69,8 @@ impl Transcript {
     pub(crate) fn new(session_id: &str, title: &str) -> Self {
         let enabled = env::var("NOEMA_TRANSCRIPT")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-        let color = enabled && std::io::stderr().is_terminal() && env::var_os("NO_COLOR").is_none();
         let transcript = Self {
             enabled,
-            color,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             announced: HashSet::new(),
             finished: HashSet::new(),
@@ -119,7 +82,7 @@ impl Transcript {
         let short = session_id
             .get(session_id.len().saturating_sub(8)..)
             .unwrap_or(session_id);
-        transcript.line(&transcript.paint(BOLD, &format!("┌─ opencode · {title} · …{short}")));
+        transcript.line(&paint(BOLD, &format!("┌─ opencode · {title} · …{short}")));
         transcript
     }
 
@@ -135,12 +98,13 @@ impl Transcript {
                     self.part(part);
                 }
             }
-            Event::SessionError { properties } => {
-                self.line(&self.paint(RED, &format!("├ ✖ session error: {:?}", properties.error)))
-            }
+            Event::SessionError { properties } => self.line(&paint(
+                RED,
+                &format!("├ ✖ session error: {:?}", properties.error),
+            )),
             Event::SessionIdle { .. } => {
                 self.close_line();
-                self.raw_line(&self.paint(
+                self.raw_line(&paint(
                     DIM,
                     &format!(
                         "└─ idle · {} steps · {} in / {} out tokens · ${:.4}",
@@ -168,24 +132,24 @@ impl Transcript {
         let mut open = lock_open_line();
         if open.as_ref().map(|line| (line.owner, line.kind)) != Some((self.id, kind)) {
             if open.is_some() {
-                let _ = writeln!(std::io::stderr());
+                let _ = writeln!(stderr());
             }
             let prefix = match kind {
-                DeltaKind::Text => self.paint(CYAN, "├ ✍ "),
-                DeltaKind::Thinking => self.paint(MAGENTA, "├ 💭 "),
+                DeltaKind::Text => paint(CYAN, "├ ✍ "),
+                DeltaKind::Thinking => paint(MAGENTA, "├ 💭 "),
             };
-            let _ = write!(std::io::stderr(), "{prefix}");
+            let _ = write!(stderr(), "{prefix}");
             *open = Some(OpenLine {
                 owner: self.id,
                 kind,
             });
         }
         let styled = match kind {
-            DeltaKind::Text => self.paint(BOLD, &content),
-            DeltaKind::Thinking => self.paint(DIM, &content),
+            DeltaKind::Text => paint(BOLD, &content),
+            DeltaKind::Thinking => paint(DIM, &content),
         };
-        let _ = write!(std::io::stderr(), "{styled}");
-        let _ = std::io::stderr().flush();
+        let _ = write!(stderr(), "{styled}");
+        let _ = stderr().flush();
     }
 
     fn part(&mut self, part: &Part) {
@@ -209,7 +173,7 @@ impl Transcript {
                     self.tokens_in += tokens.input;
                     self.tokens_out += tokens.output;
                 }
-                self.line(&self.paint(
+                self.line(&paint(
                     DIM,
                     &format!(
                         "├ · step {} · {reason} · {} in / {} out tokens",
@@ -224,9 +188,9 @@ impl Transcript {
                 summarize(description, 80)
             )),
             Part::Retry { attempt, .. } => {
-                self.line(&self.paint(YELLOW, &format!("├ ↻ retry #{attempt}")))
+                self.line(&paint(YELLOW, &format!("├ ↻ retry #{attempt}")))
             }
-            Part::Compaction { auto, .. } => self.line(&self.paint(
+            Part::Compaction { auto, .. } => self.line(&paint(
                 YELLOW,
                 &format!(
                     "├ ≡ context compaction{}",
@@ -256,12 +220,12 @@ impl Transcript {
             // those their own glyph and surface the skill name.
             let line = if tool == "skill" {
                 let name = resolved.and_then(skill_name).unwrap_or_else(|| "?".into());
-                self.paint(GREEN, &format!("├ 🎯 skill · {name}"))
+                paint(GREEN, &format!("├ 🎯 skill · {name}"))
             } else {
                 let args = resolved
                     .map(compact_args)
                     .unwrap_or_else(|| "…".to_string());
-                self.paint(CYAN, &format!("├ 🔧 {tool} {args}"))
+                paint(CYAN, &format!("├ 🔧 {tool} {args}"))
             };
             self.line(&line);
         }
@@ -280,24 +244,16 @@ impl Transcript {
                 } else {
                     format!("│  ↳ {summary}")
                 };
-                self.line(&self.paint(DIM, &text));
+                self.line(&paint(DIM, &text));
             }
             ToolState::Error(error) => {
                 self.finished.insert(call_id.to_string());
-                self.line(&self.paint(
+                self.line(&paint(
                     RED,
                     &format!("│  ↳ error: {}", summarize(&error.error, 160)),
                 ));
             }
             _ => {}
-        }
-    }
-
-    fn paint(&self, code: &str, text: &str) -> String {
-        if self.color {
-            format!("{code}{text}{RESET}")
-        } else {
-            text.to_string()
         }
     }
 
@@ -313,14 +269,14 @@ impl Transcript {
     fn close_line(&self) {
         let mut open = lock_open_line();
         if open.take().is_some() {
-            let _ = writeln!(std::io::stderr());
-            let _ = std::io::stderr().flush();
+            let _ = writeln!(stderr());
+            let _ = stderr().flush();
         }
     }
 
     fn raw_line(&self, text: &str) {
-        let _ = writeln!(std::io::stderr(), "{text}");
-        let _ = std::io::stderr().flush();
+        let _ = writeln!(stderr(), "{text}");
+        let _ = stderr().flush();
     }
 }
 
@@ -334,10 +290,22 @@ impl Drop for Transcript {
         let mut open = lock_open_line();
         if open.as_ref().is_some_and(|line| line.owner == self.id) {
             open.take();
-            let _ = writeln!(std::io::stderr());
-            let _ = std::io::stderr().flush();
+            let _ = writeln!(stderr());
+            let _ = stderr().flush();
         }
     }
+}
+
+/// Embed one style's escape codes around `text`. The stderr writer strips
+/// the codes when colors are not appropriate (see [`stderr`]).
+fn paint(style: Style, text: &str) -> String {
+    format!("{style}{text}{style:#}")
+}
+
+/// The transcript writer: anstream honours NO_COLOR / FORCE_COLOR /
+/// CLICOLOR and strips embedded styles when stderr is not a terminal.
+fn stderr() -> anstream::AutoStream<std::io::Stderr> {
+    anstream::AutoStream::auto(std::io::stderr())
 }
 
 /// Collapse whitespace and truncate to a display budget (in characters, so
@@ -414,23 +382,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn props(field: Option<&str>, part: Option<Part>) -> MessagePartEventProps {
-        MessagePartEventProps {
-            session_id: None,
-            message_id: None,
-            index: None,
-            part,
-            delta: None,
-            extra: field
-                .map(|value| json!({ "field": value }))
-                .unwrap_or(json!({})),
-        }
-    }
-
-    fn part(json: serde_json::Value) -> Part {
-        serde_json::from_value(json).unwrap()
-    }
-
     #[test]
     fn summarize_collapses_whitespace_and_truncates() {
         assert_eq!(summarize("a\n\n b\t c", 10), "a b c");
@@ -452,32 +403,5 @@ mod tests {
             Some("knowledge-compiler")
         );
         assert_eq!(skill_name(&json!({})), None);
-    }
-
-    #[test]
-    fn delta_kind_prefers_the_part_variant_then_the_field() {
-        let text = part(json!({ "type": "text", "text": "hi" }));
-        let reasoning = part(json!({ "type": "reasoning", "text": "hm" }));
-        assert_eq!(delta_kind(&props(None, Some(text))), Some(DeltaKind::Text));
-        assert_eq!(
-            delta_kind(&props(None, Some(reasoning))),
-            Some(DeltaKind::Thinking)
-        );
-        assert_eq!(
-            delta_kind(&props(Some("reasoning"), None)),
-            Some(DeltaKind::Thinking)
-        );
-        assert_eq!(
-            delta_kind(&props(Some("text"), None)),
-            Some(DeltaKind::Text)
-        );
-        assert_eq!(delta_kind(&props(None, None)), Some(DeltaKind::Text));
-    }
-
-    #[test]
-    fn only_text_deltas_feed_the_answer() {
-        assert!(is_text_delta(&props(Some("text"), None)));
-        assert!(is_text_delta(&props(None, None)));
-        assert!(!is_text_delta(&props(Some("reasoning"), None)));
     }
 }

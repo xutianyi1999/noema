@@ -16,7 +16,6 @@ use std::{
     fs,
     io::{self, BufReader, Read, Write},
     path::{Component, Path, PathBuf},
-    process::{Command, Stdio},
 };
 
 use chrono::Utc;
@@ -150,61 +149,11 @@ fn overlay_and_repair(
     // Snapshots ship their own .opencode project; only archives without one
     // need the installer to become queryable.
     if !had_opencode {
-        run_graphify_install(root)?;
+        crate::bootstrap::install_graphify(root)?;
     }
     // Always refresh the four Noema skills to this binary's versions so an
     // imported library follows the current node contract.
-    ensure_skills(root)
-}
-
-/// The four Noema skills (path relative to `.opencode/skills/` + contents),
-/// shared by library bootstrap and snapshot import.
-pub(crate) fn skill_files() -> [(&'static str, &'static str); 4] {
-    [
-        (
-            "kb-ingest/SKILL.md",
-            include_str!("../.opencode/skills/kb-ingest/SKILL.md"),
-        ),
-        (
-            "kb-query/SKILL.md",
-            include_str!("../.opencode/skills/kb-query/SKILL.md"),
-        ),
-        (
-            "kb-maintain/SKILL.md",
-            include_str!("../.opencode/skills/kb-maintain/SKILL.md"),
-        ),
-        (
-            "knowledge-compiler/SKILL.md",
-            include_str!("../.opencode/skills/knowledge-compiler/SKILL.md"),
-        ),
-    ]
-}
-
-fn ensure_skills(root: &Path) -> Result<(), AppError> {
-    for (relative, contents) in skill_files() {
-        let path = root.join(".opencode").join("skills").join(relative);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        fs::write(path, contents)?;
-    }
-    Ok(())
-}
-
-fn run_graphify_install(root: &Path) -> Result<(), AppError> {
-    let output = Command::new("graphify")
-        .args(["install", "--platform", "opencode", "--project"])
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|error| AppError::Runtime(format!("unable to run graphify installer: {error}")))?;
-    if !output.status.success() {
-        return Err(AppError::Runtime(format!(
-            "graphify installer failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )));
-    }
-    Ok(())
+    crate::bootstrap::write_skills(root)
 }
 
 /// Resolve a CLI selector: exact library id first, then an unambiguous name.
@@ -248,11 +197,8 @@ fn append_manifest<W: Write>(
 
 fn append_tree<W: Write>(archive: &mut Builder<W>, root: &Path) -> Result<(), AppError> {
     for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
-        let entry = entry.map_err(|error| AppError::Storage(error.to_string()))?;
-        let relative = entry
-            .path()
-            .strip_prefix(root)
-            .map_err(|error| AppError::Storage(error.to_string()))?;
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(root)?;
         if relative.as_os_str().is_empty() || is_excluded(relative) {
             continue;
         }

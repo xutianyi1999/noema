@@ -6,6 +6,8 @@ description = "OpenCode-driven isolated text knowledge-base service"
 license = "MIT"
 
 [dependencies]
+anstream = "1"
+anstyle = "1"
 axum = "0.8"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
@@ -22,6 +24,7 @@ schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+slug = "0.1"
 tar = "0.4.46"
 tempfile = "3"
 thiserror = "2"
@@ -31,6 +34,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2.5"
+yaml_serde = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

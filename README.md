@@ -164,7 +164,7 @@ MCP 工具都显式接收 `library_id`（健康检查除外）。Noema 不提供
 `noema-cli` 是 HTTP API 的命令行封装——所有操作都经过运行中的 `noema` 服务，可以和服务不在同一台机器（地址用 `--server` 或 `$NOEMA_SERVER` 指定，默认 `http://127.0.0.1:8787`）：
 
 ```bash
-noema-cli health
+noema-cli status
 noema-cli create 基础法规库
 noema-cli list
 noema-cli export 基础法规库 -o base-regulations.tar.gz

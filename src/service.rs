@@ -1,14 +1,16 @@
-use std::{path::Path, process::Stdio, sync::Arc};
-
-use tokio::process::Command;
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::{
     config::Config,
     error::AppError,
     models::{
-        CreateLibraryRequest, DocumentInput, HealthResponse, JobStatus, Library, QueryResponse,
-        SubmitDocumentResponse,
+        CreateLibraryRequest, DocumentInput, HealthResponse, JobKind, JobState, JobStatus, Library,
+        QueryResponse, SubmitDocumentResponse,
     },
+    references,
     runtime::{AgentRunRequest, OpenCodeAgent, OpenCodeRuntime},
     storage::{Storage, StoredDocument},
 };
@@ -104,10 +106,10 @@ impl<R: OpenCodeRuntime> AppService<R> {
             document.title.as_deref(),
             &document.content,
         )?;
-        let job = self.storage.create_job(library_id, "ingest")?;
+        let job = self.storage.create_job(library_id, JobKind::Ingest)?;
         if stored.duplicate {
             self.storage
-                .update_job(library_id, &job.job_id, "skipped", None, None)?;
+                .update_job(library_id, &job.job_id, JobState::Skipped, None, None)?;
             return Ok(SubmitDocumentResponse {
                 library_id: library_id.to_string(),
                 job_id: job.job_id,
@@ -151,7 +153,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
         let query_id = self.storage.record_query(library_id)?;
         let request = AgentRunRequest {
             library_id: library_id.into(),
-            workdir: root,
+            workdir: root.clone(),
             title: format!("Noema query {query_id}"),
             prompt: format_query_prompt(prompt),
         };
@@ -159,22 +161,28 @@ impl<R: OpenCodeRuntime> AppService<R> {
         let result = match self.runtime.run_new_session(request).await {
             Ok(result) => result,
             Err(error) => {
-                self.storage
-                    .update_query(&query_id, "failed", None, Some(&error.to_string()))?;
+                self.storage.update_query(
+                    &query_id,
+                    JobState::Failed,
+                    None,
+                    Some(&error.to_string()),
+                )?;
                 return Err(AppError::QueryFailed(error.to_string()));
             }
         };
-        self.storage
-            .update_query(&query_id, "completed", Some(&result.session_id), None)?;
-        let references = self
-            .storage
-            .references_from_answer(library_id, &result.answer)?;
+        self.storage.update_query(
+            &query_id,
+            JobState::Completed,
+            Some(&result.session_id),
+            None,
+        )?;
+        let cited = references::extract_references(&root, &result.answer);
         Ok(QueryResponse {
             query_id,
             library_id: library_id.into(),
             session_id: result.session_id,
             answer: result.answer,
-            references,
+            references: cited,
             tool_events: result.tool_events,
         })
     }
@@ -186,14 +194,14 @@ impl<R: OpenCodeRuntime> AppService<R> {
         stored: StoredDocument,
     ) -> Result<(), AppError> {
         self.storage
-            .update_job(library_id, job_id, "running", None, None)?;
+            .update_job(library_id, job_id, JobState::Running, None, None)?;
         let staging = match self.storage.prepare_staging(library_id, job_id) {
             Ok(path) => path,
             Err(error) => {
                 self.storage.update_job(
                     library_id,
                     job_id,
-                    "failed",
+                    JobState::Failed,
                     None,
                     Some(&error.to_string()),
                 )?;
@@ -213,7 +221,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 self.storage.update_job(
                     library_id,
                     job_id,
-                    "failed",
+                    JobState::Failed,
                     None,
                     Some(&error.to_string()),
                 )?;
@@ -229,7 +237,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             self.storage.update_job(
                 library_id,
                 job_id,
-                "failed",
+                JobState::Failed,
                 Some(&result.session_id),
                 Some(&error.to_string()),
             )?;
@@ -239,7 +247,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
         self.storage.update_job(
             library_id,
             job_id,
-            "completed",
+            JobState::Completed,
             Some(&result.session_id),
             None,
         )?;
@@ -247,30 +255,12 @@ impl<R: OpenCodeRuntime> AppService<R> {
     }
 
     async fn bootstrap_library(&self, library: &Library) -> Result<(), AppError> {
-        let root = Path::new(&library.root);
-        let output = Command::new("graphify")
-            .args(["install", "--platform", "opencode", "--project"])
-            .current_dir(root)
-            .stdin(Stdio::null())
-            .output()
+        // Only the installer + skill refresh run on the blocking pool; the
+        // control-plane insert and any rollback stay on the async task.
+        let root = PathBuf::from(&library.root);
+        tokio::task::spawn_blocking(move || crate::bootstrap::bootstrap(&root))
             .await
-            .map_err(|error| {
-                AppError::Runtime(format!("unable to run graphify installer: {error}"))
-            })?;
-        if !output.status.success() {
-            return Err(AppError::Runtime(format!(
-                "graphify installer failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
-        for (relative, contents) in crate::snapshot::skill_files() {
-            let path = root.join(".opencode").join("skills").join(relative);
-            if let Some(parent) = path.parent() {
-                tokio::fs::create_dir_all(parent).await?;
-            }
-            tokio::fs::write(path, contents).await?;
-        }
-        Ok(())
+            .map_err(|error| AppError::Runtime(format!("bootstrap task aborted: {error}")))?
     }
 }
 

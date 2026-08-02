@@ -51,8 +51,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
             )
             .await
             .map_err(|error| to_mcp_error(&error))?;
-        serde_json::to_string(&response)
-            .map_err(|error| to_mcp_error(&crate::AppError::from(error)))
+        json_response(&response)
     }
 
     #[tool(
@@ -67,8 +66,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
             .query(&request.library_id, &request.prompt)
             .await
             .map_err(|error| to_mcp_error(&error))?;
-        serde_json::to_string(&response)
-            .map_err(|error| to_mcp_error(&crate::AppError::from(error)))
+        json_response(&response)
     }
 
     #[tool(description = "Get the status of an ingestion job in one isolated content library.")]
@@ -80,14 +78,12 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
             .service
             .job_status(&request.library_id, &request.job_id)
             .map_err(|error| to_mcp_error(&error))?;
-        serde_json::to_string(&response)
-            .map_err(|error| to_mcp_error(&crate::AppError::from(error)))
+        json_response(&response)
     }
 
     #[tool(description = "Return Noema service health and the configured OpenCode model.")]
     async fn kb_health(&self) -> Result<String, rmcp::ErrorData> {
-        serde_json::to_string(&self.service.health())
-            .map_err(|error| to_mcp_error(&crate::AppError::from(error)))
+        json_response(&self.service.health())
     }
 }
 
@@ -117,6 +113,12 @@ pub fn streamable_http_service<R: OpenCodeRuntime>(
         Default::default(),
         config,
     )
+}
+
+/// Serialize one successful tool result to the JSON string MCP tools
+/// return, mapping any serialization failure onto the internal error code.
+fn json_response<T: serde::Serialize>(value: &T) -> Result<String, rmcp::ErrorData> {
+    serde_json::to_string(value).map_err(|error| to_mcp_error(&crate::AppError::from(error)))
 }
 
 /// Maps service errors onto MCP error codes: caller mistakes (unknown
