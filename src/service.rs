@@ -90,9 +90,11 @@ impl<R: OpenCodeRuntime> AppService<R> {
         Ok(library)
     }
 
+    /// `library` accepts an exact id or a unique library name; it is
+    /// resolved once here and every downstream call uses the resolved id.
     pub async fn submit_document(
         &self,
-        library_id: &str,
+        library: &str,
         document: DocumentInput,
     ) -> Result<SubmitDocumentResponse, AppError> {
         if document.content.is_empty() {
@@ -100,18 +102,19 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 "document content cannot be empty".into(),
             ));
         }
+        let library_id = self.storage.resolve_library(library)?.id;
         let stored = self.storage.store_document(
-            library_id,
+            &library_id,
             &document.filename,
             document.title.as_deref(),
             &document.content,
         )?;
-        let job = self.storage.create_job(library_id, JobKind::Ingest)?;
+        let job = self.storage.create_job(&library_id, JobKind::Ingest)?;
         if stored.duplicate {
             self.storage
-                .update_job(library_id, &job.job_id, JobState::Skipped, None, None)?;
+                .update_job(&library_id, &job.job_id, JobState::Skipped, None, None)?;
             return Ok(SubmitDocumentResponse {
-                library_id: library_id.to_string(),
+                library_id,
                 job_id: job.job_id,
                 document_path: Some(stored.record.path),
                 duplicate: true,
@@ -119,7 +122,6 @@ impl<R: OpenCodeRuntime> AppService<R> {
         }
 
         let service = self.clone();
-        let library_id = library_id.to_string();
         let job_id = job.job_id.clone();
         let task_library_id = library_id.clone();
         let document_path = stored.record.path.clone();
@@ -140,19 +142,23 @@ impl<R: OpenCodeRuntime> AppService<R> {
         })
     }
 
-    pub fn job_status(&self, library_id: &str, job_id: &str) -> Result<JobStatus, AppError> {
-        self.storage.get_job(library_id, job_id)
+    /// `library` accepts an exact id or a unique library name.
+    pub fn job_status(&self, library: &str, job_id: &str) -> Result<JobStatus, AppError> {
+        let library_id = self.storage.resolve_library(library)?.id;
+        self.storage.get_job(&library_id, job_id)
     }
 
-    pub async fn query(&self, library_id: &str, prompt: &str) -> Result<QueryResponse, AppError> {
+    /// `library` accepts an exact id or a unique library name.
+    pub async fn query(&self, library: &str, prompt: &str) -> Result<QueryResponse, AppError> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err(AppError::BadRequest("prompt cannot be empty".into()));
         }
-        let root = self.storage.library_root(library_id)?;
-        let query_id = self.storage.record_query(library_id)?;
+        let library_id = self.storage.resolve_library(library)?.id;
+        let root = self.storage.library_root(&library_id)?;
+        let query_id = self.storage.record_query(&library_id)?;
         let request = AgentRunRequest {
-            library_id: library_id.into(),
+            library_id: library_id.clone(),
             workdir: root.clone(),
             title: format!("Noema query {query_id}"),
             prompt: format_query_prompt(prompt),
@@ -179,7 +185,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
         let cited = references::extract_references(&root, &result.answer);
         Ok(QueryResponse {
             query_id,
-            library_id: library_id.into(),
+            library_id,
             session_id: result.session_id,
             answer: result.answer,
             references: cited,

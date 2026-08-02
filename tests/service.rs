@@ -84,6 +84,7 @@ fn config(data_dir: PathBuf) -> Config {
         opencode_url: "http://127.0.0.1:4096".into(),
         opencode_model: "opencode/deepseek-v4-flash-free".into(),
         opencode_timeout_secs: 5,
+        transcript: false,
     }
 }
 
@@ -238,6 +239,61 @@ async fn libraries_are_isolated_and_invalid_documents_are_rejected() {
         .await;
     assert!(matches!(invalid, Err(AppError::BadRequest(_))));
     assert!(service.job_status(&first.id, "missing").is_err());
+}
+
+#[tokio::test]
+async fn libraries_are_addressable_by_unique_name() {
+    let (_tempdir, service, _runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "法规库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+
+    let submitted = service
+        .submit_document(
+            "法规库",
+            DocumentInput {
+                filename: "source.md".into(),
+                content: "# Session Context\n\nTest source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.library_id, library.id);
+    let status = wait_for_completion(&service, "法规库", &submitted.job_id).await;
+    assert_eq!(status.status, JobState::Completed, "{status:?}");
+    let answer = service.query("法规库", "这个概念是什么？").await.unwrap();
+    assert_eq!(answer.library_id, library.id);
+
+    // A duplicated name makes the selector ambiguous: callers must fall
+    // back to the id, which always keeps working.
+    service
+        .create_library(CreateLibraryRequest {
+            name: "法规库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let ambiguous = service
+        .submit_document(
+            "法规库",
+            DocumentInput {
+                filename: "other.md".into(),
+                content: "content".into(),
+                title: None,
+            },
+        )
+        .await;
+    assert!(matches!(ambiguous, Err(AppError::BadRequest(_))));
+    assert!(service.job_status(&library.id, &submitted.job_id).is_ok());
+    assert!(matches!(
+        service.job_status("no-such-library", "missing"),
+        Err(AppError::LibraryNotFound(_))
+    ));
 }
 
 #[tokio::test]

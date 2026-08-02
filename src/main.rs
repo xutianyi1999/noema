@@ -33,6 +33,18 @@ struct Cli {
     /// 单个 Agent session 超时（秒）
     #[arg(long, env = "OPENCODE_TIMEOUT_SECS", default_value_t = 1800)]
     opencode_timeout_secs: u64,
+    /// 流式打印 OpenCode 会话的中间过程（仅服务端日志；接口始终只返回最终答案）。
+    /// 裸 `--transcript` 即开启，也可带值 `--transcript=false`。
+    #[arg(
+        long,
+        env = "NOEMA_TRANSCRIPT",
+        value_name = "true|false",
+        num_args = 0..=1,
+        default_missing_value = "true",
+        default_value = "false",
+        value_parser = clap::builder::BoolishValueParser::new()
+    )]
+    transcript: bool,
 }
 
 fn main() -> ExitCode {
@@ -67,6 +79,7 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         opencode_url: managed.url().to_string(),
         opencode_model: cli.model,
         opencode_timeout_secs: cli.opencode_timeout_secs,
+        transcript: cli.transcript,
     };
     let service = AppService::new(config)?;
     let app = http::router(service);

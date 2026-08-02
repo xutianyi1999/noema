@@ -93,8 +93,18 @@ fn run(command: &mut Command) -> (bool, String, String) {
     )
 }
 
-fn first_field(stdout: &str) -> &str {
-    stdout.lines().next().unwrap().split('\t').next().unwrap()
+/// Read one value out of the CLI's `key  value` output blocks, e.g. the
+/// `ID  fa-gui-ku-…` row that `create` and `import` print.
+fn field<'a>(stdout: &'a str, key: &str) -> &'a str {
+    stdout
+        .lines()
+        .find_map(|line| {
+            let mut tokens = line.split_whitespace();
+            (tokens.next() == Some(key))
+                .then(|| tokens.next())
+                .flatten()
+        })
+        .unwrap()
 }
 
 #[test]
@@ -106,7 +116,7 @@ fn cli_drives_the_http_api_through_an_export_import_round_trip() {
     // Create a library over HTTP.
     let (ok, stdout, stderr) = run(client(&server.base).args(["create", "法规库"]));
     assert!(ok, "{stderr}");
-    let library_id = first_field(&stdout).to_string();
+    let library_id = field(&stdout, "ID").to_string();
 
     // Give the library some knowledge. The test can reach the server's data
     // directory directly; a remote client could not — it only speaks HTTP.
@@ -138,7 +148,7 @@ fn cli_drives_the_http_api_through_an_export_import_round_trip() {
         .arg(&archive)
         .args(["--name", "副本"]));
     assert!(ok, "{stderr}");
-    let imported_id = first_field(&stdout).to_string();
+    let imported_id = field(&stdout, "ID").to_string();
     assert_ne!(imported_id, library_id);
     assert!(stdout.contains("副本"), "{stdout}");
 
@@ -187,5 +197,5 @@ fn cli_import_rejects_a_hostile_archive_over_http() {
     // The server rolled the rejected import back: nothing was created.
     let (ok, stdout, _) = run(client(&server.base).arg("list"));
     assert!(ok);
-    assert!(stdout.contains("(no content libraries)"), "{stdout}");
+    assert!(stdout.contains("暂无内容库"), "{stdout}");
 }

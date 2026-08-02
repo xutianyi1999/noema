@@ -1,7 +1,9 @@
 //! Optional human-readable live transcript of OpenCode sessions for the
 //! server log.
 //!
-//! Enabled per process with `NOEMA_TRANSCRIPT=1`. While enabled, the runtime
+//! Enabled per process with the server's `--transcript` flag (the
+//! `NOEMA_TRANSCRIPT` environment variable is its fallback, like every other
+//! setting). While enabled, the runtime
 //! streams assistant text, reasoning ("thinking"), tool invocations and
 //! results (including the built-in `skill` tool), per-step statistics and
 //! session errors to stderr as they arrive on the event stream. This is
@@ -10,7 +12,6 @@
 
 use std::{
     collections::HashSet,
-    env,
     io::Write as _,
     sync::{
         Mutex,
@@ -66,9 +67,7 @@ pub(crate) struct Transcript {
 }
 
 impl Transcript {
-    pub(crate) fn new(session_id: &str, title: &str) -> Self {
-        let enabled = env::var("NOEMA_TRANSCRIPT")
-            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+    pub(crate) fn new(enabled: bool, session_id: &str, title: &str) -> Self {
         let transcript = Self {
             enabled,
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),

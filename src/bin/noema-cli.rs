@@ -5,10 +5,17 @@
 //! machine: documents are read locally and uploaded, snapshots are
 //! downloaded to / uploaded from local files, queries print the server's
 //! answer. This binary never touches the server's data directory.
+//!
+//! Output styling uses the same pair as the server transcript: anstyle
+//! styles embedded through anstream, which strips them when stdout is not
+//! a terminal (NO_COLOR / FORCE_COLOR / CLICOLOR honoured); tables come
+//! from comfy-table, which applies its own styling only on a terminal.
 
-use std::{path::PathBuf, process::ExitCode};
+use std::{io::Write as _, path::PathBuf, process::ExitCode};
 
+use anstyle::{AnsiColor, Style};
 use clap::{Parser, Subcommand};
+use comfy_table::{Attribute, Cell, Color, Table, presets::UTF8_FULL};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -95,7 +102,7 @@ async fn main() -> ExitCode {
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("noema-cli: {error}");
+            let _ = writeln!(stderr(), "{}", paint(RED, &format!("noema-cli: {error}")));
             ExitCode::FAILURE
         }
     }
@@ -138,7 +145,18 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
 async fn cmd_status(client: &reqwest::Client, base: &str) -> Result<(), BoxError> {
     let response = send(client.get(format!("{base}/v1/health"))).await?;
     let value = response.json::<Value>().await?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
+    let healthy = value["status"].as_str() == Some("ok");
+    let headline = if healthy {
+        paint(GREEN, "● 服务正常")
+    } else {
+        paint(RED, &format!("● 服务异常（{}）", value["status"]))
+    };
+    let _ = writeln!(stdout(), "{headline}  {base}");
+    print_kv(vec![
+        ("数据目录", plain(string_field(&value, "data_dir"))),
+        ("OpenCode", plain(string_field(&value, "opencode_url"))),
+        ("模型", plain(string_field(&value, "configured_model"))),
+    ]);
     Ok(())
 }
 
@@ -154,7 +172,7 @@ async fn cmd_create(
             .json(&json!({ "name": name, "description": description })),
     )
     .await?;
-    print_library_line(&response.json::<Value>().await?);
+    print_library("✔ 已创建内容库", &response.json::<Value>().await?);
     Ok(())
 }
 
@@ -162,12 +180,24 @@ async fn cmd_list(client: &reqwest::Client, base: &str) -> Result<(), BoxError> 
     let response = send(client.get(format!("{base}/v1/libraries"))).await?;
     let libraries = response.json::<Vec<Value>>().await?;
     if libraries.is_empty() {
-        println!("(no content libraries) server={base}");
+        let _ = writeln!(stdout(), "{}  server={base}", paint(DIM, "（暂无内容库）"));
         return Ok(());
     }
-    for library in libraries {
-        print_library_line(&library);
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        Cell::new("ID").add_attribute(Attribute::Bold),
+        Cell::new("名称").add_attribute(Attribute::Bold),
+        Cell::new("路径").add_attribute(Attribute::Bold),
+    ]);
+    for library in &libraries {
+        table.add_row([
+            string_field(library, "id"),
+            string_field(library, "name"),
+            string_field(library, "root"),
+        ]);
     }
+    let _ = writeln!(stdout(), "{table}");
     Ok(())
 }
 
@@ -188,7 +218,12 @@ async fn cmd_export(
         file.write_all(&chunk).await?;
     }
     file.flush().await?;
-    println!("exported {library} -> {} ({bytes} bytes)", output.display());
+    let _ = writeln!(
+        stdout(),
+        "{} {library} → {}（{bytes} 字节）",
+        paint(GREEN, "✔ 已导出"),
+        output.display()
+    );
     Ok(())
 }
 
@@ -217,7 +252,7 @@ async fn cmd_import(
             .body(bytes),
     )
     .await?;
-    print_library_line(&response.json::<Value>().await?);
+    print_library("✔ 已导入为全新内容库", &response.json::<Value>().await?);
     Ok(())
 }
 
@@ -246,12 +281,21 @@ async fn cmd_submit(
     )
     .await?;
     let value = response.json::<Value>().await?;
-    println!(
-        "submitted\t{}\tduplicate={}\tjob_id={}",
-        value["document_path"].as_str().unwrap_or("-"),
-        value["duplicate"],
-        value["job_id"].as_str().unwrap_or("-"),
-    );
+    let path = string_field(&value, "document_path");
+    let job_id = string_field(&value, "job_id");
+    let headline = if value["duplicate"].as_bool().unwrap_or(false) {
+        paint(YELLOW, "● 内容重复（SHA-256）——已登记，未触发摄入")
+    } else {
+        paint(GREEN, "✔ 已提交，摄入任务已创建")
+    };
+    let _ = writeln!(stdout(), "{headline}  {path}");
+    print_kv(vec![
+        ("任务", plain(job_id.clone())),
+        (
+            "查看进度",
+            plain(format!("noema-cli job {library} {job_id}")),
+        ),
+    ]);
     Ok(())
 }
 
@@ -268,7 +312,28 @@ async fn cmd_job(
     )))
     .await?;
     let value = response.json::<Value>().await?;
-    println!("{}", serde_json::to_string_pretty(&value)?);
+    let status = string_field(&value, "status");
+    let status_cell = match status.as_str() {
+        "completed" => colored(Color::Green, status),
+        "failed" => colored(Color::Red, status),
+        "skipped" => dim(status),
+        _ => colored(Color::Yellow, status),
+    };
+    let error = value["error"].as_str();
+    let session = value["session_id"].as_str();
+    let mut rows: Vec<(&str, Cell)> = vec![
+        ("任务", plain(string_field(&value, "job_id"))),
+        ("内容库", plain(string_field(&value, "library_id"))),
+        ("类型", plain(string_field(&value, "kind"))),
+        ("状态", status_cell),
+    ];
+    if let Some(error) = error {
+        rows.push(("错误", colored(Color::Red, error.to_string())));
+    }
+    rows.push(("会话", optional(session)));
+    rows.push(("创建时间", plain(string_field(&value, "created_at"))));
+    rows.push(("更新时间", plain(string_field(&value, "updated_at"))));
+    print_kv(rows);
     Ok(())
 }
 
@@ -285,7 +350,21 @@ async fn cmd_query(
     )
     .await?;
     let value = response.json::<Value>().await?;
-    println!("{}", value["answer"].as_str().unwrap_or_default());
+    let _ = writeln!(stdout(), "{}", string_field(&value, "answer"));
+    let references = value["references"].as_array();
+    if references.is_some_and(|items| !items.is_empty()) {
+        let _ = writeln!(stdout());
+        let _ = writeln!(stdout(), "{}", paint(BOLD, "来源"));
+        for item in references.unwrap() {
+            let title = string_field(item, "title");
+            let source = string_field(item, "source");
+            let line = match item["node"].as_str() {
+                Some(node) => format!("  · {title}  {source} → {node}"),
+                None => format!("  · {title}  {source}"),
+            };
+            let _ = writeln!(stdout(), "{}", paint(DIM, &line));
+        }
+    }
     Ok(())
 }
 
@@ -315,11 +394,67 @@ fn encode(segment: &str) -> String {
     utf8_percent_encode(segment, NON_ALPHANUMERIC).to_string()
 }
 
-fn print_library_line(library: &Value) {
-    println!(
-        "{}\t{}\t{}",
-        library["id"].as_str().unwrap_or("-"),
-        library["name"].as_str().unwrap_or("-"),
-        library["root"].as_str().unwrap_or("-"),
-    );
+/// One content library as a styled headline plus a key/value block.
+fn print_library(headline: &str, library: &Value) {
+    let _ = writeln!(stdout(), "{}", paint(GREEN, headline));
+    print_kv(vec![
+        ("ID", plain(string_field(library, "id"))),
+        ("名称", plain(string_field(library, "name"))),
+        ("路径", plain(string_field(library, "root"))),
+    ]);
+}
+
+/// Borderless key/value block; comfy-table aligns the columns and handles
+/// CJK widths, its styling only applies on a terminal.
+fn print_kv(rows: Vec<(&str, Cell)>) {
+    let mut table = Table::new();
+    table.load_preset(comfy_table::presets::NOTHING);
+    for (key, value) in rows {
+        table.add_row([Cell::new(key).add_attribute(Attribute::Dim), value]);
+    }
+    let _ = writeln!(stdout(), "{table}");
+}
+
+fn string_field(value: &Value, key: &str) -> String {
+    value[key].as_str().unwrap_or("—").to_string()
+}
+
+fn plain(text: String) -> Cell {
+    Cell::new(text)
+}
+
+fn dim(text: String) -> Cell {
+    Cell::new(text).add_attribute(Attribute::Dim)
+}
+
+fn optional(text: Option<&str>) -> Cell {
+    match text {
+        Some(text) => Cell::new(text.to_string()),
+        None => dim("—".to_string()),
+    }
+}
+
+fn colored(color: Color, text: String) -> Cell {
+    Cell::new(text).fg(color)
+}
+
+const DIM: Style = Style::new().dimmed();
+const BOLD: Style = Style::new().bold();
+const RED: Style = AnsiColor::Red.on_default();
+const GREEN: Style = AnsiColor::Green.on_default();
+const YELLOW: Style = AnsiColor::Yellow.on_default();
+
+/// Embed one style's escape codes around `text`. The anstream writers strip
+/// the codes when the stream is not a terminal (NO_COLOR / FORCE_COLOR /
+/// CLICOLOR honoured).
+fn paint(style: Style, text: &str) -> String {
+    format!("{style}{text}{style:#}")
+}
+
+fn stdout() -> anstream::AutoStream<std::io::Stdout> {
+    anstream::AutoStream::auto(std::io::stdout())
+}
+
+fn stderr() -> anstream::AutoStream<std::io::Stderr> {
+    anstream::AutoStream::auto(std::io::stderr())
 }

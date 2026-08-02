@@ -110,6 +110,34 @@ impl Storage {
         Ok(libraries)
     }
 
+    /// Resolve a protocol-layer library selector: an exact id first, then an
+    /// unambiguous name. CLI and HTTP callers may pass either; storage
+    /// internals always receive the resolved id.
+    pub fn resolve_library(&self, selector: &str) -> Result<Library, AppError> {
+        let libraries = self.list_libraries()?;
+        if let Some(library) = libraries.iter().find(|item| item.id == selector) {
+            return Ok(library.clone());
+        }
+        let by_name: Vec<&Library> = libraries
+            .iter()
+            .filter(|item| item.name == selector)
+            .collect();
+        match by_name.as_slice() {
+            [] => Err(AppError::LibraryNotFound(selector.into())),
+            [library] => Ok((*library).clone()),
+            many => {
+                let ids = many
+                    .iter()
+                    .map(|item| item.id.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                Err(AppError::BadRequest(format!(
+                    "multiple libraries are named {selector:?}; select one by id: {ids}"
+                )))
+            }
+        }
+    }
+
     pub fn create_job(&self, library_id: &str, kind: JobKind) -> Result<JobStatus, AppError> {
         let _ = self.get_library(library_id)?;
         let now = Utc::now();

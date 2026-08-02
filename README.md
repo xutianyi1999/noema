@@ -206,6 +206,7 @@ NOEMA_DATA_DIR=data cargo run
 | `NOEMA_DATA_DIR` | `data` | 服务数据目录 |
 | `OPENCODE_MODEL` | `opencode/deepseek-v4-flash-free` | 模型标识 |
 | `OPENCODE_TIMEOUT_SECS` | `1800` | 单个 Agent session 超时 |
+| `NOEMA_TRANSCRIPT` | `false` | 流式打印会话中间过程（仅服务端日志，等价 `--transcript`） |
 
 OpenCode session 当前显式允许全部权限，但关闭交互式 `question` 工具（服务没有用户回答回路）。内容库的工作目录、摄入暂存目录和服务侧提交校验仍由 Noema 管理；这不是面向不受信任租户的主机级沙箱。
 
@@ -224,6 +225,8 @@ curl -X POST http://127.0.0.1:8787/v1/libraries \
   -H 'content-type: application/json' \
   -d '{"name":"产品知识库","description":"产品设计和使用文档"}'
 ```
+
+所有 `/v1/libraries/{library_id}/…` 路由的 `{library_id}` 路径段都接受内容库 id，或唯一的内容库名称；名称重名时返回 400 并要求改用 id。
 
 提交 UTF-8 Markdown/TXT 文档：
 
@@ -311,10 +314,10 @@ noema-cli query 用户A法规库 "第一条讲了什么？"
 cargo test
 ```
 
-服务端可以流式打印 OpenCode 会话的中间过程（text / thinking / tool / skill 调用与结果、step 统计），仅用于服务端日志，HTTP 与 MCP 接口始终只返回最终文本回答。设置 `NOEMA_TRANSCRIPT=1` 启用（终端下自动带颜色，遵循 `NO_COLOR`）：
+服务端可以流式打印 OpenCode 会话的中间过程（text / thinking / tool / skill 调用与结果、step 统计），仅用于服务端日志，HTTP 与 MCP 接口始终只返回最终文本回答。用 `--transcript` 标志启用（环境变量 `NOEMA_TRANSCRIPT` 是回退项；终端下自动带颜色，遵循 `NO_COLOR`）：
 
 ```bash
-NOEMA_TRANSCRIPT=1 noema
+noema --transcript
 ```
 
 ## 内容库与 Skill

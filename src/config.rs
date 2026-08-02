@@ -7,4 +7,5 @@ pub struct Config {
     pub opencode_url: String,
     pub opencode_model: String,
     pub opencode_timeout_secs: u64,
+    pub transcript: bool,
 }

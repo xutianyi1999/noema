@@ -54,7 +54,7 @@ pub struct SnapshotManifest {
 /// copy with no references outside the library.
 pub fn export_library(data_dir: &Path, selector: &str, output: &Path) -> Result<Library, AppError> {
     let storage = Storage::open(data_dir)?;
-    let library = resolve_library(&storage, selector)?;
+    let library = storage.resolve_library(selector)?;
     let root = PathBuf::from(&library.root);
     let file = fs::File::create(output)?;
     let encoder = GzEncoder::new(file, Compression::default());
@@ -154,32 +154,6 @@ fn overlay_and_repair(
     // Always refresh the four Noema skills to this binary's versions so an
     // imported library follows the current node contract.
     crate::bootstrap::write_skills(root)
-}
-
-/// Resolve a CLI selector: exact library id first, then an unambiguous name.
-fn resolve_library(storage: &Storage, selector: &str) -> Result<Library, AppError> {
-    let libraries = storage.list_libraries()?;
-    if let Some(library) = libraries.iter().find(|item| item.id == selector) {
-        return Ok(library.clone());
-    }
-    let by_name: Vec<&Library> = libraries
-        .iter()
-        .filter(|item| item.name == selector)
-        .collect();
-    match by_name.as_slice() {
-        [] => Err(AppError::LibraryNotFound(selector.into())),
-        [library] => Ok((*library).clone()),
-        many => {
-            let ids = many
-                .iter()
-                .map(|item| item.id.as_str())
-                .collect::<Vec<_>>()
-                .join(", ");
-            Err(AppError::BadRequest(format!(
-                "multiple libraries are named {selector:?}; select one by id: {ids}"
-            )))
-        }
-    }
 }
 
 fn append_manifest<W: Write>(

@@ -96,9 +96,9 @@ impl OpenCodeAgent {
             .subscribe_session(session_id)
             .map_err(|error| AppError::Runtime(error.to_string()))?;
 
-        // Server-side live transcript (opt-in via NOEMA_TRANSCRIPT); never
-        // affects the result returned to callers.
-        let mut transcript = Transcript::new(session_id, &request.title);
+        // Server-side live transcript (opt-in via the --transcript flag);
+        // never affects the result returned to callers.
+        let mut transcript = Transcript::new(self.config.transcript, session_id, &request.title);
 
         let prompt = PromptRequest {
             parts: vec![PromptPart::Text {
