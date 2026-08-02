@@ -97,7 +97,7 @@ data/                                  数据根目录（NOEMA_DATA_DIR）
 | `reviews/` | 未解决的冲突与低置信度结论 | Agent（经 staging 提交） | 与正式知识分离，留待人工或后续任务处理 |
 | `graphify-out/` | 知识图谱、报告与增量缓存 | graphify（经 staging 提交） | 输入被限定为 `raw/` + `wiki/`；与 raw/wiki 同级，只服务图谱查询 |
 | `index.md` · `manifest.json` · `library.sqlite` | 派生索引与去重记录 | Noema 自动重建 | 不手写；永远由原文、知识节点和库内数据库再生 |
-| `staging/{job_id}/` | 摄入隔离工作区 | Noema 创建与清理 | 成功则提交允许的知识产物并清理；失败则保留备查，库不受影响 |
+| `staging/{job_id}/` | 摄入隔离工作区 | Noema 创建与清理 | 成功则提交允许的知识产物并清理；失败则保留备查，库不受影响。终态残留另由调和收敛：服务启动时清扫一遍，任务完成后再延迟复查一次（OpenCode 会话状态回写可能把已清理目录复活成空骨架） |
 | `purpose.md` · `schema.md` · `.graphifyignore` | 内容库契约与边界 | 建库时种入 | 摄入校验要求逐字节未变；Agent 与 graphify 都在其划定的范围内活动 |
 | `.opencode/` · `AGENTS.md` | Agent 能力与行为说明 | Noema 与 graphify 安装器 | 建库与快照导入时写入/刷新；不属于知识提交物 |
 

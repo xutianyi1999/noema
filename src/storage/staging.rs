@@ -11,7 +11,7 @@ use std::{
 use walkdir::WalkDir;
 
 use super::{Storage, fsutil::copy_path, layout::LibraryLayout};
-use crate::error::AppError;
+use crate::{error::AppError, models::JobState};
 
 impl Storage {
     pub fn prepare_staging(&self, library_id: &str, job_id: &str) -> Result<PathBuf, AppError> {
@@ -118,6 +118,37 @@ impl Storage {
         let staging = self.library_root(library_id)?.join("staging").join(job_id);
         if staging.exists() {
             fs::remove_dir_all(staging)?;
+        }
+        Ok(())
+    }
+
+    /// Remove ingest workspaces that are no longer needed: those of
+    /// successfully finished jobs (completed or skipped) and orphans whose
+    /// job row is gone. Failed workspaces stay for inspection; in-flight
+    /// ones are left alone.
+    ///
+    /// OpenCode persists session state under the session's project
+    /// directory asynchronously, so it can resurrect a cleaned staging
+    /// directory later as an empty skeleton of session tombstones. Running
+    /// this at startup and again after each completed ingest makes staging
+    /// hygiene a convergent invariant instead of a race with that
+    /// write-back.
+    pub fn reconcile_staging(&self, library_id: &str) -> Result<(), AppError> {
+        let staging = self.library_root(library_id)?.join("staging");
+        if !staging.is_dir() {
+            return Ok(());
+        }
+        for entry in fs::read_dir(&staging)? {
+            let entry = entry?;
+            let job_id = entry.file_name().to_string_lossy().into_owned();
+            let expendable = match self.get_job(library_id, &job_id) {
+                Ok(job) => matches!(job.status, JobState::Completed | JobState::Skipped),
+                Err(AppError::JobNotFound(_)) => true,
+                Err(error) => return Err(error),
+            };
+            if expendable {
+                fs::remove_dir_all(entry.path())?;
+            }
         }
         Ok(())
     }
@@ -228,4 +259,86 @@ fn validate_wiki_nodes(root: &Path) -> Result<(), AppError> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{CreateLibraryRequest, JobKind};
+
+    fn fixture() -> (tempfile::TempDir, Storage, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let library = storage
+            .create_library(&CreateLibraryRequest {
+                name: "法规库".into(),
+                description: None,
+            })
+            .unwrap();
+        (tmp, storage, library.id)
+    }
+
+    #[test]
+    fn reconcile_staging_deletes_terminal_and_orphan_workspaces_but_keeps_the_rest() {
+        let (tmp, storage, library_id) = fixture();
+        let staging = tmp
+            .path()
+            .join("libraries")
+            .join(&library_id)
+            .join("staging");
+
+        let completed = storage.create_job(&library_id, JobKind::Ingest).unwrap();
+        storage
+            .update_job(
+                &library_id,
+                &completed.job_id,
+                JobState::Completed,
+                None,
+                None,
+            )
+            .unwrap();
+        let failed = storage.create_job(&library_id, JobKind::Ingest).unwrap();
+        storage
+            .update_job(
+                &library_id,
+                &failed.job_id,
+                JobState::Failed,
+                None,
+                Some("boom"),
+            )
+            .unwrap();
+        let running = storage.create_job(&library_id, JobKind::Ingest).unwrap();
+        storage
+            .update_job(&library_id, &running.job_id, JobState::Running, None, None)
+            .unwrap();
+        for job in [&completed, &failed, &running] {
+            fs::create_dir_all(staging.join(&job.job_id)).unwrap();
+        }
+        fs::create_dir_all(staging.join("orphan-without-a-job-row")).unwrap();
+
+        storage.reconcile_staging(&library_id).unwrap();
+
+        assert!(
+            !staging.join(&completed.job_id).exists(),
+            "completed workspaces are expendable"
+        );
+        assert!(
+            !staging.join("orphan-without-a-job-row").exists(),
+            "orphan workspaces are expendable"
+        );
+        assert!(
+            staging.join(&failed.job_id).exists(),
+            "failed workspaces are kept for inspection"
+        );
+        assert!(
+            staging.join(&running.job_id).exists(),
+            "in-flight workspaces are left alone"
+        );
+    }
+
+    #[test]
+    fn reconcile_staging_tolerates_a_library_without_a_staging_directory() {
+        let (_tmp, storage, library_id) = fixture();
+        storage.reconcile_staging(&library_id).unwrap();
+    }
 }

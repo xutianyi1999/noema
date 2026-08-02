@@ -1,6 +1,7 @@
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
+    time::Duration,
 };
 
 use crate::{
@@ -31,16 +32,24 @@ impl<R: OpenCodeRuntime> Clone for AppService<R> {
     }
 }
 
+/// How long after an ingest completes before staging is reconciled again:
+/// OpenCode takes minutes to write session tombstones back into a deleted
+/// project directory (observed ~4 min). Whatever this late pass misses, the
+/// startup sweep covers.
+const STAGING_RECONCILE_DELAY: Duration = Duration::from_secs(600);
+
 impl AppService<OpenCodeAgent> {
     pub fn new(config: Config) -> Result<Self, AppError> {
         let config = Arc::new(config);
         let storage = Storage::open(config.data_dir.clone())?;
         let runtime = Arc::new(OpenCodeAgent::new(config.clone()));
-        Ok(Self {
+        let service = Self {
             storage,
             config,
             runtime,
-        })
+        };
+        service.reconcile_staging();
+        Ok(service)
     }
 }
 
@@ -48,11 +57,13 @@ impl<R: OpenCodeRuntime> AppService<R> {
     pub fn with_runtime(config: Config, runtime: Arc<R>) -> Result<Self, AppError> {
         let config = Arc::new(config);
         let storage = Storage::open(config.data_dir.clone())?;
-        Ok(Self {
+        let service = Self {
             storage,
             config,
             runtime,
-        })
+        };
+        service.reconcile_staging();
+        Ok(service)
     }
 
     pub fn health(&self) -> HealthResponse {
@@ -67,6 +78,26 @@ impl<R: OpenCodeRuntime> AppService<R> {
     /// Data directory this service manages (control plane + library roots).
     pub fn data_dir(&self) -> &Path {
         &self.config.data_dir
+    }
+
+    /// Drop leftover staging workspaces whose jobs no longer need them (see
+    /// [`Storage::reconcile_staging`]). Runs at startup so residue from
+    /// previous runs — including directories OpenCode's session write-back
+    /// resurrected — converges away; per-library failures only log and
+    /// never block startup.
+    fn reconcile_staging(&self) {
+        match self.storage.list_libraries() {
+            Ok(libraries) => {
+                for library in libraries {
+                    if let Err(error) = self.storage.reconcile_staging(&library.id) {
+                        tracing::warn!(library_id = %library.id, %error, "staging reconcile failed");
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "staging reconcile skipped: cannot list libraries")
+            }
+        }
     }
 
     /// All content libraries known to the control plane, oldest first.
@@ -257,6 +288,19 @@ impl<R: OpenCodeRuntime> AppService<R> {
             Some(&result.session_id),
             None,
         )?;
+        // OpenCode writes this session's tombstone back into the staging
+        // project directory minutes after the cleanup above, resurrecting
+        // an empty skeleton; re-reconcile past that write-back window so a
+        // long-running server stays clean (the startup sweep covers the
+        // rest).
+        let storage = self.storage.clone();
+        let library_id = library_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(STAGING_RECONCILE_DELAY).await;
+            if let Err(error) = storage.reconcile_staging(&library_id) {
+                tracing::warn!(library_id = %library_id, %error, "deferred staging reconcile failed");
+            }
+        });
         Ok(())
     }
 
