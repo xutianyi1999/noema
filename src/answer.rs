@@ -13,7 +13,14 @@
 //! answer with no references — an unverified citation is worse than none
 //! in a knowledge base whose value is traceability.
 
-use std::{collections::HashMap, fs, path::Path, sync::OnceLock};
+use std::{
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    sync::{LazyLock, OnceLock},
+};
+
+use regex::Regex;
 
 use crate::{
     error::AppError,
@@ -266,32 +273,20 @@ fn document_titles(root: &Path) -> HashMap<String, String> {
 /// Drop every `[n]` citation marker whose n did not survive verification;
 /// surviving ids are untouched and never renumbered, so a claim whose
 /// citation failed verification simply reads as uncited.
-pub(crate) fn clean_markers(answer: &str, valid: &std::collections::HashSet<u32>) -> String {
-    let characters: Vec<char> = answer.chars().collect();
-    let mut output = String::with_capacity(answer.len());
-    let mut index = 0;
-    while index < characters.len() {
-        if characters[index] == '[' {
-            let mut cursor = index + 1;
-            while cursor < characters.len() && characters[cursor].is_ascii_digit() {
-                cursor += 1;
+pub(crate) fn clean_markers(answer: &str, valid: &HashSet<u32>) -> String {
+    // `[0-9]` rather than `\d`: ASCII digits only, matching how the Agent
+    // declares reference ids (regex's `\d` is Unicode by default).
+    static MARKER: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"\[([0-9]+)\]").unwrap());
+    MARKER
+        .replace_all(answer, |captures: &regex::Captures<'_>| {
+            let id = captures[1].parse::<u32>().unwrap_or(0);
+            if valid.contains(&id) {
+                captures[0].to_string()
+            } else {
+                String::new()
             }
-            if cursor > index + 1 && cursor < characters.len() && characters[cursor] == ']' {
-                let id: u32 = characters[index + 1..cursor]
-                    .iter()
-                    .collect::<String>()
-                    .parse()
-                    .unwrap_or(0);
-                if !valid.contains(&id) {
-                    index = cursor + 1;
-                    continue;
-                }
-            }
-        }
-        output.push(characters[index]);
-        index += 1;
-    }
-    output
+        })
+        .into_owned()
 }
 
 #[cfg(test)]
@@ -442,12 +437,20 @@ mod tests {
 
     #[test]
     fn clean_markers_strips_unverified_ids_and_preserves_gaps() {
-        let valid: std::collections::HashSet<u32> = [2].into_iter().collect();
+        let valid: HashSet<u32> = [2].into_iter().collect();
         assert_eq!(
             clean_markers("甲[1]。乙[2]。丙[3]。", &valid),
             "甲。乙[2]。丙。"
         );
         assert_eq!(clean_markers("无标记的答案。", &valid), "无标记的答案。");
+        // An overflowing id degrades to 0 and is dropped like any
+        // unverified id; adjacent markers are handled independently.
+        assert_eq!(
+            clean_markers("溢[99999999999999]。丁[1][2]。", &valid),
+            "溢。丁[2]。"
+        );
+        // Non-ASCII digits are not citation markers and pass through.
+        assert_eq!(clean_markers("数[١]。", &valid), "数[١]。");
     }
 
     #[test]

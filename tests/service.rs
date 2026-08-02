@@ -1,6 +1,5 @@
 use std::{
     fs,
-    net::SocketAddr,
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -14,13 +13,15 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use noema::{
-    AppError, AppService, Config, http as http_api,
+    AppError, AppService, http as http_api,
     models::{CreateLibraryRequest, DocumentInput, JobState},
     runtime::{AgentRunRequest, AgentRunResult, OpenCodeRuntime},
 };
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tower::ServiceExt;
+
+mod common;
 
 #[derive(Default)]
 struct FakeRuntime {
@@ -84,24 +85,14 @@ impl OpenCodeRuntime for FakeRuntime {
     }
 }
 
-fn config(data_dir: PathBuf) -> Config {
-    Config {
-        data_dir,
-        bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        opencode_url: "http://127.0.0.1:4096".into(),
-        opencode_model: "opencode/deepseek-v4-flash-free".into(),
-        opencode_timeout_secs: 5,
-        transcript: false,
-        max_sessions: 4,
-        auth_token: None,
-    }
-}
-
 async fn service_fixture() -> (TempDir, AppService<FakeRuntime>, Arc<FakeRuntime>) {
     let tempdir = tempfile::tempdir().unwrap();
     let runtime = Arc::new(FakeRuntime::default());
-    let service =
-        AppService::with_runtime(config(tempdir.path().join("data")), runtime.clone()).unwrap();
+    let service = AppService::with_runtime(
+        common::config(tempdir.path().join("data"), None),
+        runtime.clone(),
+    )
+    .unwrap();
     (tempdir, service, runtime)
 }
 

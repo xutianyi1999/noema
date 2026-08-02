@@ -149,13 +149,8 @@ impl<R: OpenCodeRuntime> AppService<R> {
         let library = self.storage.create_library(&request)?;
         if let Err(error) = self.bootstrap_library(&library).await {
             tracing::error!(library_id = %library.id, error = %error, "library bootstrap failed");
-            if let Err(cleanup_error) = self.storage.discard_library(&library.id) {
-                tracing::error!(
-                    library_id = %library.id,
-                    error = %cleanup_error,
-                    "failed to roll back library bootstrap"
-                );
-            }
+            self.storage
+                .discard_on_failure(&library.id, "library bootstrap");
             return Err(error);
         }
         Ok(library)
@@ -249,15 +244,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
 
         let result = match self.runtime.run_new_session(request).await {
             Ok(result) => result,
-            Err(error) => {
-                self.storage.update_query(
-                    &query_id,
-                    JobState::Failed,
-                    None,
-                    Some(&error.to_string()),
-                )?;
-                return Err(AppError::QueryFailed(error.to_string()));
-            }
+            Err(error) => return Err(self.record_query_failure(&query_id, error)),
         };
         self.storage.update_query(
             &query_id,
@@ -299,6 +286,42 @@ impl<R: OpenCodeRuntime> AppService<R> {
         contained.then_some(canonical).ok_or_else(not_found)
     }
 
+    /// Record a job failure and return the original error for propagation.
+    /// A failure to record is logged rather than propagated: a broken
+    /// database must never mask the actual cause from the caller.
+    fn record_job_failure(
+        &self,
+        library_id: &str,
+        job_id: &str,
+        session_id: Option<&str>,
+        original: AppError,
+    ) -> AppError {
+        if let Err(error) = self.storage.update_job(
+            library_id,
+            job_id,
+            JobState::Failed,
+            session_id,
+            Some(&original.to_string()),
+        ) {
+            tracing::warn!(library_id = %library_id, job_id = %job_id, %error, "failed to record job failure");
+        }
+        original
+    }
+
+    /// Same as [`record_job_failure`] for query runs, wrapping the original
+    /// error so the HTTP layer reports it as a query failure.
+    fn record_query_failure(&self, query_id: &str, original: AppError) -> AppError {
+        if let Err(error) = self.storage.update_query(
+            query_id,
+            JobState::Failed,
+            None,
+            Some(&original.to_string()),
+        ) {
+            tracing::warn!(query_id = %query_id, %error, "failed to record query failure");
+        }
+        AppError::QueryFailed(original.to_string())
+    }
+
     async fn process_ingest(
         &self,
         library_id: &str,
@@ -326,16 +349,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .update_job(library_id, job_id, JobState::Running, None, None)?;
         let staging = match self.storage.prepare_staging(library_id, job_id) {
             Ok(path) => path,
-            Err(error) => {
-                self.storage.update_job(
-                    library_id,
-                    job_id,
-                    JobState::Failed,
-                    None,
-                    Some(&error.to_string()),
-                )?;
-                return Err(error);
-            }
+            Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
         };
         let incremental = staging.join("graphify-out/graph.json").is_file();
         let request = AgentRunRequest {
@@ -346,16 +360,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
         };
         let result = match self.runtime.run_new_session(request).await {
             Ok(result) => result,
-            Err(error) => {
-                self.storage.update_job(
-                    library_id,
-                    job_id,
-                    JobState::Failed,
-                    None,
-                    Some(&error.to_string()),
-                )?;
-                return Err(error);
-            }
+            Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
         };
         if let Err(error) = self
             .storage
@@ -363,14 +368,12 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .and_then(|_| self.storage.promote_staging(library_id, job_id))
             .and_then(|_| self.storage.rebuild_index(library_id))
         {
-            self.storage.update_job(
+            return Err(self.record_job_failure(
                 library_id,
                 job_id,
-                JobState::Failed,
                 Some(&result.session_id),
-                Some(&error.to_string()),
-            )?;
-            return Err(error);
+                error,
+            ));
         }
         self.storage.cleanup_staging(library_id, job_id)?;
         self.storage.update_job(

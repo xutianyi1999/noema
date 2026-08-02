@@ -13,9 +13,9 @@
 
 use std::{io::Write as _, path::PathBuf, process::ExitCode};
 
-use anstyle::{AnsiColor, Style};
 use clap::{Parser, Subcommand};
 use comfy_table::{Attribute, Cell, Color, Table, presets::UTF8_FULL};
+use noema::style::{BOLD, DIM, GREEN, RED, YELLOW, paint, stderr, stdout};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde_json::{Value, json};
 use tokio::io::AsyncWriteExt;
@@ -461,25 +461,4 @@ fn optional(text: Option<&str>) -> Cell {
 
 fn colored(color: Color, text: String) -> Cell {
     Cell::new(text).fg(color)
-}
-
-const DIM: Style = Style::new().dimmed();
-const BOLD: Style = Style::new().bold();
-const RED: Style = AnsiColor::Red.on_default();
-const GREEN: Style = AnsiColor::Green.on_default();
-const YELLOW: Style = AnsiColor::Yellow.on_default();
-
-/// Embed one style's escape codes around `text`. The anstream writers strip
-/// the codes when the stream is not a terminal (NO_COLOR / FORCE_COLOR /
-/// CLICOLOR honoured).
-fn paint(style: Style, text: &str) -> String {
-    format!("{style}{text}{style:#}")
-}
-
-fn stdout() -> anstream::AutoStream<std::io::Stdout> {
-    anstream::AutoStream::auto(std::io::stdout())
-}
-
-fn stderr() -> anstream::AutoStream<std::io::Stderr> {
-    anstream::AutoStream::auto(std::io::stderr())
 }

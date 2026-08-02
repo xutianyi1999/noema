@@ -17,6 +17,7 @@ use axum::{
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::{
@@ -92,16 +93,7 @@ async fn require_auth(
 /// Constant-time string equality, so response timing never reveals how many
 /// leading bytes of a guessed token were correct.
 fn tokens_match(candidate: &str, expected: &str) -> bool {
-    let candidate = candidate.as_bytes();
-    let expected = expected.as_bytes();
-    if candidate.len() != expected.len() {
-        return false;
-    }
-    candidate
-        .iter()
-        .zip(expected)
-        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
-        == 0
+    candidate.as_bytes().ct_eq(expected.as_bytes()).into()
 }
 
 #[cfg(test)]
@@ -158,15 +150,14 @@ async fn export_library<R: OpenCodeRuntime>(
         // sent (or the connection drops); its Drop impl deletes the file.
         _temp: temp_path,
     };
-    Response::builder()
+    Ok(Response::builder()
         .header(header::CONTENT_TYPE, "application/gzip")
         .header(header::CONTENT_LENGTH, length)
         .header(
             header::CONTENT_DISPOSITION,
             format!("attachment; filename=\"{}.tar.gz\"", library.id),
         )
-        .body(Body::from_stream(body))
-        .map_err(|error| AppError::Storage(error.to_string()))
+        .body(Body::from_stream(body))?)
 }
 
 /// Optional import query parameters: the archive itself is the request body;
@@ -252,18 +243,15 @@ async fn knowledge_file<R: OpenCodeRuntime>(
         _ => "text/plain; charset=utf-8",
     };
     let file = tokio::fs::File::open(&resolved).await?;
-    Response::builder()
+    Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, metadata.len())
-        .header(header::LAST_MODIFIED, http_date(metadata.modified()?))
-        .body(Body::from_stream(ReaderStream::new(file)))
-        .map_err(|error| AppError::Storage(error.to_string()))
-}
-
-/// RFC 1123 date for `Last-Modified`.
-fn http_date(time: std::time::SystemTime) -> String {
-    let datetime: chrono::DateTime<chrono::Utc> = time.into();
-    datetime.format("%a, %d %b %Y %H:%M:%S GMT").to_string()
+        // RFC 7231 IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`.
+        .header(
+            header::LAST_MODIFIED,
+            httpdate::fmt_http_date(metadata.modified()?),
+        )
+        .body(Body::from_stream(ReaderStream::new(file)))?)
 }
 
 /// Streams the temporary export archive to the client; dropping the body

@@ -2,7 +2,7 @@
 //! every route but `/v1/health` requires the right `Authorization` header;
 //! without one, the API stays fully open (the loopback default).
 
-use std::{net::SocketAddr, path::PathBuf, sync::Arc};
+use std::sync::Arc;
 
 use axum::{
     Router,
@@ -10,11 +10,13 @@ use axum::{
     http::{Request, StatusCode, header},
 };
 use noema::{
-    AppError, AppService, Config, http as http_api,
+    AppError, AppService, http as http_api,
     runtime::{AgentRunRequest, AgentRunResult, OpenCodeRuntime},
 };
 use tempfile::TempDir;
 use tower::ServiceExt;
+
+mod common;
 
 /// Runtime that is never exercised: auth is rejected before any handler.
 struct IdleRuntime;
@@ -25,24 +27,11 @@ impl OpenCodeRuntime for IdleRuntime {
     }
 }
 
-fn config(data_dir: PathBuf, auth_token: Option<&str>) -> Config {
-    Config {
-        data_dir,
-        bind: "127.0.0.1:0".parse::<SocketAddr>().unwrap(),
-        opencode_url: "http://127.0.0.1:4096".into(),
-        opencode_model: "opencode/deepseek-v4-flash-free".into(),
-        opencode_timeout_secs: 5,
-        transcript: false,
-        max_sessions: 4,
-        auth_token: auth_token.map(str::to_string),
-    }
-}
-
 /// Router plus the TempDir backing its storage — keep both alive together.
 fn fixture(auth_token: Option<&str>) -> (Router, TempDir) {
     let tempdir = tempfile::tempdir().unwrap();
     let service = AppService::with_runtime(
-        config(tempdir.path().join("data"), auth_token),
+        common::config(tempdir.path().join("data"), auth_token),
         Arc::new(IdleRuntime),
     )
     .unwrap();

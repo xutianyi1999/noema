@@ -22,7 +22,6 @@ use chrono::Utc;
 use flate2::{Compression, read::GzDecoder, write::GzEncoder};
 use serde::{Deserialize, Serialize};
 use tar::{Archive, Builder, EntryType};
-use uuid::Uuid;
 use walkdir::WalkDir;
 
 use crate::{
@@ -88,13 +87,11 @@ pub fn import_library(
     data_dir: &Path,
 ) -> Result<Library, AppError> {
     let storage = Storage::open(data_dir)?;
-    let scratch = data_dir
-        .join("jobs")
-        .join(format!("import-{}", Uuid::new_v4()));
-    fs::create_dir_all(&scratch)?;
-    let result = import_inner(&storage, archive_path, name, description, &scratch);
-    let _ = fs::remove_dir_all(&scratch);
-    result
+    // The scratch tree is removed by TempDir's Drop on every exit path.
+    let scratch = tempfile::Builder::new()
+        .prefix("import-")
+        .tempdir_in(data_dir.join("jobs"))?;
+    import_inner(&storage, archive_path, name, description, scratch.path())
 }
 
 fn import_inner(
@@ -124,13 +121,7 @@ fn import_inner(
     let library = storage.create_library(&CreateLibraryRequest { name, description })?;
     let root = PathBuf::from(&library.root);
     if let Err(error) = overlay_and_repair(storage, &library, &root, scratch, had_opencode) {
-        if let Err(cleanup_error) = storage.discard_library(&library.id) {
-            tracing::error!(
-                library_id = %library.id,
-                error = %cleanup_error,
-                "failed to roll back rejected snapshot import"
-            );
-        }
+        storage.discard_on_failure(&library.id, "rejected snapshot import");
         return Err(error);
     }
     Ok(library)

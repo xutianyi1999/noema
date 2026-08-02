@@ -8,7 +8,8 @@
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use clap::Parser;
-use noema::{AppService, Config, http};
+use noema::{AppError, AppService, Config, http};
+use opencode_rs::server::{ManagedServer, ServerOptions};
 
 /// OpenCode 驱动的文本知识库服务：HTTP JSON API + Streamable HTTP MCP。
 ///
@@ -87,7 +88,7 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "binding a non-loopback address without --auth-token; the HTTP API is unauthenticated"
         );
     }
-    let managed = noema::supervisor::spawn().await?;
+    let managed = spawn_opencode_server().await?;
     let config = Config {
         data_dir: cli.data_dir,
         bind,
@@ -121,4 +122,21 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         tracing::warn!(%error, "failed to stop OpenCode Server");
     }
     result
+}
+
+/// How long the spawned OpenCode Server may take to start accepting
+/// connections.
+const STARTUP_TIMEOUT_MS: u64 = 60_000;
+
+/// Spawn `opencode serve` on a free local port and wait until it is ready.
+///
+/// The child is fully owned by the returned [`ManagedServer`]: dropping it
+/// terminates the process group, and [`ManagedServer::stop`] shuts it down
+/// gracefully.
+async fn spawn_opencode_server() -> Result<ManagedServer, AppError> {
+    let options = ServerOptions::new().startup_timeout_ms(STARTUP_TIMEOUT_MS);
+    tracing::info!("spawning OpenCode Server");
+    let managed = ManagedServer::start(options).await?;
+    tracing::info!(url = %managed.url(), "OpenCode Server is ready");
+    Ok(managed)
 }

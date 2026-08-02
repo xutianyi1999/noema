@@ -105,6 +105,15 @@ impl Storage {
             .lock()
             .map_err(|_| AppError::Storage("control database lock poisoned".into()))
     }
+
+    /// Roll back a library whose bootstrap or snapshot import failed:
+    /// attempt to discard the row and directory tree, logging any cleanup
+    /// failure without masking the caller's original error.
+    pub(crate) fn discard_on_failure(&self, library_id: &str, context: &str) {
+        if let Err(error) = self.discard_library(library_id) {
+            tracing::error!(library_id = %library_id, %error, "failed to roll back {context}");
+        }
+    }
 }
 
 /// Parses an RFC-3339 timestamp read from the database. Corrupt values

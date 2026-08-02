@@ -16,9 +16,11 @@ comfy-table = "7"
 flate2 = "1.1.9"
 futures-util = "0.3"
 hex = "0.4"
+httpdate = "1"
 jsonschema = "0.49.3"
 opencode_rs = { git = "https://github.com/allisoneer/agentic_auxilary.git", features = ["http", "sse", "server"] }
 percent-encoding = "2"
+regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "query", "rustls"] }
 rmcp = { version = "3.1.0", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }
 rusqlite = { version = "0.40", features = ["bundled"] }
@@ -26,6 +28,7 @@ schemars = "1.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+subtle = "2"
 tar = "0.4.46"
 tempfile = "3"
 termimad = "0.35.1"

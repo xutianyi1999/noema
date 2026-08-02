@@ -21,7 +21,6 @@ use std::{
     },
 };
 
-use anstyle::{AnsiColor, Style};
 use opencode_rs::types::{
     event::{Event, MessagePartEventProps},
     message::{Part, ToolState},
@@ -30,14 +29,7 @@ use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
 use crate::runtime::{DeltaKind, delta_kind};
-
-const DIM: Style = Style::new().dimmed();
-const BOLD: Style = Style::new().bold();
-const RED: Style = AnsiColor::Red.on_default();
-const GREEN: Style = AnsiColor::Green.on_default();
-const YELLOW: Style = AnsiColor::Yellow.on_default();
-const CYAN: Style = AnsiColor::Cyan.on_default();
-const MAGENTA: Style = AnsiColor::Magenta.on_default();
+use crate::style::{BOLD, CYAN, DIM, GREEN, MAGENTA, RED, YELLOW, paint, stderr};
 
 /// Visible assistant text is previewed up to this many characters per part.
 const TEXT_PREVIEW_CHARS: usize = 240;
@@ -428,6 +420,9 @@ fn tool_output_summary(output: &str) -> String {
     summarize(output, 120)
 }
 
+/// Extract the text between a pair of XML-ish tags in OpenCode's tool
+/// result formatting. Log-only: if OpenCode's output format changes, this
+/// returns None and the caller falls back to a plain summary.
 fn tag_value<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
     let start = text.find(open)? + open.len();
     let end = start + text[start..].find(close)?;
@@ -444,18 +439,6 @@ fn preview_chars(kind: DeltaKind) -> usize {
         DeltaKind::Text => TEXT_PREVIEW_CHARS,
         DeltaKind::Thinking => THINKING_PREVIEW_CHARS,
     }
-}
-
-/// Embed one style's escape codes around `text`. The stderr writer strips
-/// the codes when colors are not appropriate (see [`stderr`]).
-fn paint(style: Style, text: &str) -> String {
-    format!("{style}{text}{style:#}")
-}
-
-/// The transcript writer: anstream honours NO_COLOR / FORCE_COLOR /
-/// CLICOLOR and strips embedded styles when stderr is not a terminal.
-fn stderr() -> anstream::AutoStream<std::io::Stderr> {
-    anstream::AutoStream::auto(std::io::stderr())
 }
 
 /// Collapse whitespace and truncate to a display-width budget (terminal

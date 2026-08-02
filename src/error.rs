@@ -85,3 +85,9 @@ impl From<std::path::StripPrefixError> for AppError {
         Self::Storage(error.to_string())
     }
 }
+
+impl From<axum::http::Error> for AppError {
+    fn from(error: axum::http::Error) -> Self {
+        Self::Storage(error.to_string())
+    }
+}

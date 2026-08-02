@@ -61,8 +61,7 @@ impl OpenCodeRuntime for OpenCodeAgent {
             .base_url(&self.config.opencode_url)
             .directory(request.workdir.to_string_lossy())
             .timeout_secs(self.config.opencode_timeout_secs)
-            .build()
-            .map_err(|error| AppError::Runtime(error.to_string()))?;
+            .build()?;
 
         let session = client
             .sessions()
@@ -71,8 +70,7 @@ impl OpenCodeRuntime for OpenCodeAgent {
                 permission: Some(all_permissions()),
                 ..Default::default()
             })
-            .await
-            .map_err(|error| AppError::Runtime(error.to_string()))?;
+            .await?;
 
         let result = self.drive_session(&client, &session.id, request).await;
 
@@ -92,9 +90,7 @@ impl OpenCodeAgent {
         session_id: &str,
         request: AgentRunRequest,
     ) -> Result<AgentRunResult, AppError> {
-        let mut subscription = client
-            .subscribe_session(session_id)
-            .map_err(|error| AppError::Runtime(error.to_string()))?;
+        let mut subscription = client.subscribe_session(session_id)?;
 
         // Server-side live transcript (opt-in via the --transcript flag);
         // never affects the result returned to callers.
@@ -120,11 +116,7 @@ impl OpenCodeAgent {
         // very end. `prompt_async` returns immediately and the turn streams
         // over the session subscription, which is also what lets the timeout
         // below cover the actual agent work.
-        client
-            .messages()
-            .prompt_async(session_id, &prompt)
-            .await
-            .map_err(|error| AppError::Runtime(error.to_string()))?;
+        client.messages().prompt_async(session_id, &prompt).await?;
 
         let collected = match timeout(
             Duration::from_secs(self.config.opencode_timeout_secs),
