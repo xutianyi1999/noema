@@ -114,9 +114,15 @@ impl OpenCodeAgent {
             system: None,
             variant: None,
         };
+        // Fire-and-forget: the synchronous `prompt` endpoint blocks until the
+        // whole turn completes, so nothing on the already-open subscription
+        // would be consumed (or rendered by the live transcript) until the
+        // very end. `prompt_async` returns immediately and the turn streams
+        // over the session subscription, which is also what lets the timeout
+        // below cover the actual agent work.
         client
             .messages()
-            .prompt(session_id, &prompt)
+            .prompt_async(session_id, &prompt)
             .await
             .map_err(|error| AppError::Runtime(error.to_string()))?;
 
