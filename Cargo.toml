@@ -16,7 +16,7 @@ comfy-table = "7"
 flate2 = "1.1.9"
 futures-util = "0.3"
 hex = "0.4"
-opencode_rs = { path = "/mnt/data/code/agentic_auxilary/crates/services/opencode-rs", features = ["http", "sse", "server"] }
+opencode_rs = { git = "https://github.com/allisoneer/agentic_auxilary.git", features = ["http", "sse", "server"] }
 percent-encoding = "2"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 rmcp = { version = "3.1.0", default-features = false, features = ["server", "macros", "transport-streamable-http-server"] }

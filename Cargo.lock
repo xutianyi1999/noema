@@ -1360,7 +1360,8 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "opencode_rs"
-version = "0.10.0"
+version = "0.13.3"
+source = "git+https://github.com/allisoneer/agentic_auxilary.git#c83c1431dbca7b95fd940eef8659dc3a83479d0d"
 dependencies = [
  "backon",
  "chrono",
