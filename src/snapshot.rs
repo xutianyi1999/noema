@@ -1,4 +1,5 @@
-//! Offline library snapshot import/export behind the `noemactl` CLI.
+//! Library snapshot import/export behind the HTTP API and the `noema-cli`
+//! command-line client.
 //!
 //! A snapshot is a gzip-compressed tar archive of exactly one content
 //! library: the raw sources, compiled wiki nodes (LLM-WIKI contract),
@@ -47,13 +48,6 @@ pub struct SnapshotManifest {
     pub exported_at: String,
 }
 
-#[derive(Debug, Clone)]
-pub struct ImportOptions {
-    pub data_dir: PathBuf,
-    pub install_graphify: bool,
-    pub graphify_bin: String,
-}
-
 /// Export one content library (selected by id or, if unique, by name) as a
 /// snapshot archive. Only the library's own root directory is walked; the
 /// staging workspace, SQLite sidecar files, `.opencode/node_modules` and all
@@ -92,15 +86,14 @@ pub fn import_library(
     archive_path: &Path,
     name: Option<&str>,
     description: Option<&str>,
-    options: &ImportOptions,
+    data_dir: &Path,
 ) -> Result<Library, AppError> {
-    let storage = Storage::open(&options.data_dir)?;
-    let scratch = options
-        .data_dir
+    let storage = Storage::open(data_dir)?;
+    let scratch = data_dir
         .join("jobs")
         .join(format!("import-{}", Uuid::new_v4()));
     fs::create_dir_all(&scratch)?;
-    let result = import_inner(&storage, archive_path, name, description, options, &scratch);
+    let result = import_inner(&storage, archive_path, name, description, &scratch);
     let _ = fs::remove_dir_all(&scratch);
     result
 }
@@ -110,7 +103,6 @@ fn import_inner(
     archive_path: &Path,
     name: Option<&str>,
     description: Option<&str>,
-    options: &ImportOptions,
     scratch: &Path,
 ) -> Result<Library, AppError> {
     let file = fs::File::open(archive_path)?;
@@ -131,8 +123,7 @@ fn import_inner(
 
     let library = storage.create_library(&CreateLibraryRequest { name, description })?;
     let root = PathBuf::from(&library.root);
-    if let Err(error) = overlay_and_repair(storage, &library, &root, scratch, had_opencode, options)
-    {
+    if let Err(error) = overlay_and_repair(storage, &library, &root, scratch, had_opencode) {
         if let Err(cleanup_error) = storage.discard_library(&library.id) {
             tracing::error!(
                 library_id = %library.id,
@@ -151,16 +142,15 @@ fn overlay_and_repair(
     root: &Path,
     scratch: &Path,
     had_opencode: bool,
-    options: &ImportOptions,
 ) -> Result<(), AppError> {
     copy_path(scratch, root)?;
     // Regenerate index.md, the content FTS and manifest.json from the copied
     // tree and database so every derived artifact matches the snapshot.
     storage.rebuild_index(&library.id)?;
     // Snapshots ship their own .opencode project; only archives without one
-    // need the upstream installer to become queryable.
-    if !had_opencode && options.install_graphify {
-        run_graphify_install(&options.graphify_bin, root)?;
+    // need the installer to become queryable.
+    if !had_opencode {
+        run_graphify_install(root)?;
     }
     // Always refresh the four Noema skills to this binary's versions so an
     // imported library follows the current node contract.
@@ -201,8 +191,8 @@ fn ensure_skills(root: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
-fn run_graphify_install(graphify_bin: &str, root: &Path) -> Result<(), AppError> {
-    let output = Command::new(graphify_bin)
+fn run_graphify_install(root: &Path) -> Result<(), AppError> {
+    let output = Command::new("graphify")
         .args(["install", "--platform", "opencode", "--project"])
         .current_dir(root)
         .stdin(Stdio::null())
@@ -316,7 +306,7 @@ fn unpack_validated<R: Read>(archive: &mut Archive<R>, destination: &Path) -> Re
         let target = destination.join(&relative);
         // Defence in depth: the joined path must stay inside the destination.
         if !target.starts_with(destination) {
-            return Err(AppError::Storage(format!(
+            return Err(AppError::BadRequest(format!(
                 "snapshot entry escapes the library root: {}",
                 relative.display()
             )));
@@ -333,7 +323,7 @@ fn unpack_validated<R: Read>(archive: &mut Archive<R>, destination: &Path) -> Re
                 io::copy(&mut entry, &mut file)?;
             }
             other => {
-                return Err(AppError::Storage(format!(
+                return Err(AppError::BadRequest(format!(
                     "snapshot entry type not allowed (byte {:?}): {}",
                     char::from(other.as_byte()),
                     relative.display()
@@ -350,7 +340,7 @@ fn validate_relative_path(path: &Path) -> Result<(), AppError> {
             .components()
             .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir));
     if escaped {
-        return Err(AppError::Storage(format!(
+        return Err(AppError::BadRequest(format!(
             "snapshot entry escapes the library root: {}",
             path.display()
         )));
@@ -364,15 +354,15 @@ fn read_snapshot_manifest(scratch: &Path) -> Result<Option<SnapshotManifest>, Ap
         return Ok(None);
     }
     let manifest: SnapshotManifest = serde_json::from_slice(&fs::read(&path)?)
-        .map_err(|error| AppError::Storage(format!("invalid snapshot manifest: {error}")))?;
+        .map_err(|error| AppError::BadRequest(format!("invalid snapshot manifest: {error}")))?;
     if manifest.format != SNAPSHOT_FORMAT {
-        return Err(AppError::Storage(format!(
+        return Err(AppError::BadRequest(format!(
             "unsupported snapshot format: {}",
             manifest.format
         )));
     }
     if manifest.version != SNAPSHOT_VERSION {
-        return Err(AppError::Storage(format!(
+        return Err(AppError::BadRequest(format!(
             "unsupported snapshot version: {}",
             manifest.version
         )));
@@ -471,12 +461,7 @@ mod tests {
         let archive = source_dir.path().join("snap.tar.gz");
         export_library(source_dir.path(), &library.id, &archive).unwrap();
 
-        let options = ImportOptions {
-            data_dir: target_dir.path().to_path_buf(),
-            install_graphify: false,
-            graphify_bin: "graphify".into(),
-        };
-        let imported = import_library(&archive, Some("副本"), None, &options).unwrap();
+        let imported = import_library(&archive, Some("副本"), None, target_dir.path()).unwrap();
         assert_ne!(imported.id, library.id);
         assert!(
             imported
@@ -558,15 +543,11 @@ mod tests {
                 .unwrap();
             archive.into_inner().unwrap().finish().unwrap();
         }
-        let options = ImportOptions {
-            data_dir: workspace.path().join("data"),
-            install_graphify: false,
-            graphify_bin: "graphify".into(),
-        };
-        let error = import_library(&archive_path, None, None, &options).unwrap_err();
+        let data_dir = workspace.path().join("data");
+        let error = import_library(&archive_path, None, None, &data_dir).unwrap_err();
         assert!(error.to_string().contains("not allowed"), "{error}");
         // A rejected import leaves no library row behind.
-        let storage = Storage::open(&options.data_dir).unwrap();
+        let storage = Storage::open(&data_dir).unwrap();
         assert!(storage.list_libraries().unwrap().is_empty());
     }
 }

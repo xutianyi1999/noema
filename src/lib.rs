@@ -9,6 +9,7 @@ pub mod runtime;
 pub mod service;
 pub mod snapshot;
 pub mod storage;
+pub mod supervisor;
 pub(crate) mod transcript;
 
 pub use config::Config;

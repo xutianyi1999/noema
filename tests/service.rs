@@ -84,8 +84,6 @@ fn config(data_dir: PathBuf) -> Config {
         opencode_url: "http://127.0.0.1:4096".into(),
         opencode_model: "opencode/deepseek-v4-flash-free".into(),
         opencode_timeout_secs: 5,
-        graphify_bin: "graphify".into(),
-        install_graphify: false,
     }
 }
 

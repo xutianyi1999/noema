@@ -1,8 +1,21 @@
+use std::{
+    io,
+    pin::Pin,
+    task::{Context, Poll},
+};
+
 use axum::{
     Json, Router,
-    extract::{Path, State},
+    body::Body,
+    extract::{Path, Query, Request, State},
+    http::{StatusCode, header},
+    response::Response,
     routing::{get, post},
 };
+use bytes::Bytes;
+use futures_util::{Stream, TryStreamExt};
+use serde::Deserialize;
+use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::{
     error::AppError,
@@ -12,12 +25,21 @@ use crate::{
     },
     runtime::OpenCodeRuntime,
     service::AppService,
+    snapshot,
 };
 
 pub fn router<R: OpenCodeRuntime>(service: AppService<R>) -> Router {
     Router::new()
         .route("/v1/health", get(health::<R>))
-        .route("/v1/libraries", post(create_library::<R>))
+        .route(
+            "/v1/libraries",
+            get(list_libraries::<R>).post(create_library::<R>),
+        )
+        .route("/v1/libraries/import", post(import_library::<R>))
+        .route(
+            "/v1/libraries/{library_id}/export",
+            get(export_library::<R>),
+        )
         .route(
             "/v1/libraries/{library_id}/documents",
             post(submit_document::<R>),
@@ -42,6 +64,91 @@ async fn create_library<R: OpenCodeRuntime>(
     Ok(Json(service.create_library(request).await?))
 }
 
+async fn list_libraries<R: OpenCodeRuntime>(
+    State(service): State<AppService<R>>,
+) -> Result<Json<Vec<Library>>, AppError> {
+    Ok(Json(service.list_libraries()?))
+}
+
+/// Stream one content library out as a snapshot archive (gzip tar). The
+/// selector may be a library id or, if unique, a name — exactly like
+/// `noema-cli export`.
+async fn export_library<R: OpenCodeRuntime>(
+    State(service): State<AppService<R>>,
+    Path(library_id): Path<String>,
+) -> Result<Response, AppError> {
+    let data_dir = service.data_dir().to_path_buf();
+    let (library, temp) = tokio::task::spawn_blocking(move || {
+        let temp = tempfile::NamedTempFile::new()?;
+        let library = snapshot::export_library(&data_dir, &library_id, temp.path())?;
+        Ok::<_, AppError>((library, temp))
+    })
+    .await
+    .map_err(|error| AppError::Storage(format!("export task aborted: {error}")))??;
+    let (archive, temp_path) = temp.into_parts();
+    let length = archive.metadata()?.len();
+    let body = SnapshotBody {
+        chunks: ReaderStream::new(tokio::fs::File::from_std(archive)),
+        // Keeps the temporary archive alive until the response body is fully
+        // sent (or the connection drops); its Drop impl deletes the file.
+        _temp: temp_path,
+    };
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/gzip")
+        .header(header::CONTENT_LENGTH, length)
+        .header(
+            header::CONTENT_DISPOSITION,
+            format!("attachment; filename=\"{}.tar.gz\"", library.id),
+        )
+        .body(Body::from_stream(body))
+        .map_err(|error| AppError::Storage(error.to_string()))
+}
+
+/// Optional import query parameters: the archive itself is the request body;
+/// the snapshot manifest supplies defaults for both when omitted.
+#[derive(Deserialize)]
+struct ImportQuery {
+    name: Option<String>,
+    description: Option<String>,
+}
+
+/// Import a snapshot archive (request body) as a brand-new, fully isolated
+/// library. Same semantics as `noema-cli import`: always a fresh library,
+/// full rollback on failure, hostile archives rejected.
+async fn import_library<R: OpenCodeRuntime>(
+    State(service): State<AppService<R>>,
+    Query(query): Query<ImportQuery>,
+    request: Request,
+) -> Result<(StatusCode, Json<Library>), AppError> {
+    // Stream the upload into a scratch archive on disk — no in-memory
+    // buffering; the NamedTempFile is deleted on drop.
+    let temp = tempfile::NamedTempFile::new()?;
+    let mut reader = StreamReader::new(
+        request
+            .into_body()
+            .into_data_stream()
+            .map_err(io::Error::other),
+    );
+    let mut file = tokio::fs::File::from_std(temp.as_file().try_clone()?);
+    tokio::io::copy(&mut reader, &mut file)
+        .await
+        .map_err(|error| AppError::BadRequest(format!("failed reading the upload: {error}")))?;
+    drop(file);
+
+    let data_dir = service.data_dir().to_path_buf();
+    let imported = tokio::task::spawn_blocking(move || {
+        snapshot::import_library(
+            temp.path(),
+            query.name.as_deref(),
+            query.description.as_deref(),
+            &data_dir,
+        )
+    })
+    .await
+    .map_err(|error| AppError::Storage(format!("import task aborted: {error}")))??;
+    Ok((StatusCode::CREATED, Json(imported)))
+}
+
 async fn submit_document<R: OpenCodeRuntime>(
     State(service): State<AppService<R>>,
     Path(library_id): Path<String>,
@@ -63,4 +170,19 @@ async fn query<R: OpenCodeRuntime>(
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, AppError> {
     Ok(Json(service.query(&library_id, &request.prompt).await?))
+}
+
+/// Streams the temporary export archive to the client; dropping the body
+/// (response complete or connection gone) deletes the file.
+struct SnapshotBody {
+    chunks: ReaderStream<tokio::fs::File>,
+    _temp: tempfile::TempPath,
+}
+
+impl Stream for SnapshotBody {
+    type Item = io::Result<Bytes>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        Pin::new(&mut self.get_mut().chunks).poll_next(cx)
+    }
 }

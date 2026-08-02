@@ -62,6 +62,16 @@ impl<R: OpenCodeRuntime> AppService<R> {
         }
     }
 
+    /// Data directory this service manages (control plane + library roots).
+    pub fn data_dir(&self) -> &Path {
+        &self.config.data_dir
+    }
+
+    /// All content libraries known to the control plane, oldest first.
+    pub fn list_libraries(&self) -> Result<Vec<Library>, AppError> {
+        self.storage.list_libraries()
+    }
+
     pub async fn create_library(&self, request: CreateLibraryRequest) -> Result<Library, AppError> {
         let library = self.storage.create_library(&request)?;
         if let Err(error) = self.bootstrap_library(&library).await {
@@ -238,22 +248,20 @@ impl<R: OpenCodeRuntime> AppService<R> {
 
     async fn bootstrap_library(&self, library: &Library) -> Result<(), AppError> {
         let root = Path::new(&library.root);
-        if self.config.install_graphify {
-            let output = Command::new(&self.config.graphify_bin)
-                .args(["install", "--platform", "opencode", "--project"])
-                .current_dir(root)
-                .stdin(Stdio::null())
-                .output()
-                .await
-                .map_err(|error| {
-                    AppError::Runtime(format!("unable to run graphify installer: {error}"))
-                })?;
-            if !output.status.success() {
-                return Err(AppError::Runtime(format!(
-                    "graphify installer failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                )));
-            }
+        let output = Command::new("graphify")
+            .args(["install", "--platform", "opencode", "--project"])
+            .current_dir(root)
+            .stdin(Stdio::null())
+            .output()
+            .await
+            .map_err(|error| {
+                AppError::Runtime(format!("unable to run graphify installer: {error}"))
+            })?;
+        if !output.status.success() {
+            return Err(AppError::Runtime(format!(
+                "graphify installer failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            )));
         }
         for (relative, contents) in crate::snapshot::skill_files() {
             let path = root.join(".opencode").join("skills").join(relative);
