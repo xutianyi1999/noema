@@ -54,7 +54,7 @@ noema-cli query 产品知识库 "Session Context 是怎么设计的？"
 
 ```bash
 noema [--bind 127.0.0.1:8787] [--data-dir data] [--model <MODEL>] \
-      [--opencode-timeout-secs 1800] [--max-sessions 4] [--transcript]
+      [--opencode-timeout-secs 1800] [--max-sessions 4] [--auth-token <TOKEN>] [--transcript]
 ```
 
 所有参数都是"命令行标志 → 环境变量 → 内置默认"三级回退：
@@ -66,9 +66,23 @@ noema [--bind 127.0.0.1:8787] [--data-dir data] [--model <MODEL>] \
 | `--model` | `OPENCODE_MODEL` | `opencode/deepseek-v4-flash-free` | Agent 使用的模型标识 |
 | `--opencode-timeout-secs` | `OPENCODE_TIMEOUT_SECS` | `1800` | 单个 Agent session 超时（秒） |
 | `--max-sessions` | `NOEMA_MAX_SESSIONS` | `4` | 全局并发 Agent session 上限（摄入 + 查询），超出的排队等待 |
+| `--auth-token` | `NOEMA_AUTH_TOKEN` | 无（API 开放） | HTTP API 的 Bearer 令牌（见下） |
 | `--transcript` | `NOEMA_TRANSCRIPT` | `false` | 实时打印会话中间过程（见下） |
 
 日志走 `RUST_LOG`（缺省 `noema=info,tower_http=info`）。
+
+### `--auth-token`：API 鉴权
+
+HTTP API 默认无鉴权，前提是只绑定 loopback。需要跨机器或经容器网络访问时，用
+`--auth-token`（或 `NOEMA_AUTH_TOKEN`）启用 Bearer 鉴权：设置后除 `/v1/health`
+（供容器探针免凭据探活）外，所有路由与 MCP 端点都必须携带
+`Authorization: Bearer <token>`，否则一律 `401`。绑定非 loopback 地址而未设置
+令牌时，启动会打印警告。`noema-cli` 用同名全局参数/环境变量携带令牌：
+
+```bash
+noema --bind 0.0.0.0:8787 --auth-token "$NOEMA_AUTH_TOKEN"
+noema-cli --server http://<host>:8787 --auth-token "$NOEMA_AUTH_TOKEN" status
+```
 
 ### `--transcript`：会话实录
 
@@ -85,7 +99,7 @@ noema --transcript=false        # 显式关闭（覆盖环境变量时）
 
 ## noema-cli 命令行客户端
 
-所有操作都经过运行中的 `noema` 服务，可以和服务不在同一台机器（`--server` 或 `$NOEMA_SERVER`，缺省 `http://127.0.0.1:8787`）。库选择器（下表的 `<lib>`）接受库名——新建库的库名即 id，二者等价。
+所有操作都经过运行中的 `noema` 服务，可以和服务不在同一台机器（`--server` 或 `$NOEMA_SERVER`，缺省 `http://127.0.0.1:8787`）。服务启用鉴权时，用全局参数 `--auth-token`（或 `$NOEMA_AUTH_TOKEN`）携带令牌。库选择器（下表的 `<lib>`）接受库名——新建库的库名即 id，二者等价。
 
 | 命令 | 作用 |
 | --- | --- |

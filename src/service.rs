@@ -99,6 +99,11 @@ impl<R: OpenCodeRuntime> AppService<R> {
         &self.config.data_dir
     }
 
+    /// The configured bearer token, when API authentication is enabled.
+    pub fn auth_token(&self) -> Option<&str> {
+        self.config.auth_token.as_deref()
+    }
+
     /// The serialization lock for one content library, created on first
     /// use and shared by every ingest task targeting that library.
     fn ingest_lock(&self, library_id: &str) -> Arc<tokio::sync::Mutex<()>> {

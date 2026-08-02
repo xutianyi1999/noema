@@ -32,6 +32,9 @@ struct Cli {
         default_value = "http://127.0.0.1:8787"
     )]
     server: String,
+    /// 服务鉴权令牌（服务以 --auth-token 启用鉴权时必须；每个请求携带 Authorization: Bearer <token>）
+    #[arg(long, global = true, env = "NOEMA_AUTH_TOKEN")]
+    auth_token: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -109,7 +112,17 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), BoxError> {
-    let client = reqwest::Client::new();
+    let client = match &cli.auth_token {
+        Some(token) => {
+            let mut headers = reqwest::header::HeaderMap::new();
+            headers.insert(
+                reqwest::header::AUTHORIZATION,
+                format!("Bearer {token}").parse()?,
+            );
+            reqwest::Client::builder().default_headers(headers).build()?
+        }
+        None => reqwest::Client::new(),
+    };
     let base = cli.server.trim_end_matches('/').to_string();
     match cli.command {
         Command::Status => cmd_status(&client, &base).await,

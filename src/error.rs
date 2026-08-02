@@ -10,6 +10,8 @@ use thiserror::Error;
 pub enum AppError {
     #[error("bad request: {0}")]
     BadRequest(String),
+    #[error("unauthorized: missing or invalid bearer token")]
+    Unauthorized,
     #[error("conflict: {0}")]
     Conflict(String),
     #[error("library not found: {0}")]
@@ -34,6 +36,7 @@ impl AppError {
     pub fn status_code(&self) -> StatusCode {
         match self {
             Self::BadRequest(_) => StatusCode::BAD_REQUEST,
+            Self::Unauthorized => StatusCode::UNAUTHORIZED,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::LibraryNotFound(_) | Self::JobNotFound(_) => StatusCode::NOT_FOUND,
             Self::QueryFailed(_) | Self::Runtime(_) => StatusCode::BAD_GATEWAY,

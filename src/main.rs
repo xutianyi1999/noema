@@ -36,6 +36,10 @@ struct Cli {
     /// 全局并发 Agent session 上限（摄入与查询之和），超出的请求排队等待
     #[arg(long, env = "NOEMA_MAX_SESSIONS", default_value_t = 4)]
     max_sessions: usize,
+    /// HTTP API 的 Bearer 令牌。设置后除 /v1/health 外所有路由（含 MCP 端点）
+    /// 强制校验 Authorization: Bearer <token>；缺省保持无鉴权，仅适合绑定 loopback
+    #[arg(long, env = "NOEMA_AUTH_TOKEN")]
+    auth_token: Option<String>,
     /// 流式打印 OpenCode 会话的中间过程（仅服务端日志；接口始终只返回最终答案）。
     /// 裸 `--transcript` 即开启，也可带值 `--transcript=false`。
     #[arg(
@@ -77,6 +81,12 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         return Err("--max-sessions must be at least 1".into());
     }
     let bind = cli.bind;
+    if !bind.ip().is_loopback() && cli.auth_token.is_none() {
+        tracing::warn!(
+            %bind,
+            "binding a non-loopback address without --auth-token; the HTTP API is unauthenticated"
+        );
+    }
     let managed = noema::supervisor::spawn().await?;
     let config = Config {
         data_dir: cli.data_dir,
@@ -87,6 +97,7 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         opencode_timeout_secs: cli.opencode_timeout_secs,
         transcript: cli.transcript,
         max_sessions: cli.max_sessions,
+        auth_token: cli.auth_token,
     };
     let service = AppService::new(config)?;
     let app = http::router(service);

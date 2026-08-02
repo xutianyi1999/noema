@@ -126,7 +126,10 @@ fn json_response<T: serde::Serialize>(value: &T) -> Result<String, rmcp::ErrorDa
 /// only genuine runtime/storage failures stay internal.
 fn to_mcp_error(error: &crate::AppError) -> rmcp::ErrorData {
     match error {
+        // Unauthorized is rejected at the HTTP layer before reaching the MCP
+        // tools, so this arm is only a completeness mapping.
         crate::AppError::BadRequest(_)
+        | crate::AppError::Unauthorized
         | crate::AppError::Conflict(_)
         | crate::AppError::LibraryNotFound(_)
         | crate::AppError::JobNotFound(_) => {

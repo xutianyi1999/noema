@@ -1,6 +1,7 @@
 use std::{
     io,
     pin::Pin,
+    sync::Arc,
     task::{Context, Poll},
 };
 
@@ -9,6 +10,7 @@ use axum::{
     body::Body,
     extract::{Path, Query, Request, State},
     http::{StatusCode, header},
+    middleware,
     response::Response,
     routing::{get, post},
 };
@@ -29,7 +31,8 @@ use crate::{
 };
 
 pub fn router<R: OpenCodeRuntime>(service: AppService<R>) -> Router {
-    Router::new()
+    let auth_token = service.auth_token().map(Arc::from);
+    let router = Router::new()
         .route("/v1/health", get(health::<R>))
         .route(
             "/v1/libraries",
@@ -50,7 +53,65 @@ pub fn router<R: OpenCodeRuntime>(service: AppService<R>) -> Router {
         )
         .route("/v1/libraries/{library_id}/query", post(query::<R>))
         .nest_service("/mcp", crate::mcp::streamable_http_service(service.clone()))
-        .with_state(service)
+        .with_state(service);
+    // Without a configured token the API stays open: the historical
+    // loopback-only deployment model. With one, every route (including the
+    // MCP endpoint) except the unauthenticated health probe requires it.
+    match auth_token {
+        Some(token) => router.layer(middleware::from_fn_with_state(token, require_auth)),
+        None => router,
+    }
+}
+
+/// Bearer-token guard: rejects requests whose `Authorization` header is
+/// absent, malformed, or carries the wrong token with `401 Unauthorized`.
+async fn require_auth(
+    State(token): State<Arc<str>>,
+    request: Request,
+    next: middleware::Next,
+) -> Result<Response, AppError> {
+    // Container orchestrators probe health without credentials.
+    if request.uri().path() == "/v1/health" {
+        return Ok(next.run(request).await);
+    }
+    let presented = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    match presented {
+        Some(candidate) if tokens_match(candidate, &token) => Ok(next.run(request).await),
+        _ => Err(AppError::Unauthorized),
+    }
+}
+
+/// Constant-time string equality, so response timing never reveals how many
+/// leading bytes of a guessed token were correct.
+fn tokens_match(candidate: &str, expected: &str) -> bool {
+    let candidate = candidate.as_bytes();
+    let expected = expected.as_bytes();
+    if candidate.len() != expected.len() {
+        return false;
+    }
+    candidate
+        .iter()
+        .zip(expected)
+        .fold(0u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tokens_match;
+
+    #[test]
+    fn token_comparison_is_exact() {
+        assert!(tokens_match("s3cret", "s3cret"));
+        assert!(!tokens_match("s3cret", "s3creT"));
+        assert!(!tokens_match("s3cret", "s3cre"));
+        assert!(!tokens_match("", "s3cret"));
+        assert!(tokens_match("", ""));
+    }
 }
 
 async fn health<R: OpenCodeRuntime>(State(service): State<AppService<R>>) -> Json<HealthResponse> {

@@ -86,6 +86,7 @@ fn config(data_dir: PathBuf) -> Config {
         opencode_timeout_secs: 5,
         transcript: false,
         max_sessions: 4,
+        auth_token: None,
     }
 }
 
