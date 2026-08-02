@@ -3,15 +3,17 @@
 //!
 //! Enabled per process with the server's `--transcript` flag (the
 //! `NOEMA_TRANSCRIPT` environment variable is its fallback, like every other
-//! setting). While enabled, the runtime
-//! streams assistant text, reasoning ("thinking"), tool invocations and
-//! results (including the built-in `skill` tool), per-step statistics and
-//! session errors to stderr as they arrive on the event stream. This is
-//! strictly server-side observability: the HTTP and MCP surfaces keep
-//! returning only the final text answer.
+//! setting). While enabled, the runtime streams assistant text, reasoning
+//! ("thinking"), tool invocations and results (including the built-in
+//! `skill` tool), per-step statistics and session errors to stderr as they
+//! arrive on the event stream. Assistant text and reasoning are previewed
+//! per part with a bounded budget plus an omission note — full answers
+//! travel over HTTP/MCP, the log only needs to show what the agent is
+//! doing. This is strictly server-side observability: the HTTP and MCP
+//! surfaces keep returning only the final text answer.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::Write as _,
     sync::{
         Mutex,
@@ -24,6 +26,8 @@ use opencode_rs::types::{
     event::{Event, MessagePartEventProps},
     message::{Part, ToolState},
 };
+use unicode_truncate::UnicodeTruncateStr;
+use unicode_width::UnicodeWidthStr;
 
 use crate::runtime::{DeltaKind, delta_kind};
 
@@ -35,14 +39,21 @@ const YELLOW: Style = AnsiColor::Yellow.on_default();
 const CYAN: Style = AnsiColor::Cyan.on_default();
 const MAGENTA: Style = AnsiColor::Magenta.on_default();
 
+/// Visible assistant text is previewed up to this many characters per part.
+const TEXT_PREVIEW_CHARS: usize = 240;
+/// Reasoning ("thinking") is noisier: a smaller preview keeps the log usable.
+const THINKING_PREVIEW_CHARS: usize = 120;
+
 /// The currently open streamed line, if any. Text and thinking deltas are
 /// written without a trailing newline so they read as live output; anything
-/// that emits a whole line must close the open line first. The owner id keeps
-/// concurrent sessions from appending into each other's line: a mismatch
-/// closes and re-opens the gutter instead.
+/// that emits a whole line must close the open line first. The owner id
+/// keeps concurrent sessions apart, and the part key keeps consecutive
+/// parts of the same kind on their own gutter line instead of gluing
+/// together.
 struct OpenLine {
     owner: usize,
     kind: DeltaKind,
+    part: String,
 }
 
 static OPEN_LINE: Mutex<Option<OpenLine>> = Mutex::new(None);
@@ -60,6 +71,11 @@ pub(crate) struct Transcript {
     id: usize,
     announced: HashSet<String>,
     finished: HashSet<String>,
+    /// Preview characters already streamed per text/reasoning part, keyed by
+    /// message id and part index.
+    previewed: HashMap<String, usize>,
+    /// Parts whose "N more characters omitted" note has been printed.
+    omission_noted: HashSet<String>,
     steps: u32,
     tokens_in: u64,
     tokens_out: u64,
@@ -73,6 +89,8 @@ impl Transcript {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             announced: HashSet::new(),
             finished: HashSet::new(),
+            previewed: HashMap::new(),
+            omission_noted: HashSet::new(),
             steps: 0,
             tokens_in: 0,
             tokens_out: 0,
@@ -92,11 +110,7 @@ impl Transcript {
         }
         match event {
             Event::MessagePartDelta { properties } => self.delta(properties),
-            Event::MessagePartUpdated { properties } => {
-                if let Some(part) = properties.part.as_ref() {
-                    self.part(part);
-                }
-            }
+            Event::MessagePartUpdated { properties } => self.part_update(properties),
             Event::SessionError { properties } => self.line(&paint(
                 RED,
                 &format!("├ ✖ session error: {:?}", properties.error),
@@ -115,21 +129,34 @@ impl Transcript {
         }
     }
 
-    /// Stream one text or thinking delta.
-    fn delta(&self, properties: &MessagePartEventProps) {
+    /// Stream one text or thinking delta, capped by the per-part preview
+    /// budget. Whitespace-only deltas are skipped so the gutter never fills
+    /// with empty lines.
+    fn delta(&mut self, properties: &MessagePartEventProps) {
         let Some(kind) = delta_kind(properties) else {
             return;
         };
         let Some(delta) = properties.delta.as_deref() else {
             return;
         };
-        if delta.is_empty() {
+        if delta.trim().is_empty() {
             return;
         }
+        let key = part_key(properties);
+        let budget = preview_chars(kind);
+        let rendered = self.previewed.get(&key).copied().unwrap_or(0);
+        if rendered >= budget {
+            return;
+        }
+        let piece: String = delta.chars().take(budget - rendered).collect();
         // Keep the gutter on wrapped lines of multi-line chunks.
-        let content = delta.replace('\n', "\n│  ");
+        let content = piece.replace('\n', "\n│  ");
         let mut open = lock_open_line();
-        if open.as_ref().map(|line| (line.owner, line.kind)) != Some((self.id, kind)) {
+        if open
+            .as_ref()
+            .map(|line| (line.owner, line.kind, line.part.as_str()))
+            != Some((self.id, kind, key.as_str()))
+        {
             if open.is_some() {
                 let _ = writeln!(stderr());
             }
@@ -141,6 +168,7 @@ impl Transcript {
             *open = Some(OpenLine {
                 owner: self.id,
                 kind,
+                part: key.clone(),
             });
         }
         let styled = match kind {
@@ -149,6 +177,35 @@ impl Transcript {
         };
         let _ = write!(stderr(), "{styled}");
         let _ = stderr().flush();
+        *self.previewed.entry(key).or_insert(0) += piece.chars().count();
+    }
+
+    fn part_update(&mut self, properties: &MessagePartEventProps) {
+        match properties.part.as_ref() {
+            Some(Part::Text { text, .. }) => self.preview_omission(properties, text),
+            Some(Part::Reasoning { text, .. }) => self.preview_omission(properties, text),
+            Some(part) => self.part(part),
+            None => {}
+        }
+    }
+
+    /// Once a previewed part's full text is known, note how much of it was
+    /// left out of the log.
+    fn preview_omission(&mut self, properties: &MessagePartEventProps, full: &str) {
+        let key = part_key(properties);
+        let rendered = self.previewed.get(&key).copied().unwrap_or(0);
+        if rendered == 0 || self.omission_noted.contains(&key) {
+            return;
+        }
+        let total = full.chars().count();
+        if total <= rendered {
+            return;
+        }
+        self.omission_noted.insert(key);
+        self.line(&paint(
+            DIM,
+            &format!("│  …（另有约 {} 字未显示）", total - rendered),
+        ));
     }
 
     fn part(&mut self, part: &Part) {
@@ -221,10 +278,13 @@ impl Transcript {
                 let name = resolved.and_then(skill_name).unwrap_or_else(|| "?".into());
                 paint(GREEN, &format!("├ 🎯 skill · {name}"))
             } else {
-                let args = resolved
-                    .map(compact_args)
-                    .unwrap_or_else(|| "…".to_string());
-                paint(CYAN, &format!("├ 🔧 {tool} {args}"))
+                let args = resolved.map(tool_args).unwrap_or_else(|| "…".to_string());
+                let line = if args.is_empty() {
+                    format!("├ 🔧 {tool}")
+                } else {
+                    format!("├ 🔧 {tool} {args}")
+                };
+                paint(CYAN, &line)
             };
             self.line(&line);
         }
@@ -237,7 +297,7 @@ impl Transcript {
         match state {
             ToolState::Completed(completed) => {
                 self.finished.insert(call_id.to_string());
-                let summary = summarize(&completed.output, 120);
+                let summary = tool_output_summary(&completed.output);
                 let text = if summary.is_empty() {
                     "│  ↳ ok".to_string()
                 } else {
@@ -295,6 +355,97 @@ impl Drop for Transcript {
     }
 }
 
+/// Argument keys worth displaying in full (paths, patterns, shell commands),
+/// in the order the most relevant one is surfaced first.
+const FULL_VALUE_KEYS: [&str; 8] = [
+    "filePath",
+    "command",
+    "pattern",
+    "path",
+    "directory",
+    "workdir",
+    "cwd",
+    "notebookPath",
+];
+
+/// Tool arguments for the log: the first path-like argument comes first and
+/// in full; everything else stays compact so `content` blobs never flood the
+/// line. No overall length cap — full paths are the point.
+fn tool_args(input: &serde_json::Value) -> String {
+    let serde_json::Value::Object(map) = input else {
+        return summarize(&input.to_string(), 100);
+    };
+    if map.is_empty() {
+        return String::new();
+    }
+    let primary = FULL_VALUE_KEYS
+        .iter()
+        .find_map(|key| map.get(*key).map(|value| (*key, value)));
+    let mut pieces = Vec::new();
+    if let Some((_, value)) = primary {
+        pieces.push(full_scalar(value));
+    }
+    for (key, value) in map {
+        if primary.is_some_and(|(primary_key, _)| key == primary_key) {
+            continue;
+        }
+        let rendered = if FULL_VALUE_KEYS.contains(&key.as_str()) {
+            full_scalar(value)
+        } else {
+            compact_scalar(value)
+        };
+        pieces.push(format!("{key}={rendered}"));
+    }
+    pieces.join(" ")
+}
+
+/// A scalar argument shown in full (paths, commands); newlines become
+/// spaces to keep the call on one log line.
+fn full_scalar(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.replace(['\n', '\r'], " "),
+        other => other.to_string(),
+    }
+}
+
+/// Compact rendering of a tool result. OpenCode's file tools report
+/// `<path>…</path> <type>…</type> …`; surface the full path (plus the entry
+/// count for directories) instead of raw XML-ish text.
+fn tool_output_summary(output: &str) -> String {
+    if let Some(path) = tag_value(output, "<path>", "</path>") {
+        let kind = tag_value(output, "<type>", "</type>").unwrap_or_default();
+        return match kind {
+            "directory" => {
+                let entries = tag_value(output, "<entries>", "</entries>")
+                    .map(|list| list.split_whitespace().count())
+                    .unwrap_or(0);
+                format!("目录 {path}（{entries} 项）")
+            }
+            "file" => format!("文件 {path}"),
+            _ => path.to_string(),
+        };
+    }
+    summarize(output, 120)
+}
+
+fn tag_value<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let start = text.find(open)? + open.len();
+    let end = start + text[start..].find(close)?;
+    Some(&text[start..end])
+}
+
+/// Stable identity of a streamed part: message id plus part index.
+fn part_key(properties: &MessagePartEventProps) -> String {
+    format!("{:?}#{:?}", properties.message_id, properties.index)
+}
+
+fn preview_chars(kind: DeltaKind) -> usize {
+    match kind {
+        DeltaKind::Text => TEXT_PREVIEW_CHARS,
+        DeltaKind::Thinking => THINKING_PREVIEW_CHARS,
+    }
+}
+
 /// Embed one style's escape codes around `text`. The stderr writer strips
 /// the codes when colors are not appropriate (see [`stderr`]).
 fn paint(style: Style, text: &str) -> String {
@@ -307,17 +458,15 @@ fn stderr() -> anstream::AutoStream<std::io::Stderr> {
     anstream::AutoStream::auto(std::io::stderr())
 }
 
-/// Collapse whitespace and truncate to a display budget (in characters, so
-/// CJK text is not split mid-codepoint).
-fn summarize(text: &str, max_chars: usize) -> String {
+/// Collapse whitespace and truncate to a display-width budget (terminal
+/// columns, so CJK counts double and codepoints are never split).
+fn summarize(text: &str, max_width: usize) -> String {
     let collapsed = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = collapsed.chars();
-    let head: String = chars.by_ref().take(max_chars).collect();
-    if chars.next().is_some() {
-        format!("{head}…")
-    } else {
-        head
+    if collapsed.width() <= max_width {
+        return collapsed;
     }
+    let (head, _) = collapsed.unicode_truncate(max_width.saturating_sub(1));
+    format!("{head}…")
 }
 
 /// Tool arguments, preferring the part-level `input` and falling back to the
@@ -348,20 +497,6 @@ fn has_args(value: &serde_json::Value) -> bool {
 }
 
 /// Render tool input as compact `key=value` pairs on one line.
-fn compact_args(input: &serde_json::Value) -> String {
-    match input {
-        serde_json::Value::Object(map) if !map.is_empty() => {
-            let pairs = map
-                .iter()
-                .map(|(key, value)| format!("{key}={}", compact_scalar(value)))
-                .collect::<Vec<_>>()
-                .join(" ");
-            summarize(&pairs, 100)
-        }
-        _ => summarize(&input.to_string(), 100),
-    }
-}
-
 fn compact_scalar(value: &serde_json::Value) -> String {
     match value {
         serde_json::Value::String(text) => summarize(text, 60),
@@ -382,17 +517,40 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn summarize_collapses_whitespace_and_truncates() {
+    fn summarize_collapses_whitespace_and_truncates_by_width() {
         assert_eq!(summarize("a\n\n b\t c", 10), "a b c");
-        assert_eq!(summarize("会话上下文与会话执行", 4), "会话上下…");
+        // CJK characters are two columns wide: budget 4 fits one plus the
+        // ellipsis.
+        assert_eq!(summarize("会话上下文与会话执行", 4), "会…");
     }
 
     #[test]
-    fn compact_args_renders_key_value_pairs() {
-        let args = json!({ "filePath": "purpose.md", "limit": 10 });
-        let rendered = compact_args(&args);
-        assert!(rendered.contains("filePath=purpose.md"));
+    fn tool_args_surfaces_full_paths_first_and_compacts_blobs() {
+        let long_path = format!("/root/very/long/library/root/wiki/{}.md", "n".repeat(80));
+        let args = json!({ "content": "x".repeat(300), "filePath": long_path, "limit": 10 });
+        let rendered = tool_args(&args);
+        assert!(rendered.starts_with(&long_path));
         assert!(rendered.contains("limit=10"));
+        assert!(rendered.contains("content="));
+        assert!(!rendered.contains(&"x".repeat(300)));
+    }
+
+    #[test]
+    fn tool_output_summary_prefers_the_full_path() {
+        let read_output = "<path>/root/data/libraries/lib/wiki/node.md</path> <type>file</type> <content> 1: ---…";
+        assert_eq!(
+            tool_output_summary(read_output),
+            "文件 /root/data/libraries/lib/wiki/node.md"
+        );
+        let dir_output = "<path>/root/data/libraries/lib/raw</path> <type>directory</type> <entries> a.md b.md c.txt </entries>";
+        assert_eq!(
+            tool_output_summary(dir_output),
+            "目录 /root/data/libraries/lib/raw（3 项）"
+        );
+        assert_eq!(
+            tool_output_summary("Wrote file successfully."),
+            "Wrote file successfully."
+        );
     }
 
     #[test]

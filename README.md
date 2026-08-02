@@ -314,7 +314,7 @@ noema-cli query 用户A法规库 "第一条讲了什么？"
 cargo test
 ```
 
-服务端可以流式打印 OpenCode 会话的中间过程（text / thinking / tool / skill 调用与结果、step 统计），仅用于服务端日志，HTTP 与 MCP 接口始终只返回最终文本回答。用 `--transcript` 标志启用（环境变量 `NOEMA_TRANSCRIPT` 是回退项；终端下自动带颜色，遵循 `NO_COLOR`）：
+服务端可以流式打印 OpenCode 会话的中间过程（text / thinking / tool / skill 调用与结果、step 统计），仅用于服务端日志，HTTP 与 MCP 接口始终只返回最终文本回答。模型的长段自述与最终答案按部件截取预览（其余以"另有约 N 字未显示"一行带过），工具参数中的路径完整显示。用 `--transcript` 标志启用（环境变量 `NOEMA_TRANSCRIPT` 是回退项；终端下自动带颜色，遵循 `NO_COLOR`）：
 
 ```bash
 noema --transcript

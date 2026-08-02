@@ -350,7 +350,9 @@ async fn cmd_query(
     )
     .await?;
     let value = response.json::<Value>().await?;
-    let _ = writeln!(stdout(), "{}", string_field(&value, "answer"));
+    // The answer is Markdown: termimad renders it for the terminal (styled
+    // on a tty, plain structured text when piped).
+    termimad::print_text(&string_field(&value, "answer"));
     let references = value["references"].as_array();
     if references.is_some_and(|items| !items.is_empty()) {
         let _ = writeln!(stdout());
