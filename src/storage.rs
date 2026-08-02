@@ -191,6 +191,28 @@ impl Storage {
         Ok(PathBuf::from(self.get_library(library_id)?.root))
     }
 
+    pub fn list_libraries(&self) -> Result<Vec<Library>, AppError> {
+        let connection = self.db()?;
+        let mut statement = connection.prepare(
+            "SELECT id, name, description, root, created_at FROM libraries ORDER BY created_at",
+        )?;
+        let libraries = statement
+            .query_map([], |row| {
+                let created_at: String = row.get(4)?;
+                Ok(Library {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    description: row.get(2)?,
+                    root: row.get(3)?,
+                    created_at: DateTime::parse_from_rfc3339(&created_at)
+                        .map(|value| value.with_timezone(&Utc))
+                        .unwrap_or_else(|_| Utc::now()),
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(libraries)
+    }
+
     pub fn store_document(
         &self,
         library_id: &str,
@@ -689,7 +711,7 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobStatus> {
     })
 }
 
-fn copy_path(source: &Path, destination: &Path) -> Result<(), AppError> {
+pub(crate) fn copy_path(source: &Path, destination: &Path) -> Result<(), AppError> {
     if source.is_dir() {
         fs::create_dir_all(destination)?;
         for entry in WalkDir::new(source).follow_links(false) {

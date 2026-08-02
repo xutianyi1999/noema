@@ -7,6 +7,7 @@ pub mod mcp;
 pub mod models;
 pub mod runtime;
 pub mod service;
+pub mod snapshot;
 pub mod storage;
 pub(crate) mod transcript;
 

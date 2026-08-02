@@ -90,9 +90,25 @@ POST /mcp
 
 MCP 工具都显式接收 `library_id`（健康检查除外）。Noema 不提供 stdio MCP 入口，也不会把自定义知识库 MCP 工具注入 OpenCode；OpenCode 直接使用当前内容库工作区和已安装 Skill。
 
+## CLI（noemactl）
+
+`noemactl` 离线管理内容库，直接操作数据目录，不需要 OpenCode Server：
+
+```bash
+cargo run --bin noemactl -- list
+cargo run --bin noemactl -- export <library_id 或名称> -o base-regulations.tar.gz
+cargo run --bin noemactl -- import base-regulations.tar.gz --name 用户A法规库
+```
+
+快照是一个内容库的完整副本（gzip tar）：`raw/` 原文、`wiki/` 知识节点（LLM-WIKI 编译产物）、`reviews/`、`graphify-out/` 图谱产物、`.opencode/` Skill 与插件、`library.sqlite`（去重与索引记录）。归档不含 `staging/`、运行时状态（`node_modules`、会话记录、SQLite sidecar）和任何符号链接。
+
+导入始终创建一个全新的内容库：新 id、新目录、独立数据库，失败时完整回滚。不同内容库完全隔离——不共享任何文件、不互相引用，跨库复用只通过"导出 → 导入"的副本发生。内容库名称只是别名，导入时可以随意重命名、可以重名；知识的身份由节点内的 `node_id` 承载。若快照缺少 `.opencode/`，导入会按 `NOEMA_INSTALL_GRAPHIFY` 执行上游 graphify 安装器补齐（默认开启，需要 graphify CLI）。
+
+典型复用流程：团队维护一份基础法规库，导出快照后分发给各用户；每个用户导入到自己的数据目录，再通过正常摄入流程增量添加自己的法规（摄入 Agent 执行 graphify `--update` 增量建图）。
+
 ## 测试
 
-离线端到端测试（`tests/e2e.rs`、`tests/service.rs`）通过假 OpenCode runtime 覆盖 HTTP API、Streamable HTTP MCP（使用 rmcp 官方客户端）、内容库隔离、SHA-256 去重、摄入失败/校验失败的 staging 保留、查询审计和错误路径，不需要模型、网络或 graphify：
+离线端到端测试（`tests/e2e.rs`、`tests/service.rs`、`tests/cli.rs`）通过假 OpenCode runtime 覆盖 HTTP API、Streamable HTTP MCP（使用 rmcp 官方客户端）、内容库隔离、SHA-256 去重、摄入失败/校验失败的 staging 保留、查询审计和错误路径，以及 noemactl 快照导出→导入往返和恶意归档拒绝，不需要模型、网络或 graphify：
 
 ```bash
 cargo test

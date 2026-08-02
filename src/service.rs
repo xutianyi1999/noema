@@ -255,24 +255,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 )));
             }
         }
-        for (relative, contents) in [
-            (
-                "kb-ingest/SKILL.md",
-                include_str!("../.opencode/skills/kb-ingest/SKILL.md"),
-            ),
-            (
-                "kb-query/SKILL.md",
-                include_str!("../.opencode/skills/kb-query/SKILL.md"),
-            ),
-            (
-                "kb-maintain/SKILL.md",
-                include_str!("../.opencode/skills/kb-maintain/SKILL.md"),
-            ),
-            (
-                "knowledge-compiler/SKILL.md",
-                include_str!("../.opencode/skills/knowledge-compiler/SKILL.md"),
-            ),
-        ] {
+        for (relative, contents) in crate::snapshot::skill_files() {
             let path = root.join(".opencode").join("skills").join(relative);
             if let Some(parent) = path.parent() {
                 tokio::fs::create_dir_all(parent).await?;
