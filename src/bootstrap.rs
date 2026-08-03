@@ -128,6 +128,9 @@ pub(crate) fn write_skills(root: &Path) -> Result<(), AppError> {
 
 const CONTRACT_BEGIN: &str = "<!-- noema-contract -->";
 const CONTRACT_END: &str = "<!-- /noema-contract -->";
+/// Heading of the always-on section the graphify installer writes into the
+/// project's `AGENTS.md`.
+const GRAPHIFY_SECTION_HEADING: &str = "## graphify";
 
 /// Idempotently install the generated Noema contract (ingest discipline +
 /// query contract with the schema and example) into the project's
@@ -138,7 +141,7 @@ const CONTRACT_END: &str = "<!-- /noema-contract -->";
 /// else in the file (e.g. the graphify installer's content) is preserved.
 pub(crate) fn write_agents_contract(root: &Path) -> Result<(), AppError> {
     let path = root.join("AGENTS.md");
-    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let existing = strip_graphify_section(&fs::read_to_string(&path).unwrap_or_default());
     let block = format!(
         "{CONTRACT_BEGIN}\n{}\n{CONTRACT_END}",
         crate::answer::agents_contract()
@@ -175,6 +178,40 @@ pub(crate) fn write_agents_contract(root: &Path) -> Result<(), AppError> {
     };
     fs::write(path, updated)?;
     Ok(())
+}
+
+/// Drop the graphify installer's always-on section from `AGENTS.md` content.
+/// That block tells every session to run `graphify query` first on content
+/// questions and a bare `graphify update .` after modifications — a
+/// code-repo stance that contradicts Noema's summaries-first query contract
+/// and the skill-driven `/graphify . --update` ingest flow. The Noema
+/// contract plus the upstream Skill (loaded on demand, per the contract)
+/// already carry the library's whole graphify stance, so the installer's
+/// voice is removed on every contract refresh; only a re-run installer
+/// (fresh bootstrap) brings it back, and the next refresh strips it again.
+fn strip_graphify_section(content: &str) -> String {
+    let lines = content.lines().collect::<Vec<_>>();
+    let Some(start) = lines
+        .iter()
+        .position(|line| *line == GRAPHIFY_SECTION_HEADING)
+    else {
+        return content.to_string();
+    };
+    // The section runs to the next heading, the contract marker or EOF.
+    let end = lines[start + 1..]
+        .iter()
+        .position(|line| line.starts_with("## ") || *line == CONTRACT_BEGIN)
+        .map_or(lines.len(), |offset| start + 1 + offset);
+    let mut kept = lines[..start]
+        .iter()
+        .chain(&lines[end..])
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if content.ends_with('\n') {
+        kept.push('\n');
+    }
+    kept
 }
 
 /// Full bootstrap for a brand-new library project: installer, then skills.
@@ -223,6 +260,48 @@ mod tests {
         assert_eq!(once.matches(CONTRACT_BEGIN).count(), 1, "{once}");
         assert!(once.contains("preamble"), "{once}");
         assert!(!once.contains("old contract"), "{once}");
+    }
+
+    /// The installer's always-on block (`## graphify` … graph-first rules,
+    /// bare `graphify update .`) shares every session's system prompt with
+    /// the Noema contract and contradicts it, so each refresh removes it.
+    #[test]
+    fn contract_refresh_strips_the_graphify_installers_always_on_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("AGENTS.md");
+        fs::write(
+            &path,
+            "## graphify\n\nThis project has a knowledge graph at graphify-out/.\n\nRules:\n- For codebase questions, first run `graphify query \"<question>\"`.\n- After modifying code, run `graphify update .` to keep the graph current.\n",
+        )
+        .unwrap();
+        write_agents_contract(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(!contents.contains("## graphify"), "{contents}");
+        assert!(!contents.contains("graphify update ."), "{contents}");
+        assert_eq!(contents.matches(CONTRACT_BEGIN).count(), 1, "{contents}");
+        // A second refresh is a no-op.
+        write_agents_contract(tmp.path()).unwrap();
+        assert_eq!(contents, fs::read_to_string(&path).unwrap());
+    }
+
+    #[test]
+    fn stripping_the_graphify_block_preserves_other_sections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("AGENTS.md");
+        fs::write(
+            &path,
+            "preamble\n\n## graphify\n\ninstaller rules\n\n## Other section\n\nkept\n",
+        )
+        .unwrap();
+        write_agents_contract(tmp.path()).unwrap();
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.starts_with("preamble\n"), "{contents}");
+        assert!(
+            contents.contains("## Other section\n\nkept\n"),
+            "{contents}"
+        );
+        assert!(!contents.contains("installer rules"), "{contents}");
+        assert_eq!(contents.matches(CONTRACT_BEGIN).count(), 1, "{contents}");
     }
 
     #[test]

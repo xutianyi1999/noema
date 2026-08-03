@@ -193,7 +193,7 @@ data/                                  数据根目录（NOEMA_DATA_DIR）
     ├── index.md                       全库知识索引（派生，提交后重建）
     ├── manifest.json                  原文清单（派生）
     ├── .graphifyignore                graphify 输入边界：只含 raw/ 与 wiki/
-    ├── AGENTS.md                      Agent 行为说明（graphify 安装器写入）
+    ├── AGENTS.md                      Noema 服务契约（摄入纪律 + 查询契约；graphify 安装器的常驻段落被剥离）
     ├── library.sqlite                 库内数据库：原文去重、节点注册、全文检索
     ├── .opencode/                     OpenCode 项目：四个 Noema Skill、graphify 插件与配置
     ├── raw/                           原文：.md/.txt、原文件名存储、SHA-256 去重（同名异内容拒绝）、入库后只读
@@ -214,7 +214,7 @@ data/                                  数据根目录（NOEMA_DATA_DIR）
 | `index.md` · `manifest.json` · `library.sqlite` | 派生索引与去重记录 | Noema 自动重建 | 不手写；永远由原文、知识节点和库内数据库再生 |
 | `staging/{job_id}/` | 摄入隔离工作区 | Noema 创建与清理 | 成功则提交允许的知识产物并清理；失败则保留备查。终态残留另由调和收敛：服务启动时清扫一遍，任务完成后延迟复查一次 |
 | `purpose.md` · `schema.md` · `.graphifyignore` | 内容库契约与边界 | 建库时种入 | 摄入校验要求逐字节未变 |
-| `.opencode/` · `AGENTS.md` | Agent 能力与行为说明 | Noema 与 graphify 安装器 | 建库与快照导入时写入/刷新；不属于知识提交物 |
+| `.opencode/` · `AGENTS.md` | Agent 能力与行为说明 | Noema（契约）与 graphify 安装器（插件与 Skill） | 建库与快照导入时写入/刷新，服务启动时按库收敛；AGENTS.md 中 graphify 安装器的常驻段落由 Noema 剥离，只留服务契约；不属于知识提交物 |
 
 ### 摄入业务流
 

@@ -71,7 +71,7 @@ pub(super) fn scaffold_library(root: &Path, name: &str) -> Result<(), AppError> 
 
 fn default_purpose(name: &str) -> String {
     format!(
-        "# {name}\n\nDefine this content library's purpose, scope, key questions, and terminology. State the authority ranking of its sources (e.g. statutes and regulations > judicial interpretations > standards and guides > other documents) and the update policy, including how superseded or amended texts are flagged and kept distinguishable from the texts in force.\n"
+        "# {name}\n\n在此定义内容库的目的、范围、关键问题与术语。说明来源的权威层级（如：法律法规 > 司法解释 > 标准指南 > 其他文档）与更新策略，包括被废止或修订的文本如何标注，以区别于现行有效的文本。\n"
     )
 }
 
@@ -97,5 +97,5 @@ fn default_schema() -> String {
 }
 
 fn default_index(name: &str) -> String {
-    format!("# {name}\n\nNo documents have been ingested yet.\n")
+    format!("# {name}\n\n尚未摄入任何文档。\n")
 }
