@@ -40,11 +40,6 @@ impl Storage {
         let root = self.root.join("libraries").join(&id);
         let now = Utc::now();
 
-        if let Err(error) = layout::scaffold_library(&root, &name) {
-            let _ = fs::remove_dir_all(&root);
-            return Err(error);
-        }
-
         let library = Library {
             id: id.clone(),
             name,
@@ -53,6 +48,11 @@ impl Storage {
             created_at: now,
         };
 
+        // Claim the name in the control plane BEFORE touching the
+        // filesystem: the UNIQUE constraint arbitrates concurrent creators
+        // atomically, so scaffolding only ever runs for the name's owner.
+        // (Scaffolding first let a loser's scaffold failure delete the
+        // directory the winner was using.)
         let result = self.db()?.execute(
             "INSERT INTO libraries (id, name, description, root, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
             params![
@@ -64,21 +64,25 @@ impl Storage {
             ],
         );
         match result {
-            Ok(_) => Ok(library),
-            // Lost the name race against a concurrent creator (the pre-check
-            // above is not atomic with this INSERT): its row and directory
-            // are the real ones now. Report the conflict WITHOUT removing
-            // the directory — that would destroy the winner's library.
             Err(rusqlite::Error::SqliteFailure(failure, _))
                 if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                Err(library_name_conflict(&library.name))
+                return Err(library_name_conflict(&library.name));
             }
-            Err(error) => {
-                let _ = fs::remove_dir_all(&root);
-                Err(error.into())
-            }
+            Err(error) => return Err(error.into()),
+            Ok(_) => {}
         }
+
+        // This call owns the row, so on scaffold failure both the row and
+        // the directory belong to it and can be rolled back safely.
+        if let Err(error) = layout::scaffold_library(&root, &library.name) {
+            let _ = fs::remove_dir_all(&root);
+            let _ = self
+                .db()?
+                .execute("DELETE FROM libraries WHERE id = ?1", params![library.id]);
+            return Err(error);
+        }
+        Ok(library)
     }
 
     pub fn get_library(&self, library_id: &str) -> Result<Library, AppError> {
@@ -259,22 +263,40 @@ impl Storage {
         Ok(())
     }
 
+    /// Remove a library completely: directory tree and every control-plane
+    /// row. Reads the row directly instead of [`get_library`] so a library
+    /// whose tree is missing or partial (a failed creation, a botched
+    /// rollback) can still be discarded instead of orphaning its rows
+    /// forever. The row deletions run in one transaction; the schema has no
+    /// foreign keys, so a crash mid-delete would otherwise leave orphans.
     pub fn discard_library(&self, library_id: &str) -> Result<(), AppError> {
-        let library = self.get_library(library_id)?;
-        let root = PathBuf::from(&library.root);
+        validate_library_id(library_id)?;
+        let mut connection = self.db()?;
+        let root: Option<String> = connection
+            .query_row(
+                "SELECT root FROM libraries WHERE id = ?1",
+                params![library_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(root) = root else {
+            return Err(AppError::LibraryNotFound(library_id.into()));
+        };
+        let root = PathBuf::from(root);
         if root.exists() {
             fs::remove_dir_all(root)?;
         }
-        self.db()?.execute(
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "DELETE FROM jobs WHERE library_id = ?1",
             params![library_id],
         )?;
-        self.db()?.execute(
+        transaction.execute(
             "DELETE FROM query_runs WHERE library_id = ?1",
             params![library_id],
         )?;
-        self.db()?
-            .execute("DELETE FROM libraries WHERE id = ?1", params![library_id])?;
+        transaction.execute("DELETE FROM libraries WHERE id = ?1", params![library_id])?;
+        transaction.commit()?;
         Ok(())
     }
 }

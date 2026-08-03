@@ -64,7 +64,7 @@ pub(crate) struct Transcript {
     announced: HashSet<String>,
     finished: HashSet<String>,
     /// Preview characters already streamed per text/reasoning part, keyed by
-    /// message id and part index.
+    /// part identity (see [`part_key`]).
     previewed: HashMap<String, usize>,
     /// Parts whose "N more characters omitted" note has been printed.
     omission_noted: HashSet<String>,
@@ -429,9 +429,45 @@ fn tag_value<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
     Some(&text[start..end])
 }
 
-/// Stable identity of a streamed part: message id plus part index.
+/// Stable identity of a streamed part. Deltas carry a `partID` the SDK only
+/// exposes through the flattened extras; whole-part updates carry the id
+/// inside the part object itself. The event-level `index` is a fallback for
+/// emitters that send neither — production OpenCode sends no index at all,
+/// so keying on it alone would merge every part of a message into one
+/// preview budget and one gutter line.
 fn part_key(properties: &MessagePartEventProps) -> String {
+    if let Some(part_id) = properties
+        .extra
+        .get("partID")
+        .and_then(serde_json::Value::as_str)
+    {
+        return part_id.to_string();
+    }
+    if let Some(part) = properties.part.as_ref()
+        && let Some(part_id) = part_id(part)
+    {
+        return part_id.to_string();
+    }
     format!("{:?}#{:?}", properties.message_id, properties.index)
+}
+
+/// The part identifier carried by a whole part object.
+fn part_id(part: &Part) -> Option<&str> {
+    match part {
+        Part::Text { id, .. }
+        | Part::File { id, .. }
+        | Part::Tool { id, .. }
+        | Part::Reasoning { id, .. }
+        | Part::StepStart { id, .. }
+        | Part::StepFinish { id, .. }
+        | Part::Snapshot { id, .. }
+        | Part::Patch { id, .. }
+        | Part::Agent { id, .. }
+        | Part::Retry { id, .. }
+        | Part::Compaction { id, .. }
+        | Part::Subtask { id, .. } => id.as_deref(),
+        _ => None,
+    }
 }
 
 fn preview_chars(kind: DeltaKind) -> usize {

@@ -93,8 +93,13 @@ pub(crate) fn install_graphify(root: &Path) -> Result<(), AppError> {
                 std::thread::sleep(Duration::from_millis(50));
             }
             Err(error) => {
+                // Same hygiene as the timeout path: do not leave the child
+                // running or the stderr reader unjoined.
+                let _ = child.kill();
+                let _ = child.wait();
+                let stderr = reader.join().unwrap_or_default();
                 return Err(AppError::Runtime(format!(
-                    "graphify installer error: {error}"
+                    "graphify installer error: {error} {stderr}"
                 )));
             }
         }

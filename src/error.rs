@@ -81,7 +81,12 @@ impl From<opencode_rs::OpencodeError> for AppError {
 
 impl From<walkdir::Error> for AppError {
     fn from(error: walkdir::Error) -> Self {
-        Self::Storage(error.to_string())
+        // Directory-walk failures are infrastructure errors carrying
+        // absolute paths: surface them through the masked `Io` variant.
+        match error.into_io_error() {
+            Some(io) => Self::Io(io),
+            None => Self::Storage("directory traversal failed".into()),
+        }
     }
 }
 

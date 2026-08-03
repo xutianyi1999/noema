@@ -112,19 +112,21 @@ async fn main() -> ExitCode {
 }
 
 async fn run(cli: Cli) -> Result<(), BoxError> {
-    let client = match &cli.auth_token {
-        Some(token) => {
-            let mut headers = reqwest::header::HeaderMap::new();
-            headers.insert(
-                reqwest::header::AUTHORIZATION,
-                format!("Bearer {token}").parse()?,
-            );
-            reqwest::Client::builder()
-                .default_headers(headers)
-                .build()?
-        }
-        None => reqwest::Client::new(),
-    };
+    // Deadlines so a wedged server cannot hang the CLI forever: a short
+    // connect timeout, plus a generous overall deadline that still covers a
+    // synchronous query running a full agent session server-side.
+    let mut builder = reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(2 * 60 * 60));
+    if let Some(token) = &cli.auth_token {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::AUTHORIZATION,
+            format!("Bearer {token}").parse()?,
+        );
+        builder = builder.default_headers(headers);
+    }
+    let client = builder.build()?;
     let base = cli.server.trim_end_matches('/').to_string();
     match cli.command {
         Command::Status => cmd_status(&client, &base).await,
@@ -226,19 +228,41 @@ async fn cmd_export(
     let mut response = send(client.get(url)).await?;
     let output = output
         .unwrap_or_else(|| PathBuf::from(format!("{}.tar.gz", library.replace(['/', '\\'], "-"))));
-    let mut file = tokio::fs::File::create(&output).await?;
+    // Download into a sibling `.part` file and rename it into place only
+    // once the whole archive has arrived: a download that fails mid-stream
+    // must not leave a truncated archive at the destination nor destroy
+    // whatever was there before.
+    let mut part = output.clone().into_os_string();
+    part.push(".part");
+    let part = PathBuf::from(part);
+    let mut file = tokio::fs::File::create(&part).await?;
     let mut bytes = 0u64;
-    while let Some(chunk) = response.chunk().await? {
-        bytes += chunk.len() as u64;
-        file.write_all(&chunk).await?;
+    let copied = copy_chunks(&mut response, &mut file, &mut bytes).await;
+    drop(file);
+    if let Err(error) = copied {
+        let _ = tokio::fs::remove_file(&part).await;
+        return Err(error);
     }
-    file.flush().await?;
+    tokio::fs::rename(&part, &output).await?;
     let _ = writeln!(
         stdout(),
         "{} {library} → {}（{bytes} 字节）",
         paint(GREEN, "✔ 已导出"),
         output.display()
     );
+    Ok(())
+}
+
+async fn copy_chunks(
+    response: &mut reqwest::Response,
+    file: &mut tokio::fs::File,
+    bytes: &mut u64,
+) -> Result<(), BoxError> {
+    while let Some(chunk) = response.chunk().await? {
+        *bytes += chunk.len() as u64;
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
     Ok(())
 }
 

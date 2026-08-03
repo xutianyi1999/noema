@@ -71,70 +71,80 @@ impl OpenCodeRuntime for OpenCodeAgent {
             })
             .await?;
 
-        let result = self.drive_session(&client, &session.id, request).await;
-
-        // Every session is single-use: delete it on every exit path, and
-        // surface cleanup failures instead of silently dropping them.
-        if let Err(error) = client.sessions().delete(&session.id).await {
-            tracing::warn!(session_id = %session.id, error = %error, "failed to delete OpenCode session");
-        }
-        result
+        // Run the turn on a detached task so its cleanup is cancellation
+        // safe: when a caller's future is dropped (client disconnect,
+        // shutdown), awaiting `drive_session` inline would skip the session
+        // deletion and leak the session on the OpenCode server until it
+        // restarts. The detached task always runs to the session's own
+        // deadline and deletes it on every exit path; the cost is that a
+        // cancelled turn still finishes server-side, which is the lesser
+        // evil. Ingest callers already run detached and are unaffected.
+        let config = self.config.clone();
+        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let result = drive_session(&client, &session.id, request, &config).await;
+            if let Err(error) = client.sessions().delete(&session.id).await {
+                tracing::warn!(session_id = %session.id, error = %error, "failed to delete OpenCode session");
+            }
+            let _ = result_tx.send(result);
+        });
+        result_rx
+            .await
+            .map_err(|_| AppError::Runtime("OpenCode session task aborted".into()))?
     }
 }
 
-impl OpenCodeAgent {
-    async fn drive_session(
-        &self,
-        client: &Client,
-        session_id: &str,
-        request: AgentRunRequest,
-    ) -> Result<AgentRunResult, AppError> {
-        let mut subscription = client.subscribe_session(session_id)?;
+async fn drive_session(
+    client: &Client,
+    session_id: &str,
+    request: AgentRunRequest,
+    config: &Config,
+) -> Result<AgentRunResult, AppError> {
+    let mut subscription = client.subscribe_session(session_id)?;
 
-        // Server-side live transcript (opt-in via the --transcript flag);
-        // never affects the result returned to callers.
-        let mut transcript = Transcript::new(self.config.transcript, session_id, &request.title);
+    // Server-side live transcript (opt-in via the --transcript flag);
+    // never affects the result returned to callers.
+    let mut transcript = Transcript::new(config.transcript, session_id, &request.title);
 
-        let prompt = PromptRequest {
-            parts: vec![PromptPart::Text {
-                text: request.prompt,
-                synthetic: None,
-                ignored: None,
-                metadata: None,
-            }],
-            message_id: None,
-            model: Some(parse_model(&self.config.opencode_model)),
-            agent: None,
-            no_reply: None,
-            system: None,
-            variant: None,
-        };
-        // One deadline for the whole turn: firing the prompt and collecting
-        // the streamed answer are both agent work, so both count against the
-        // configured session timeout. (A stalled `prompt_async` used to be
-        // bounded only by the HTTP client timeout, doubling the worst case.)
-        let deadline = Instant::now() + Duration::from_secs(self.config.opencode_timeout_secs);
-        let turn = async {
-            // Fire-and-forget: the synchronous `prompt` endpoint blocks until
-            // the whole turn completes, so nothing on the already-open
-            // subscription would be consumed (or rendered by the live
-            // transcript) until the very end. `prompt_async` returns
-            // immediately and the turn streams over the session subscription.
-            client.messages().prompt_async(session_id, &prompt).await?;
-            collect_events(&mut subscription, &mut transcript).await
-        };
+    let prompt = PromptRequest {
+        parts: vec![PromptPart::Text {
+            text: request.prompt,
+            synthetic: None,
+            ignored: None,
+            metadata: None,
+        }],
+        message_id: None,
+        model: Some(parse_model(&config.opencode_model)),
+        agent: None,
+        no_reply: None,
+        system: None,
+        variant: None,
+    };
+    // One deadline for the whole turn: firing the prompt and collecting
+    // the streamed answer are both agent work, so both count against the
+    // configured session timeout. (A stalled `prompt_async` used to be
+    // bounded only by the HTTP client timeout, doubling the worst case.)
+    let deadline = Instant::now() + Duration::from_secs(config.opencode_timeout_secs);
+    let turn = async {
+        // Fire-and-forget: the synchronous `prompt` endpoint blocks until
+        // the whole turn completes, so nothing on the already-open
+        // subscription would be consumed (or rendered by the live
+        // transcript) until the very end. `prompt_async` returns
+        // immediately and the turn streams over the session subscription.
+        client.messages().prompt_async(session_id, &prompt).await?;
+        collect_events(&mut subscription, &mut transcript).await
+    };
 
-        let collected = match timeout_at(deadline, turn).await {
-            Ok(collected) => collected?,
-            Err(_) => return Err(AppError::Runtime("OpenCode session timed out".into())),
-        };
+    let collected = match timeout_at(deadline, turn).await {
+        Ok(collected) => collected?,
+        Err(_) => return Err(AppError::Runtime("OpenCode session timed out".into())),
+    };
 
-        Ok(AgentRunResult {
-            session_id: session_id.to_string(),
-            answer: collected.answer,
-            tool_events: collected.tool_events,
-        })
-    }
+    Ok(AgentRunResult {
+        session_id: session_id.to_string(),
+        answer: collected.answer,
+        tool_events: collected.tool_events,
+    })
 }
 
 #[derive(Default)]
@@ -144,18 +154,21 @@ struct CollectedEvents {
     answer: String,
     streamed_text: bool,
     streamed_message: Option<String>,
-    /// Latest text snapshot per part index of the fallback message: OpenCode
+    /// Latest text snapshot per part of the fallback message: OpenCode
     /// resends a part's whole text on every `message.part.updated`, so a new
     /// snapshot of the same part replaces the old one instead of appending.
-    fallback_parts: Vec<(Option<usize>, String)>,
-    fallback_message: Option<String>,
+    /// Keyed by the part identity (see [`part_identity`]).
+    fallback_parts: Vec<(String, String)>,
     tool_events: Vec<serde_json::Value>,
 }
 
 impl CollectedEvents {
     /// Accumulate one streamed text delta. A new assistant message starts a
     /// new step, so its first delta discards the previous message's
-    /// intermediate text.
+    /// intermediate text — both the delta-accumulated answer and the part
+    /// snapshots, which up to that point belonged to the earlier message
+    /// (the server's `message.part.updated` events carry no message id, so
+    /// snapshots cannot be attributed to a message on their own).
     fn apply_delta(&mut self, properties: &MessagePartEventProps) {
         if !is_text_delta(properties) {
             return;
@@ -167,6 +180,7 @@ impl CollectedEvents {
             && self.streamed_message.as_deref() != Some(message_id)
         {
             self.answer.clear();
+            self.fallback_parts.clear();
             self.streamed_message = Some(message_id.clone());
         }
         self.answer.push_str(delta);
@@ -179,22 +193,32 @@ impl CollectedEvents {
         let Some(Part::Text { text, .. }) = properties.part.as_ref() else {
             return;
         };
-        if let Some(message_id) = &properties.message_id
-            && self.fallback_message.as_deref() != Some(message_id)
-        {
-            self.fallback_parts.clear();
-            self.fallback_message = Some(message_id.clone());
-        }
+        let key = part_identity(properties);
         match self
             .fallback_parts
             .iter_mut()
-            .find(|(index, _)| *index == properties.index)
+            .find(|(part, _)| *part == key)
         {
             Some((_, snapshot)) => *snapshot = text.clone(),
-            None => self.fallback_parts.push((properties.index, text.clone())),
+            None => self.fallback_parts.push((key, text.clone())),
         }
     }
+}
 
+/// The identity a part snapshot is deduped under. The server's
+/// `message.part.updated` event carries neither a message id nor a part
+/// index (only `{sessionID, part, time}`); the stable identity is the
+/// `prt…` id inside the part object, repeated on every snapshot resend.
+/// Emitters that omit the part id (older servers, test fixtures) fall back
+/// to the event's index; with neither, all snapshots share one slot.
+fn part_identity(properties: &MessagePartEventProps) -> String {
+    if let Some(Part::Text { id: Some(id), .. }) = properties.part.as_ref() {
+        return id.clone();
+    }
+    format!("index:{:?}", properties.index)
+}
+
+impl CollectedEvents {
     fn push_tool_event(&mut self, event: &Event) {
         if let Ok(value) = serde_json::to_value(event) {
             self.tool_events.push(value);
@@ -435,14 +459,15 @@ mod tests {
         assert!(!is_text_delta(&props(Some("reasoning"), None)));
     }
 
-    fn text_update(message_id: &str, index: usize, text: &str) -> MessagePartEventProps {
-        let mut properties = props(
+    /// Production shape: `message.part.updated` carries no message id and
+    /// no index — the identity is the part id inside the part object.
+    fn text_update(part_id: &str, text: &str) -> MessagePartEventProps {
+        props(
             None,
-            Some(part(serde_json::json!({ "type": "text", "text": text }))),
-        );
-        properties.message_id = Some(message_id.into());
-        properties.index = Some(index);
-        properties
+            Some(part(
+                serde_json::json!({ "type": "text", "id": part_id, "text": text }),
+            )),
+        )
     }
 
     #[test]
@@ -450,9 +475,32 @@ mod tests {
         // OpenCode resends a part's whole text on every update; the fallback
         // answer must hold each part once, not once per snapshot.
         let mut collected = CollectedEvents::default();
-        collected.apply_part_update(&text_update("m1", 0, "hel"));
-        collected.apply_part_update(&text_update("m1", 0, "hello"));
-        collected.apply_part_update(&text_update("m1", 1, "world"));
+        collected.apply_part_update(&text_update("prt-1", "hel"));
+        collected.apply_part_update(&text_update("prt-1", "hello"));
+        collected.apply_part_update(&text_update("prt-2", "world"));
         assert_eq!(collected.finish().answer, "hello\nworld");
+    }
+
+    #[test]
+    fn fallback_without_part_ids_falls_back_to_the_event_index() {
+        let mut properties = props(
+            None,
+            Some(part(serde_json::json!({ "type": "text", "text": "hi" }))),
+        );
+        properties.index = Some(7);
+        assert_eq!(part_identity(&properties), "index:Some(7)");
+        assert_eq!(part_identity(&text_update("prt-9", "x")), "prt-9");
+    }
+
+    #[test]
+    fn a_new_message_delta_discards_stale_fallback_snapshots() {
+        let mut collected = CollectedEvents::default();
+        collected.apply_part_update(&text_update("prt-1", "中间步骤"));
+        let mut delta = props(Some("text"), None);
+        delta.message_id = Some("m2".into());
+        delta.delta = Some("最终答案".into());
+        collected.apply_delta(&delta);
+        // The delta-path answer wins and the stale snapshot is gone.
+        assert_eq!(collected.finish().answer, "最终答案");
     }
 }

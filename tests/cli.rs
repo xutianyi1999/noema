@@ -32,7 +32,10 @@ fn spawn_server(data_dir: &Path) -> Server {
         .arg("--bind")
         .arg(format!("127.0.0.1:{port}"))
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        // Keep stderr visible: if the server dies at startup, the wait loop
+        // below panics, and the server's own error lines are the only
+        // diagnostics for why.
+        .stderr(Stdio::inherit())
         .spawn()
         .unwrap();
     // Startup includes spawning the OpenCode Server child. Both tests in
@@ -123,12 +126,11 @@ fn cli_drives_the_http_api_through_an_export_import_round_trip() {
 
     // Give the library some knowledge. The test can reach the server's data
     // directory directly; a remote client could not — it only speaks HTTP.
+    // The node follows the nine-key contract: imports (and every ingest's
+    // staging validation) reject wikis outside it.
+    const CONTRACT_NODE: &str = "---\nnode_id: reg\ncanonical_name: 法规节点\nkind: concept\nsources: []\nrelations:\n  depends_on: []\n  related_to: []\n  opposite_to: []\nclaim_type: observed\nconfidence: 1.0\ncreated_at: 2026-08-01T00:00:00Z\nupdated_at: 2026-08-01T00:00:00Z\n---\n\nbody";
     let root = data_dir.join("libraries").join(&library_id);
-    fs::write(
-        root.join("wiki/regulation.md"),
-        "---\nnode_id: reg\n---\nbody",
-    )
-    .unwrap();
+    fs::write(root.join("wiki/regulation.md"), CONTRACT_NODE).unwrap();
 
     // The library shows up in the listing.
     let (ok, stdout, _) = run(client(&server.base).arg("list"));
@@ -158,7 +160,7 @@ fn cli_drives_the_http_api_through_an_export_import_round_trip() {
     let imported_root = data_dir.join("libraries").join(&imported_id);
     assert_eq!(
         fs::read_to_string(imported_root.join("wiki/regulation.md")).unwrap(),
-        "---\nnode_id: reg\n---\nbody"
+        CONTRACT_NODE
     );
 
     // Both libraries are listed afterwards.

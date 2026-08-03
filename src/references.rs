@@ -1,7 +1,7 @@
 //! Safety for library knowledge paths: anything cited, served or promoted
 //! under `raw/` or `wiki/` must stay inside the library tree.
 
-use std::path::{Component, Path};
+use std::path::{Component, Path, PathBuf};
 
 /// A library-relative knowledge path: under `raw/` or `wiki/`, never
 /// absolute, never escaping the library tree.
@@ -14,6 +14,17 @@ pub(crate) fn safe_knowledge_path(path: &str) -> bool {
                 Component::ParentDir | Component::RootDir | Component::Prefix(_)
             )
         })
+}
+
+/// The canonical absolute path of `relative` inside `root`, when it is a
+/// regular file that stays inside the library: canonicalization resolves
+/// symlinks, so a link planted under `raw/` or `wiki/` (the ingestion
+/// agent runs with full permissions) cannot point the reader at files
+/// outside the tree. Anything missing or escaping yields `None`.
+pub(crate) fn contained_file(root: &Path, relative: &str) -> Option<PathBuf> {
+    let canonical = root.join(relative).canonicalize().ok()?;
+    let root = root.canonicalize().ok()?;
+    (canonical.starts_with(root) && canonical.is_file()).then_some(canonical)
 }
 
 #[cfg(test)]

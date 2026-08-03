@@ -95,6 +95,13 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             "binding a non-loopback address without --auth-token; the HTTP API is unauthenticated"
         );
     }
+    // Register the signal handlers BEFORE the child process and the
+    // startup maintenance run: a SIGTERM/SIGINT arriving during that
+    // window must not kill the process with the default handler, which
+    // would orphan the managed OpenCode child. Once handlers are
+    // installed, an early signal simply queues until the graceful
+    // shutdown below starts.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let managed = spawn_opencode_server().await?;
     let config = Config {
         data_dir: cli.data_dir,
@@ -111,18 +118,20 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let listener = tokio::net::TcpListener::bind(bind).await?;
     tracing::info!(%bind, "Noema HTTP and Streamable HTTP MCP service started");
 
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let result = tokio::select! {
-        result = axum::serve(listener, app) => result.map_err(Into::into),
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received SIGINT, stopping");
-            Ok(())
-        }
-        _ = sigterm.recv() => {
-            tracing::info!("received SIGTERM, stopping");
-            Ok(())
+    // Graceful shutdown: on a signal, axum finishes the in-flight requests
+    // (queries complete instead of dying mid-session) before the managed
+    // OpenCode server is stopped. Detached ingest tasks are still cut off
+    // by the runtime drop; the startup reap marks them failed on next boot.
+    let shutdown = async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => tracing::info!("received SIGINT, stopping gracefully"),
+            _ = sigterm.recv() => tracing::info!("received SIGTERM, stopping gracefully"),
         }
     };
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+        .map_err(Into::into);
 
     if let Err(error) = managed.stop().await {
         tracing::warn!(%error, "failed to stop OpenCode Server");

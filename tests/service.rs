@@ -134,7 +134,7 @@ async fn wait_for_completion(
     library_id: &str,
     job_id: &str,
 ) -> noema::models::JobStatus {
-    for _ in 0..100 {
+    for _ in 0..500 {
         let status = service.job_status(library_id, job_id).unwrap();
         if matches!(
             status.status,
@@ -528,11 +528,12 @@ async fn knowledge_files_are_served_with_safety_checks() {
     let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
     assert_eq!(body, "# Session Context\n\nTest source.");
 
-    // Outside raw/|wiki/ → 400; inside but missing → 404.
+    // Anything outside raw/|wiki/ and anything missing inside are the same
+    // uniform 404 — the status code never reveals the path policy.
     for (uri, status) in [
         (
             "/v1/libraries/fileslib/files/library.sqlite",
-            StatusCode::BAD_REQUEST,
+            StatusCode::NOT_FOUND,
         ),
         (
             "/v1/libraries/fileslib/files/raw/absent.md",

@@ -121,11 +121,42 @@ impl Storage {
             let _ = connection.execute("DELETE FROM documents WHERE id = ?1", params![record.id]);
             return Err(error);
         }
-        self.write_manifest(library_id)?;
+        // The document is durably stored now; a manifest refresh failure
+        // must not fail the submission. The manifest is derived data — the
+        // next index rebuild regenerates it.
+        if let Err(error) = self.write_manifest(library_id) {
+            tracing::warn!(library_id = %library_id, %error, "manifest refresh failed");
+        }
         Ok(StoredDocument {
             record,
             duplicate: false,
         })
+    }
+
+    /// Drop document rows whose `raw/` file is missing — the residue of a
+    /// crash between the row's INSERT and the file write. Such a row blocks
+    /// the document forever: dedupe treats the content as already stored,
+    /// yet ingest would be told to read a file that does not exist. Runs at
+    /// startup, when no ingest is in flight; the document becomes
+    /// submittable again.
+    pub fn reconcile_documents(&self, library_id: &str) -> Result<(), AppError> {
+        let root = self.library_root(library_id)?;
+        let connection = open_library_db(&root.join("library.sqlite"))?;
+        let rows = {
+            let mut statement = connection.prepare("SELECT id, path FROM documents")?;
+            statement
+                .query_map([], |row| {
+                    Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for (id, path) in rows {
+            if !root.join(&path).is_file() {
+                tracing::warn!(library_id = %library_id, %path, "removing document row whose raw/ file is missing");
+                connection.execute("DELETE FROM documents WHERE id = ?1", params![id])?;
+            }
+        }
+        Ok(())
     }
 
     /// Every document record of one library in submission order (oldest
@@ -192,32 +223,69 @@ pub(super) fn init_library_db(path: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Rebuild batch size: each batch is its own write transaction, so a
+/// rebuild of a large library releases the writer lock between batches and
+/// concurrent uploads wait at most one batch instead of the whole rebuild
+/// (the previous single transaction exceeded the busy timeout and failed
+/// them outright).
+const FTS_REBUILD_BATCH: usize = 256;
+
 fn rebuild_content_fts(root: &Path) -> Result<(), AppError> {
     let mut connection = open_library_db(&root.join("library.sqlite"))?;
-    // One transaction: concurrent queries never observe an empty or
-    // half-built index, and the rebuild is one commit instead of one per
-    // file.
-    let transaction = connection.transaction()?;
-    transaction.execute("DELETE FROM content_fts", [])?;
-    for (relative, path) in knowledge_files(root)? {
-        let body = fs::read_to_string(&path)?;
-        let title = path
-            .file_stem()
-            .and_then(|value| value.to_str())
-            .unwrap_or_default();
-        transaction.execute(
-            "INSERT INTO content_fts (path, title, body) VALUES (?1, ?2, ?3)",
-            params![relative, title, body],
-        )?;
+    // Build into a shadow table, then swap it in with one short
+    // transaction: readers never observe an empty or half-built index,
+    // writers are barely held. A leftover shadow from a crashed rebuild is
+    // dropped first.
+    connection.execute_batch(
+        "DROP TABLE IF EXISTS content_fts_rebuild;
+         CREATE VIRTUAL TABLE content_fts_rebuild USING fts5(path, title, body);",
+    )?;
+    let files = knowledge_files(root)?;
+    let result = rebuild_fts_batches(&mut connection, &files);
+    if result.is_err() {
+        let _ = connection.execute_batch("DROP TABLE IF EXISTS content_fts_rebuild");
+        return result;
     }
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "DROP TABLE IF EXISTS content_fts;
+         ALTER TABLE content_fts_rebuild RENAME TO content_fts;",
+    )?;
     transaction.commit()?;
+    Ok(())
+}
+
+fn rebuild_fts_batches(
+    connection: &mut rusqlite::Connection,
+    files: &[(String, PathBuf)],
+) -> Result<(), AppError> {
+    for batch in files.chunks(FTS_REBUILD_BATCH) {
+        let transaction = connection.transaction()?;
+        for (relative, path) in batch {
+            let body = fs::read_to_string(path).map_err(|error| {
+                AppError::Storage(format!(
+                    "knowledge file is not valid UTF-8 text: {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let title = path
+                .file_stem()
+                .and_then(|value| value.to_str())
+                .unwrap_or_default();
+            transaction.execute(
+                "INSERT INTO content_fts_rebuild (path, title, body) VALUES (?1, ?2, ?3)",
+                params![relative, title, body],
+            )?;
+        }
+        transaction.commit()?;
+    }
     Ok(())
 }
 
 /// Every file the derived artifacts (index.md, the content FTS) cover:
 /// `raw/` as .md/.txt and `wiki/` as .md, matched case-insensitively
 /// (uploads keep their extension casing verbatim), sorted by relative path.
-fn knowledge_files(root: &Path) -> Result<Vec<(String, PathBuf)>, AppError> {
+pub(crate) fn knowledge_files(root: &Path) -> Result<Vec<(String, PathBuf)>, AppError> {
     let mut files: Vec<(String, PathBuf)> = Vec::new();
     for (directory, extensions) in [
         ("raw", ["md", "txt"].as_slice()),
@@ -360,6 +428,26 @@ mod tests {
         let mut hasher = Sha256::new();
         hasher.update(on_disk.as_bytes());
         assert_eq!(sha256, hex::encode(hasher.finalize()));
+    }
+
+    #[test]
+    fn reconcile_drops_phantom_rows_and_unblocks_resubmission() {
+        let (_tmp, storage, library_id) = fixture();
+        storage
+            .store_document(&library_id, "phantom.md", None, "content")
+            .unwrap();
+        // Simulate the crash window's aftermath: the row exists, the file
+        // does not.
+        let root = storage.library_root(&library_id).unwrap();
+        fs::remove_file(root.join("raw/phantom.md")).unwrap();
+        storage.reconcile_documents(&library_id).unwrap();
+        assert!(storage.list_documents(&library_id).unwrap().is_empty());
+        // Without reconciliation dedupe would keep reporting a duplicate of
+        // content whose file no longer exists.
+        let stored = storage
+            .store_document(&library_id, "phantom.md", None, "content")
+            .unwrap();
+        assert!(!stored.duplicate);
     }
 
     #[test]

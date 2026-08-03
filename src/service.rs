@@ -15,7 +15,7 @@ use crate::{
         CreateLibraryRequest, DocumentInput, HealthResponse, JobKind, JobState, JobStatus, Library,
         QueryResponse, SubmitDocumentResponse,
     },
-    references::safe_knowledge_path,
+    references::{contained_file, safe_knowledge_path},
     runtime::{AgentRunRequest, OpenCodeAgent, OpenCodeRuntime},
     storage::{Storage, StoredDocument, referenced_sources},
 };
@@ -141,6 +141,9 @@ impl<R: OpenCodeRuntime> AppService<R> {
                     if let Err(error) = self.storage.reconcile_staging(&library.id) {
                         tracing::warn!(library_id = %library.id, %error, "staging reconcile failed");
                     }
+                    if let Err(error) = self.storage.reconcile_documents(&library.id) {
+                        tracing::warn!(library_id = %library.id, %error, "document reconcile failed");
+                    }
                     let root = Path::new(&library.root);
                     let refreshed = if crate::bootstrap::graphify_installed(root) {
                         crate::bootstrap::write_skills(root)
@@ -202,8 +205,14 @@ impl<R: OpenCodeRuntime> AppService<R> {
             stored.duplicate && self.document_already_compiled(&library_id, &stored.record.path)?;
         let job = self.storage.create_job(&library_id, JobKind::Ingest)?;
         if skip {
-            self.storage
-                .update_job(&library_id, &job.job_id, JobState::Skipped, None, None)?;
+            // Record the skip durably; a failure here must mark the job
+            // failed rather than leave it queued forever.
+            if let Err(error) =
+                self.storage
+                    .update_job(&library_id, &job.job_id, JobState::Skipped, None, None)
+            {
+                return Err(self.record_job_failure(&library_id, &job.job_id, None, error));
+            }
             return Ok(SubmitDocumentResponse {
                 library_id,
                 job_id: job.job_id,
@@ -271,12 +280,18 @@ impl<R: OpenCodeRuntime> AppService<R> {
             Ok(result) => result,
             Err(error) => return Err(self.record_query_failure(&query_id, error)),
         };
-        self.storage.update_query(
+        // The run succeeded; a failure to record that must not discard the
+        // answer (the run row simply stays `running` until the startup reap
+        // picks it up). Same discipline as [`record_job_failure`]: a broken
+        // database must never mask successful work.
+        if let Err(error) = self.storage.update_query(
             &query_id,
             JobState::Completed,
             Some(&result.session_id),
             None,
-        )?;
+        ) {
+            tracing::warn!(query_id = %query_id, %error, "failed to record query completion");
+        }
         let (answer, references) = answer::present_answer(&root, &result.answer);
         Ok(QueryResponse {
             query_id,
@@ -290,25 +305,19 @@ impl<R: OpenCodeRuntime> AppService<R> {
 
     /// Resolve one knowledge file for reading: `library` accepts an id or a
     /// unique name; `relative` must stay inside the library under `raw/` or
-    /// `wiki/`. Canonicalization rejects symlink escapes; missing files and
-    /// paths outside the tree are the same `FileNotFound` to the client.
+    /// `wiki/`. Canonicalization rejects symlink escapes; missing files,
+    /// malformed shapes and paths outside the tree are all the same
+    /// `FileNotFound` to the client, so the path policy itself is never
+    /// revealed by the status code.
     pub fn knowledge_file(&self, library: &str, relative: &str) -> Result<PathBuf, AppError> {
         let library_id = self.storage.resolve_library(library)?.id;
-        if !safe_knowledge_path(relative) {
-            return Err(AppError::BadRequest(format!(
-                "not a raw/ or wiki/ knowledge path: {relative}"
-            )));
-        }
         let root = self.storage.library_root(&library_id)?;
-        let not_found = || AppError::FileNotFound(relative.to_string());
-        let canonical = root
-            .join(relative)
-            .canonicalize()
-            .map_err(|_| not_found())?;
-        let contained = root
-            .canonicalize()
-            .is_ok_and(|root| canonical.starts_with(root) && canonical.is_file());
-        contained.then_some(canonical).ok_or_else(not_found)
+        if safe_knowledge_path(relative)
+            && let Some(canonical) = contained_file(&root, relative)
+        {
+            return Ok(canonical);
+        }
+        Err(AppError::FileNotFound(relative.to_string()))
     }
 
     /// Record a job failure and return the original error for propagation.
@@ -375,14 +384,20 @@ impl<R: OpenCodeRuntime> AppService<R> {
         // resubmitted mid-run spawns a second job for it. Re-checked here
         // under the library lock so the late job skips instead of redoing a
         // whole ingest session over an already-compiled document.
-        if self.document_already_compiled(library_id, &stored.record.path)? {
-            if let Err(error) =
-                self.storage
-                    .update_job(library_id, job_id, JobState::Skipped, None, None)
-            {
-                return Err(self.record_job_failure(library_id, job_id, None, error));
+        match self.document_already_compiled(library_id, &stored.record.path) {
+            Ok(true) => {
+                if let Err(error) =
+                    self.storage
+                        .update_job(library_id, job_id, JobState::Skipped, None, None)
+                {
+                    return Err(self.record_job_failure(library_id, job_id, None, error));
+                }
+                return Ok(());
             }
-            return Ok(());
+            // Like every other failure below, record it on the job row: a
+            // bare `?` would leave the job stranded as `queued`.
+            Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
+            Ok(false) => {}
         }
 
         if let Err(error) =

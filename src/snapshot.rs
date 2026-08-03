@@ -69,10 +69,34 @@ pub fn export_library(data_dir: &Path, selector: &str, output: &Path) -> Result<
             exported_at: Utc::now().to_rfc3339(),
         },
     )?;
-    append_tree(&mut archive, &root)?;
+    // Consistent database snapshot: uploads keep landing while an export
+    // runs (they are not gated by the ingest lock), so archiving the live
+    // file could capture a mid-transaction database.
+    let db_snapshot = snapshot_library_db(&root)?;
+    append_tree(
+        &mut archive,
+        &root,
+        db_snapshot.as_ref().map(|(path, _)| path.as_path()),
+    )?;
     let encoder = archive.into_inner()?;
     encoder.finish()?;
     Ok(library)
+}
+
+/// A consistent copy of the library database taken with `VACUUM INTO`,
+/// which snapshots correctly even while another connection is writing.
+/// The returned guard owns the temporary copy until the archive is built.
+fn snapshot_library_db(root: &Path) -> Result<Option<(PathBuf, tempfile::TempDir)>, AppError> {
+    let db_path = root.join("library.sqlite");
+    if !db_path.is_file() {
+        return Ok(None);
+    }
+    let connection = rusqlite::Connection::open(&db_path)?;
+    connection.busy_timeout(std::time::Duration::from_secs(5))?;
+    let directory = tempfile::tempdir()?;
+    let snapshot = directory.path().join("library.sqlite");
+    connection.execute("VACUUM INTO ?1", [snapshot.display().to_string()])?;
+    Ok(Some((snapshot, directory)))
 }
 
 /// Import a snapshot archive as a brand-new library. The archive is first
@@ -103,12 +127,28 @@ fn import_inner(
 ) -> Result<Library, AppError> {
     let file = fs::File::open(archive_path)?;
     let mut archive = Archive::new(GzDecoder::new(BufReader::new(file)));
-    unpack_validated(&mut archive, scratch, MAX_UNPACKED_BYTES)?;
+    // A truncated or non-gzip body surfaces here as read errors on the
+    // decoder stream: that is a malformed upload (400), not a server fault.
+    unpack_validated(&mut archive, scratch, MAX_UNPACKED_BYTES).map_err(|error| match error {
+        AppError::Io(io) => AppError::BadRequest(format!("invalid snapshot archive: {io}")),
+        other => other,
+    })?;
 
     let manifest = read_snapshot_manifest(scratch)?;
     // The manifest is snapshot metadata, not library content: drop it so it
-    // never settles into the imported library root (and every later export).
-    let _ = fs::remove_file(scratch.join(SNAPSHOT_MANIFEST));
+    // never settles into the imported library root (and every later export)
+    // — whether it arrived as a file or a directory.
+    let manifest_path = scratch.join(SNAPSHOT_MANIFEST);
+    if manifest_path.is_dir() {
+        fs::remove_dir_all(&manifest_path)?;
+    } else {
+        let _ = fs::remove_file(&manifest_path);
+    }
+    // Reject archives whose content would brick the imported library before
+    // any library row exists: a non-conforming wiki node would fail every
+    // later ingest's staging validation, and a binary knowledge file would
+    // fail every index rebuild.
+    validate_snapshot_content(scratch)?;
     let had_opencode = scratch.join(".opencode").is_dir();
     // The snapshot records the source library's name; importers keep it
     // unless they pass an explicit one. Names are unique, so re-importing
@@ -151,6 +191,26 @@ fn overlay_and_repair(
     crate::bootstrap::write_skills(root)
 }
 
+/// The content contract an imported library must already satisfy, checked on
+/// the unpacked scratch tree before any library row is created. Staging
+/// validation enforces the nine-key node contract at the end of every
+/// ingest — on the staging copy of the live wiki — so one imported node
+/// outside the contract would fail every later ingest with no way to heal.
+/// Knowledge files must additionally be UTF-8 text: the index rebuild reads
+/// them as strings.
+fn validate_snapshot_content(scratch: &Path) -> Result<(), AppError> {
+    crate::storage::validate_wiki_nodes(&scratch.join("wiki"))
+        .map_err(|error| AppError::BadRequest(format!("snapshot rejected: {error}")))?;
+    for (relative, path) in crate::storage::knowledge_files(scratch)? {
+        if let Err(error) = fs::read_to_string(&path) {
+            return Err(AppError::BadRequest(format!(
+                "snapshot rejected: knowledge file is not valid UTF-8 text: {relative}: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn append_manifest<W: Write>(
     archive: &mut Builder<W>,
     manifest: &SnapshotManifest,
@@ -164,7 +224,11 @@ fn append_manifest<W: Write>(
     Ok(())
 }
 
-fn append_tree<W: Write>(archive: &mut Builder<W>, root: &Path) -> Result<(), AppError> {
+fn append_tree<W: Write>(
+    archive: &mut Builder<W>,
+    root: &Path,
+    db_snapshot: Option<&Path>,
+) -> Result<(), AppError> {
     for entry in WalkDir::new(root).follow_links(false).sort_by_file_name() {
         let entry = entry?;
         let relative = entry.path().strip_prefix(root)?;
@@ -177,7 +241,12 @@ fn append_tree<W: Write>(archive: &mut Builder<W>, root: &Path) -> Result<(), Ap
         if file_type.is_dir() {
             archive.append_dir(relative, entry.path())?;
         } else if file_type.is_file() {
-            archive.append_path_with_name(entry.path(), relative)?;
+            let source = if relative == Path::new("library.sqlite") {
+                db_snapshot.unwrap_or(entry.path())
+            } else {
+                entry.path()
+            };
+            archive.append_path_with_name(source, relative)?;
         }
     }
     Ok(())
@@ -318,6 +387,10 @@ fn default_name_from_archive(path: &Path) -> String {
 mod tests {
     use super::*;
 
+    /// A wiki node satisfying the nine-key contract — imports now enforce
+    /// it, exactly as staging validation does at the end of every ingest.
+    const CONTRACT_NODE: &str = "---\nnode_id: reg\ncanonical_name: 法规节点\nkind: concept\nsources:\n  - path: raw/regulation.md\n    locator: 第一条\nrelations:\n  depends_on: []\n  related_to: []\n  opposite_to: []\nclaim_type: observed\nconfidence: 1.0\ncreated_at: 2026-08-01T00:00:00Z\nupdated_at: 2026-08-01T00:00:00Z\n---\n\n# 法规节点\n";
+
     #[test]
     fn relative_path_validation_rejects_escapes() {
         assert!(validate_relative_path(Path::new("raw/a.md")).is_ok());
@@ -375,7 +448,7 @@ mod tests {
         storage
             .store_document(&library.id, "regulation.md", None, "# 法规\n\n第一条。")
             .unwrap();
-        fs::write(root.join("wiki/regulation.md"), "---\nnode_id: reg\n---\n").unwrap();
+        fs::write(root.join("wiki/regulation.md"), CONTRACT_NODE).unwrap();
         fs::create_dir_all(root.join("graphify-out")).unwrap();
         fs::write(root.join("graphify-out/graph.json"), r#"{"nodes":[]}"#).unwrap();
         fs::create_dir_all(root.join(".opencode/skills/kb-query")).unwrap();
@@ -402,7 +475,7 @@ mod tests {
         let imported_root = PathBuf::from(&imported.root);
         assert_eq!(
             fs::read_to_string(imported_root.join("wiki/regulation.md")).unwrap(),
-            "---\nnode_id: reg\n---\n"
+            CONTRACT_NODE
         );
         assert_eq!(
             fs::read_to_string(imported_root.join("graphify-out/graph.json")).unwrap(),
@@ -497,5 +570,85 @@ mod tests {
         // A rejected import leaves no library row behind.
         let storage = Storage::open(&data_dir).unwrap();
         assert!(storage.list_libraries().unwrap().is_empty());
+    }
+
+    /// A regular-file entry with a gzip payload: the same builder shape the
+    /// manifest and content entries below use.
+    fn append_regular<W: Write>(archive: &mut Builder<W>, path: &str, payload: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        archive
+            .append_data(&mut header, path, payload)
+            .expect("append entry");
+    }
+
+    #[test]
+    fn import_rejects_archives_whose_wiki_breaks_the_node_contract() {
+        // Without this check the import would succeed and every later ingest
+        // would fail its staging validation against the poisoned node.
+        let workspace = tempfile::tempdir().unwrap();
+        let archive_path = workspace.path().join("bad-wiki.tar.gz");
+        {
+            let file = fs::File::create(&archive_path).unwrap();
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut archive = Builder::new(encoder);
+            append_regular(&mut archive, "raw/a.md", "# 来源\n\n正文。".as_bytes());
+            append_regular(&mut archive, "wiki/bad.md", b"---\nbad: [unclosed\n---\n");
+            archive.into_inner().unwrap().finish().unwrap();
+        }
+        let data_dir = workspace.path().join("data");
+        let error = import_library(&archive_path, None, None, &data_dir).unwrap_err();
+        assert!(error.to_string().contains("frontmatter"), "{error}");
+        let storage = Storage::open(&data_dir).unwrap();
+        assert!(storage.list_libraries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_rejects_archives_with_binary_knowledge_files() {
+        let workspace = tempfile::tempdir().unwrap();
+        let archive_path = workspace.path().join("binary-raw.tar.gz");
+        {
+            let file = fs::File::create(&archive_path).unwrap();
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut archive = Builder::new(encoder);
+            append_regular(&mut archive, "raw/evil.md", &[0xff, 0xfe, 0x00, 0x80]);
+            archive.into_inner().unwrap().finish().unwrap();
+        }
+        let data_dir = workspace.path().join("data");
+        let error = import_library(&archive_path, None, None, &data_dir).unwrap_err();
+        assert!(error.to_string().contains("UTF-8"), "{error}");
+        let storage = Storage::open(&data_dir).unwrap();
+        assert!(storage.list_libraries().unwrap().is_empty());
+    }
+
+    #[test]
+    fn import_drops_a_manifest_that_arrives_as_a_directory() {
+        // A crafted archive can carry the manifest name as a directory of
+        // arbitrary files; it must not settle into the imported library.
+        let workspace = tempfile::tempdir().unwrap();
+        let archive_path = workspace.path().join("manifest-dir.tar.gz");
+        {
+            let file = fs::File::create(&archive_path).unwrap();
+            let encoder = GzEncoder::new(file, Compression::default());
+            let mut archive = Builder::new(encoder);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(EntryType::Directory);
+            header.set_size(0);
+            header.set_mode(0o755);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "noema-snapshot.json/", &b""[..])
+                .unwrap();
+            append_regular(&mut archive, "noema-snapshot.json/smuggled.md", b"smuggled");
+            append_regular(&mut archive, "raw/a.md", "# 来源\n\n正文。".as_bytes());
+            archive.into_inner().unwrap().finish().unwrap();
+        }
+        let data_dir = workspace.path().join("data");
+        let imported = import_library(&archive_path, None, None, &data_dir).unwrap();
+        let imported_root = PathBuf::from(&imported.root);
+        assert!(!imported_root.join(SNAPSHOT_MANIFEST).exists());
+        assert!(imported_root.join("raw/a.md").is_file());
     }
 }

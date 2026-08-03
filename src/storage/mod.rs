@@ -25,8 +25,9 @@ mod fsutil;
 mod layout;
 mod staging;
 
+pub(crate) use documents::knowledge_files;
 pub(crate) use fsutil::copy_path;
-pub(crate) use staging::referenced_sources;
+pub(crate) use staging::{referenced_sources, validate_wiki_nodes};
 
 use crate::error::AppError;
 

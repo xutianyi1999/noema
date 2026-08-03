@@ -44,6 +44,11 @@ impl Storage {
         Ok((staging, baseline))
     }
 
+    /// Promote validated staging artifacts into the live library. Every
+    /// swap is rename-based (staging lives on the same filesystem as the
+    /// root), so each directory is replaced atomically: a failure can never
+    /// leave the live tree deleted-but-half-repopulated, and concurrent
+    /// readers observe either the old or the new version, never a torn one.
     pub fn promote_staging(&self, library_id: &str, job_id: &str) -> Result<(), AppError> {
         let root = self.library_root(library_id)?;
         let staging = root.join("staging").join(job_id);
@@ -54,18 +59,37 @@ impl Storage {
         }
         for entry in LibraryLayout::PROMOTED_DIRS {
             let source = staging.join(entry);
+            if !source.exists() {
+                continue;
+            }
             let destination = root.join(entry);
-            if source.exists() {
-                if destination.exists() {
-                    fs::remove_dir_all(&destination)?;
+            // Park the replaced tree inside this job's staging workspace:
+            // it is invisible to exports and index rebuilds (which never
+            // walk staging) and is removed with the workspace on cleanup.
+            let replaced = staging.join(format!(".replaced-{entry}"));
+            if destination.is_dir() {
+                fs::rename(&destination, &replaced)?;
+            } else if destination.exists() {
+                fs::remove_file(&destination)?;
+            }
+            if let Err(error) = fs::rename(&source, &destination) {
+                // Restore the live tree before reporting the failure.
+                if replaced.exists() {
+                    let _ = fs::rename(&replaced, &destination);
                 }
-                copy_path(&source, &destination)?;
+                return Err(error.into());
+            }
+            if replaced.exists()
+                && let Err(error) = fs::remove_dir_all(&replaced)
+            {
+                tracing::warn!(library_id = %library_id, job_id = %job_id, entry = %entry, %error, "failed to remove replaced tree");
             }
         }
         for entry in LibraryLayout::PROMOTED_FILES {
             let source = staging.join(entry);
             if source.exists() {
-                fs::copy(source, root.join(entry))?;
+                // rename(2) atomically replaces an existing file target.
+                fs::rename(&source, root.join(entry))?;
             }
         }
         Ok(())
@@ -134,7 +158,37 @@ impl Storage {
                 "staging cannot contain library.sqlite".into(),
             ));
         }
-        validate_wiki_nodes(&staging.join("wiki"))
+
+        // Shape of the promoted outputs: every ingest compiles knowledge
+        // nodes, and each output path must be the type promotion swaps in.
+        // Without this an agent that deleted `wiki/` (or replaced it with a
+        // regular file) would pass validation and either report a job
+        // completed that compiled nothing or promote a file over the live
+        // wiki tree.
+        let wiki = staging.join("wiki");
+        if !wiki.is_dir() || !contains_markdown(&wiki)? {
+            return Err(AppError::Storage(
+                "staging has no wiki/ nodes: the ingest compiled no knowledge".into(),
+            ));
+        }
+        for entry in LibraryLayout::PROMOTED_DIRS {
+            let path = staging.join(entry);
+            if path.exists() && !path.is_dir() {
+                return Err(AppError::Storage(format!(
+                    "staging output must be a directory: {entry}"
+                )));
+            }
+        }
+        for entry in LibraryLayout::PROMOTED_FILES {
+            let path = staging.join(entry);
+            if path.exists() && !path.is_file() {
+                return Err(AppError::Storage(format!(
+                    "staging output must be a file: {entry}"
+                )));
+            }
+        }
+
+        validate_wiki_nodes(&wiki)
     }
 
     pub fn cleanup_staging(&self, library_id: &str, job_id: &str) -> Result<(), AppError> {
@@ -223,6 +277,23 @@ fn tree_digest(path: &Path) -> Result<Option<String>, AppError> {
     Ok(Some(hex::encode(hasher.finalize())))
 }
 
+/// Whether the tree contains at least one markdown file.
+fn contains_markdown(root: &Path) -> Result<bool, AppError> {
+    for entry in WalkDir::new(root).follow_links(false) {
+        let entry = entry?;
+        let is_markdown = entry.file_type().is_file()
+            && entry
+                .path()
+                .extension()
+                .and_then(|value| value.to_str())
+                .is_some_and(|value| value.eq_ignore_ascii_case("md"));
+        if is_markdown {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Every `raw/` path some wiki node claims in its `sources` frontmatter —
 /// the set of documents ingestion has already compiled. Used to name the
 /// documents a failed job left behind in `raw/` without nodes, and to tell
@@ -309,7 +380,7 @@ fn frontmatter_mapping(path: &Path) -> Result<Option<yaml_serde::Mapping>, AppEr
     Ok(Some(mapping))
 }
 
-fn validate_wiki_nodes(root: &Path) -> Result<(), AppError> {
+pub(crate) fn validate_wiki_nodes(root: &Path) -> Result<(), AppError> {
     if !root.exists() {
         return Ok(());
     }
@@ -451,7 +522,7 @@ mod tests {
             .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
             .unwrap();
         let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
-        let (_staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
+        let (staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
 
         // A concurrent submission lands in the live raw/ (and a manual edit
         // rewrites purpose.md) while the job runs: validation compares the
@@ -460,6 +531,8 @@ mod tests {
         let root = storage.library_root(&library_id).unwrap();
         fs::write(root.join("raw/late.md"), "# Late arrival").unwrap();
         fs::write(root.join("purpose.md"), "rewritten live").unwrap();
+        // A successful ingest compiled at least one node.
+        fs::write(staging.join("wiki/n.md"), contract_node("")).unwrap();
         storage
             .validate_staging(&library_id, &job.job_id, &baseline)
             .unwrap();
@@ -547,9 +620,29 @@ mod tests {
         assert!(error.to_string().contains("protected path: raw"), "{error}");
         fs::write(staging.join("raw/source.md"), "# Source\n\nBody.").unwrap();
 
-        // Restored byte-for-byte: the digests match again.
+        // Restored byte-for-byte: the digests match again once the ingest's
+        // compiled node is in place.
+        fs::write(staging.join("wiki/n.md"), contract_node("")).unwrap();
         storage
             .validate_staging(&library_id, &job.job_id, &baseline)
             .unwrap();
+
+        // A whole-directory deletion of a promoted output is rejected —
+        // promotion would silently keep the old tree and report success.
+        fs::remove_dir_all(staging.join("wiki")).unwrap();
+        let error = storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap_err();
+        assert!(error.to_string().contains("wiki"), "{error}");
+        fs::create_dir_all(staging.join("wiki")).unwrap();
+        fs::write(staging.join("wiki/n.md"), contract_node("")).unwrap();
+
+        // Replacing a promoted directory with a regular file as well.
+        fs::remove_dir_all(staging.join("wiki")).unwrap();
+        fs::write(staging.join("wiki"), "not a directory").unwrap();
+        let error = storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap_err();
+        assert!(error.to_string().contains("wiki"), "{error}");
     }
 }

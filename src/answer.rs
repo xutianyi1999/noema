@@ -103,24 +103,41 @@ fn contract_validator() -> &'static jsonschema::Validator {
 }
 
 /// Parse the Agent's final answer block into the contract. Tolerates code
-/// fences and stray prose: the payload is the outermost `{...}` span,
-/// validated against the generated schema before decoding.
+/// fences and stray prose: every `{` is tried as a potential object start
+/// and the first span that parses as one complete value wins — prose after
+/// the JSON (even prose containing braces) is ignored, and if several
+/// objects parse, the first one satisfying the contract is used.
 pub(crate) fn parse_agent_answer(block: &str) -> Result<AgentAnswer, AppError> {
-    let start = block
-        .find('{')
-        .ok_or_else(|| AppError::BadRequest("answer contains no JSON object".into()))?;
-    let end = block
-        .rfind('}')
-        .filter(|end| *end > start)
-        .ok_or_else(|| AppError::BadRequest("answer JSON object is never closed".into()))?;
-    // '{' and '}' are ASCII, so the inclusive range is char-boundary safe.
-    let value: serde_json::Value = serde_json::from_str(&block[start..=end])?;
-    if let Err(error) = contract_validator().validate(&value) {
-        return Err(AppError::BadRequest(format!(
-            "answer JSON violates the contract: {error}"
-        )));
+    let mut first_violation: Option<String> = None;
+    let mut cursor = 0;
+    while let Some(offset) = block[cursor..].find('{') {
+        let start = cursor + offset;
+        cursor = start + 1;
+        let Some(Ok(value)) = serde_json::Deserializer::from_str(&block[start..])
+            .into_iter::<serde_json::Value>()
+            .next()
+        else {
+            continue;
+        };
+        if !value.is_object() {
+            continue;
+        }
+        if let Err(error) = contract_validator().validate(&value) {
+            if first_violation.is_none() {
+                first_violation = Some(error.to_string());
+            }
+            continue;
+        }
+        return Ok(serde_json::from_value(value)?);
     }
-    Ok(serde_json::from_value(value)?)
+    match first_violation {
+        Some(error) => Err(AppError::BadRequest(format!(
+            "answer JSON violates the contract: {error}"
+        ))),
+        None => Err(AppError::BadRequest(
+            "answer contains no JSON object".into(),
+        )),
+    }
 }
 
 /// Turn the Agent's raw answer block into the user-facing answer plus
@@ -178,7 +195,14 @@ fn resolve_one(
         tracing::warn!(source = %declaration.source, "citation rejected: not a knowledge path or empty quote");
         return None;
     }
-    let content = match fs::read_to_string(root.join(&declaration.source)) {
+    // Resolve through the canonical path: the agent runs with full
+    // permissions and could plant a symlink under raw/ pointing outside the
+    // library; verification must never read (and "confirm") such a target.
+    let Some(source_path) = crate::references::contained_file(root, &declaration.source) else {
+        tracing::warn!(source = %declaration.source, "citation rejected: source escapes the library or is missing");
+        return None;
+    };
+    let content = match fs::read_to_string(&source_path) {
         Ok(content) => content,
         Err(error) => {
             tracing::warn!(source = %declaration.source, %error, "citation rejected: unreadable source");
@@ -369,6 +393,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_contract_json_followed_by_prose_with_braces() {
+        // Trailing prose with braces used to extend the naive `{...}` span
+        // past the JSON and break the parse.
+        let block = r#"{"answer":"结论","references":[]} 如需引用见附录{一}"#;
+        assert_eq!(parse_agent_answer(block).unwrap().answer, "结论");
+    }
+
+    #[test]
+    fn picks_the_first_contract_object_when_non_contract_json_precedes_it() {
+        let block = r#"示例 {"foo":1} 真答案 {"answer":"正文","references":[]}"#;
+        assert_eq!(parse_agent_answer(block).unwrap().answer, "正文");
+    }
+
+    #[test]
     fn resolves_quote_to_offsets_lines_title_and_node() {
         let tmp = fixture();
         let quote = "当事人在保证合同中约定保证人与债务人对债务承担连带责任的,为连带责任保证。";
@@ -436,6 +474,24 @@ mod tests {
             end: None,
         };
         assert!(resolve_references(tmp.path(), std::slice::from_ref(&unsafe_path)).is_empty());
+    }
+
+    /// The agent runs with full permissions and could plant a link under
+    /// raw/ pointing outside the library; verification must not read (and
+    /// thereby "confirm") its target.
+    #[test]
+    #[cfg(unix)]
+    fn drops_citations_whose_source_is_a_symlink_escaping_the_library() {
+        let tmp = fixture();
+        std::os::unix::fs::symlink("/etc/passwd", tmp.path().join("raw/evil")).unwrap();
+        let declaration = AgentReference {
+            source: "raw/evil".into(),
+            quote: "root".into(),
+            locator: None,
+            start: None,
+            end: None,
+        };
+        assert!(resolve_references(tmp.path(), std::slice::from_ref(&declaration)).is_empty());
     }
 
     #[test]
