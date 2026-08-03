@@ -11,7 +11,7 @@ use opencode_rs::{
     },
 };
 use serde::Serialize;
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout_at};
 
 use crate::{config::Config, error::AppError, transcript::Transcript};
 
@@ -110,20 +110,22 @@ impl OpenCodeAgent {
             system: None,
             variant: None,
         };
-        // Fire-and-forget: the synchronous `prompt` endpoint blocks until the
-        // whole turn completes, so nothing on the already-open subscription
-        // would be consumed (or rendered by the live transcript) until the
-        // very end. `prompt_async` returns immediately and the turn streams
-        // over the session subscription, which is also what lets the timeout
-        // below cover the actual agent work.
-        client.messages().prompt_async(session_id, &prompt).await?;
+        // One deadline for the whole turn: firing the prompt and collecting
+        // the streamed answer are both agent work, so both count against the
+        // configured session timeout. (A stalled `prompt_async` used to be
+        // bounded only by the HTTP client timeout, doubling the worst case.)
+        let deadline = Instant::now() + Duration::from_secs(self.config.opencode_timeout_secs);
+        let turn = async {
+            // Fire-and-forget: the synchronous `prompt` endpoint blocks until
+            // the whole turn completes, so nothing on the already-open
+            // subscription would be consumed (or rendered by the live
+            // transcript) until the very end. `prompt_async` returns
+            // immediately and the turn streams over the session subscription.
+            client.messages().prompt_async(session_id, &prompt).await?;
+            collect_events(&mut subscription, &mut transcript).await
+        };
 
-        let collected = match timeout(
-            Duration::from_secs(self.config.opencode_timeout_secs),
-            collect_events(&mut subscription, &mut transcript),
-        )
-        .await
-        {
+        let collected = match timeout_at(deadline, turn).await {
             Ok(collected) => collected?,
             Err(_) => return Err(AppError::Runtime("OpenCode session timed out".into())),
         };
@@ -202,18 +204,36 @@ impl CollectedEvents {
 }
 
 /// The query prompt asks the model to wrap its final answer in these
-/// markers. When a complete pair is present, the content of the last pair is
-/// the answer (marker-free even if the same message also contains narration);
-/// otherwise callers fall back to the raw last-message text, so models that
-/// skip the markers degrade gracefully instead of failing.
-const ANSWER_OPEN: &str = "<noema-answer>";
-const ANSWER_CLOSE: &str = "</noema-answer>";
+/// markers. When a complete pair is present, its content is the answer
+/// (marker-free even if the same message also contains narration); otherwise
+/// callers fall back to the raw last-message text, so models that skip the
+/// markers degrade gracefully instead of failing.
+pub(crate) const ANSWER_OPEN: &str = "<noema-answer>";
+pub(crate) const ANSWER_CLOSE: &str = "</noema-answer>";
 
 fn extract_marked_answer(text: &str) -> Option<String> {
-    let close = text.rfind(ANSWER_CLOSE)?;
-    let open = text[..close].rfind(ANSWER_OPEN)?;
-    let inner = text[open + ANSWER_OPEN.len()..close].trim();
-    (!inner.is_empty()).then(|| inner.to_string())
+    // Scan closing markers right to left. The answer JSON itself may quote a
+    // `</noema-answer>` marker, so the rightmost close is not necessarily the
+    // protocol's: prefer the first span (from its matching open marker) that
+    // parses as JSON, keeping the rightmost complete pair as the fallback
+    // for non-JSON answers.
+    let mut search = text;
+    let mut fallback = None;
+    while let Some(close) = search.rfind(ANSWER_CLOSE) {
+        if let Some(open) = search[..close].rfind(ANSWER_OPEN) {
+            let inner = search[open + ANSWER_OPEN.len()..close].trim();
+            if !inner.is_empty() {
+                if fallback.is_none() {
+                    fallback = Some(inner.to_string());
+                }
+                if serde_json::from_str::<serde_json::Value>(inner).is_ok() {
+                    return Some(inner.to_string());
+                }
+            }
+        }
+        search = &search[..close];
+    }
+    fallback
 }
 
 /// Which streamed field a part delta carries.
@@ -347,6 +367,14 @@ mod tests {
             extract_marked_answer("<noema-answer>  </noema-answer>"),
             None
         );
+    }
+
+    #[test]
+    fn marked_answer_extraction_recovers_json_quoting_a_close_marker() {
+        let text = r#"<noema-answer>{"answer":"see </noema-answer> for details","references":[]}</noema-answer>"#;
+        let extracted = extract_marked_answer(text).unwrap();
+        assert!(serde_json::from_str::<serde_json::Value>(&extracted).is_ok());
+        assert!(extracted.contains("for details"));
     }
 
     fn props(field: Option<&str>, part: Option<Part>) -> MessagePartEventProps {

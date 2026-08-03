@@ -145,6 +145,9 @@ pub struct SubmitDocumentResponse {
     pub library_id: String,
     pub job_id: String,
     pub document_path: Option<String>,
+    /// `true` only for the genuine no-op: identical content already
+    /// compiled into wiki nodes. A resubmission of content a failed job
+    /// left uncompiled reports `false` — it runs a real ingestion.
     pub duplicate: bool,
 }
 
@@ -267,7 +270,12 @@ pub struct JobStatus {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: &'static str,
-    pub data_dir: String,
-    pub opencode_url: String,
-    pub configured_model: String,
+    /// Server internals, reported only when the probe is authorized (or the
+    /// API runs without authentication); absent from open probes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_dir: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub opencode_url: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub configured_model: Option<String>,
 }

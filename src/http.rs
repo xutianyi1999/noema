@@ -9,7 +9,7 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, Query, Request, State},
-    http::{StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     middleware,
     response::Response,
     routing::{get, post},
@@ -18,6 +18,7 @@ use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
+use tokio::io::AsyncReadExt;
 use tokio_util::io::{ReaderStream, StreamReader};
 
 use crate::{
@@ -110,8 +111,28 @@ mod tests {
     }
 }
 
-async fn health<R: OpenCodeRuntime>(State(service): State<AppService<R>>) -> Json<HealthResponse> {
-    Json(service.health())
+async fn health<R: OpenCodeRuntime>(
+    State(service): State<AppService<R>>,
+    headers: HeaderMap,
+) -> Json<HealthResponse> {
+    Json(service.health(probe_carries_the_token(&service, &headers)))
+}
+
+/// The health probe stays open to unauthenticated orchestrators; server
+/// internals (data directory, OpenCode URL) only travel with it when the API
+/// itself runs open or the probe carries the configured token.
+fn probe_carries_the_token<R: OpenCodeRuntime>(
+    service: &AppService<R>,
+    headers: &HeaderMap,
+) -> bool {
+    match service.auth_token() {
+        None => true,
+        Some(expected) => headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|candidate| tokens_match(candidate, expected)),
+    }
 }
 
 async fn create_library<R: OpenCodeRuntime>(
@@ -168,6 +189,12 @@ struct ImportQuery {
     description: Option<String>,
 }
 
+/// Upper bound for one snapshot upload. Snapshots are libraries of plain
+/// text, so this only fences off abuse (disk-fill uploads); real imports
+/// stay far below it. Decompression is bounded separately inside
+/// [`crate::snapshot`] (gzip bombs compress small).
+const MAX_IMPORT_UPLOAD: u64 = 512 * 1024 * 1024;
+
 /// Import a snapshot archive (request body) as a brand-new, fully isolated
 /// library. Same semantics as `noema-cli import`: always a fresh library,
 /// full rollback on failure, hostile archives rejected.
@@ -177,19 +204,27 @@ async fn import_library<R: OpenCodeRuntime>(
     request: Request,
 ) -> Result<(StatusCode, Json<Library>), AppError> {
     // Stream the upload into a scratch archive on disk — no in-memory
-    // buffering; the NamedTempFile is deleted on drop.
+    // buffering; the NamedTempFile is deleted on drop. The `.take` ceiling
+    // bounds disk fill; one extra byte distinguishes "at the limit" from
+    // "over the limit".
     let temp = tempfile::NamedTempFile::new()?;
     let mut reader = StreamReader::new(
         request
             .into_body()
             .into_data_stream()
             .map_err(io::Error::other),
-    );
+    )
+    .take(MAX_IMPORT_UPLOAD + 1);
     let mut file = tokio::fs::File::from_std(temp.as_file().try_clone()?);
     tokio::io::copy(&mut reader, &mut file)
         .await
         .map_err(|error| AppError::BadRequest(format!("failed reading the upload: {error}")))?;
     drop(file);
+    if temp.as_file().metadata()?.len() > MAX_IMPORT_UPLOAD {
+        return Err(AppError::BadRequest(format!(
+            "snapshot upload exceeds the {MAX_IMPORT_UPLOAD}-byte limit"
+        )));
+    }
 
     let data_dir = service.data_dir().to_path_buf();
     let imported = tokio::task::spawn_blocking(move || {
@@ -237,12 +272,20 @@ async fn knowledge_file<R: OpenCodeRuntime>(
     Path((library_id, path)): Path<(String, String)>,
 ) -> Result<Response, AppError> {
     let resolved = service.knowledge_file(&library_id, &path)?;
-    let metadata = tokio::fs::metadata(&resolved).await?;
+    // The file passed containment a moment ago; anything failing now (e.g.
+    // deleted mid-request) is the same 404 as any absent path — and never an
+    // error body carrying the resolved absolute path.
+    let not_found = || AppError::FileNotFound(path.clone());
+    let metadata = tokio::fs::metadata(&resolved)
+        .await
+        .map_err(|_| not_found())?;
     let content_type = match resolved.extension().and_then(|value| value.to_str()) {
         Some("md") => "text/markdown; charset=utf-8",
         _ => "text/plain; charset=utf-8",
     };
-    let file = tokio::fs::File::open(&resolved).await?;
+    let file = tokio::fs::File::open(&resolved)
+        .await
+        .map_err(|_| not_found())?;
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, metadata.len())

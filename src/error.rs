@@ -58,13 +58,18 @@ struct ErrorBody {
 
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
-        (
-            self.status_code(),
-            Json(ErrorBody {
-                error: self.to_string(),
-            }),
-        )
-            .into_response()
+        let status = self.status_code();
+        // Infrastructure errors carry filesystem and database details
+        // (absolute paths, SQL) that clients never need: log the real cause
+        // server-side, report an opaque body.
+        let message = match &self {
+            Self::Io(_) | Self::Sqlite(_) => {
+                tracing::error!(error = %self, "request failed");
+                "internal server error".to_string()
+            }
+            other => other.to_string(),
+        };
+        (status, Json(ErrorBody { error: message })).into_response()
     }
 }
 

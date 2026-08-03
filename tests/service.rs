@@ -23,30 +23,63 @@ use tower::ServiceExt;
 
 mod common;
 
+/// A test hook fired at the start of every session, letting a test perturb
+/// the library mid-run (e.g. simulate a concurrent submission).
+type SessionHook = Box<dyn Fn(&AgentRunRequest) + Send + Sync>;
+
 #[derive(Default)]
 struct FakeRuntime {
     next_session: AtomicUsize,
     requests: Mutex<Vec<AgentRunRequest>>,
+    /// Remaining ingest sessions to fail with a runtime error. Only ingest
+    /// sessions consume the counter; queries pass through untouched.
+    fail_next_ingests: AtomicUsize,
+    /// Fired at the start of every session, ingest and query alike, with
+    /// the request about to run; callbacks filter on the title themselves.
+    on_session: Mutex<Option<SessionHook>>,
 }
 
 impl OpenCodeRuntime for FakeRuntime {
     async fn run_new_session(&self, request: AgentRunRequest) -> Result<AgentRunResult, AppError> {
+        if let Some(hook) = self.on_session.lock().unwrap().as_ref() {
+            hook(&request);
+        }
         let number = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
         let session_id = format!("fake-session-{number}");
         let is_ingest = request.title.contains("ingestion");
         self.requests.lock().unwrap().push(request.clone());
-        let source = fs::read_dir(request.workdir.join("raw"))
+        // Failure injection: consume one pending failure per ingest session,
+        // after recording the request and before writing any artifact.
+        if is_ingest {
+            let should_fail = self
+                .fail_next_ingests
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |pending| {
+                    pending.checked_sub(1)
+                })
+                .is_ok();
+            if should_fail {
+                return Err(AppError::Runtime("injected ingestion failure".into()));
+            }
+        }
+        let mut sources = fs::read_dir(request.workdir.join("raw"))
             .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .file_name()
-            .to_string_lossy()
-            .to_string();
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        sources.sort();
+        let source = sources[0].clone();
 
         if is_ingest {
+            // Every raw/ document becomes a source of the one node, so a
+            // completed ingest deterministically compiles the whole library
+            // regardless of directory iteration order.
+            let mut node_sources = String::new();
+            let mut evidence = String::new();
+            for name in &sources {
+                node_sources.push_str(&format!("  - path: raw/{name}\n"));
+                evidence.push_str(&format!("- raw/{name}\n"));
+            }
             let node = format!(
-                "---\nnode_id: session-context\ncanonical_name: Session Context\nkind: concept\nsources:\n  - path: raw/{source}\nrelations:\n  depends_on: []\n  related_to: []\n  opposite_to: []\nclaim_type: observed\nconfidence: 1.0\ncreated_at: 2026-08-01T00:00:00Z\nupdated_at: 2026-08-01T00:00:00Z\n---\n\n# Session Context\n\nA test knowledge node.\n\n## Evidence\n\n- raw/{source}\n"
+                "---\nnode_id: session-context\ncanonical_name: Session Context\nkind: concept\nsources:\n{node_sources}relations:\n  depends_on: []\n  related_to: []\n  opposite_to: []\nclaim_type: observed\nconfidence: 1.0\ncreated_at: 2026-08-01T00:00:00Z\nupdated_at: 2026-08-01T00:00:00Z\n---\n\n# Session Context\n\nA test knowledge node.\n\n## Evidence\n\n{evidence}"
             );
             fs::write(request.workdir.join("wiki/session-context.md"), node).unwrap();
             fs::write(
@@ -591,4 +624,162 @@ async fn http_and_streamable_http_mcp_are_mounted() {
     assert!(body.contains("\"id\":1"));
     assert!(body.contains("\"capabilities\""));
     assert!(body.contains("\"tools\""));
+}
+
+#[tokio::test]
+async fn a_submission_landing_mid_ingest_no_longer_fails_validation() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "并发落盘库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let root = PathBuf::from(&library.root);
+    // While this job's session runs, a document lands in the live raw/ —
+    // exactly what a concurrent submission does. Validation must compare
+    // the staging copy against its preparation baseline, not the live root.
+    *runtime.on_session.lock().unwrap() = Some(Box::new(|request| {
+        if !request.title.contains("ingestion") {
+            return;
+        }
+        let late = request
+            .workdir
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("raw/late.md");
+        fs::write(late, "# Late arrival\n\nSubmitted mid-run.").unwrap();
+    }));
+
+    let submitted = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "source.md".into(),
+                content: "# Session Context\n\nTest source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
+    assert_eq!(status.status, JobState::Completed, "{status:?}");
+    assert!(root.join("raw/late.md").is_file());
+}
+
+#[tokio::test]
+async fn a_job_that_failed_before_promotion_is_recompiled_by_the_next_ingest() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "补编译库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    runtime.fail_next_ingests.store(1, Ordering::SeqCst);
+
+    let first = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "doc1.md".into(),
+                content: "# One\n\nFirst source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    let first_status = wait_for_completion(&service, &library.id, &first.job_id).await;
+    assert_eq!(first_status.status, JobState::Failed, "{first_status:?}");
+
+    let second = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "doc2.md".into(),
+                content: "# Two\n\nSecond source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    let second_status = wait_for_completion(&service, &library.id, &second.job_id).await;
+    assert_eq!(
+        second_status.status,
+        JobState::Completed,
+        "{second_status:?}"
+    );
+
+    // The failed job left doc1 in raw/ without any node: the second job's
+    // prompt names it alongside the new document so it gets compiled too.
+    let prompts: Vec<String> = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.title.contains("ingestion"))
+        .map(|request| request.prompt.clone())
+        .collect();
+    assert_eq!(prompts.len(), 2);
+    assert!(prompts[1].contains("raw/doc1.md"), "{}", prompts[1]);
+    assert!(prompts[1].contains("raw/doc2.md"), "{}", prompts[1]);
+}
+
+#[tokio::test]
+async fn an_uncompiled_duplicate_is_reingested_instead_of_skipped() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "重复补摄入库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    runtime.fail_next_ingests.store(1, Ordering::SeqCst);
+    let document = DocumentInput {
+        filename: "source.md".into(),
+        content: "# Session Context\n\nTest source.".into(),
+        title: None,
+    };
+
+    let first = service
+        .submit_document(&library.id, document.clone())
+        .await
+        .unwrap();
+    assert!(!first.duplicate);
+    let first_status = wait_for_completion(&service, &library.id, &first.job_id).await;
+    assert_eq!(first_status.status, JobState::Failed, "{first_status:?}");
+
+    // Same content again: dedupe sees a duplicate, but no wiki node
+    // references it, so the submission runs a real ingestion instead of
+    // skipping.
+    let second = service
+        .submit_document(&library.id, document.clone())
+        .await
+        .unwrap();
+    assert!(!second.duplicate);
+    let second_status = wait_for_completion(&service, &library.id, &second.job_id).await;
+    assert_eq!(
+        second_status.status,
+        JobState::Completed,
+        "{second_status:?}"
+    );
+
+    // The node exists now: the third submission is the genuine no-op skip.
+    let third = service
+        .submit_document(&library.id, document)
+        .await
+        .unwrap();
+    assert!(third.duplicate);
+    assert_eq!(
+        service
+            .job_status(&library.id, &third.job_id)
+            .unwrap()
+            .status,
+        JobState::Skipped
+    );
 }

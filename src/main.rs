@@ -81,6 +81,15 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     if cli.max_sessions == 0 {
         return Err("--max-sessions must be at least 1".into());
     }
+    if cli.opencode_timeout_secs == 0 {
+        return Err("--opencode-timeout-secs must be at least 1".into());
+    }
+    if cli.auth_token.as_deref() == Some("") {
+        return Err(
+            "--auth-token must not be empty: an empty token would authenticate empty bearer headers"
+                .into(),
+        );
+    }
     let bind = cli.bind;
     if !bind.ip().is_loopback() && cli.auth_token.is_none() {
         tracing::warn!(

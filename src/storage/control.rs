@@ -1,7 +1,10 @@
 //! Control-plane persistence: libraries, ingestion jobs and query runs in
 //! control.sqlite.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use chrono::Utc;
 use rusqlite::{OptionalExtension, params};
@@ -62,12 +65,25 @@ impl Storage {
                 library.created_at.to_rfc3339(),
             ],
         );
-        if let Err(error) = result {
-            let _ = fs::remove_dir_all(&root);
-            return Err(error.into());
+        match result {
+            Ok(_) => Ok(library),
+            // Lost the name race against a concurrent creator (the pre-check
+            // above is not atomic with this INSERT): its row and directory
+            // are the real ones now. Report the conflict WITHOUT removing
+            // the directory — that would destroy the winner's library.
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                Err(AppError::Conflict(format!(
+                    "a library named {} already exists",
+                    library.name
+                )))
+            }
+            Err(error) => {
+                let _ = fs::remove_dir_all(&root);
+                Err(error.into())
+            }
         }
-
-        Ok(library)
     }
 
     pub fn get_library(&self, library_id: &str) -> Result<Library, AppError> {
@@ -90,8 +106,9 @@ impl Storage {
             )
             .optional()?;
         let mut library = row.ok_or_else(|| AppError::LibraryNotFound(library_id.into()))?;
-        let expected_root = fs::canonicalize(self.root.join("libraries").join(library_id))?;
-        let actual_root = fs::canonicalize(&library.root)?;
+        let expected_root =
+            canonicalize_library_path(&self.root.join("libraries").join(library_id), library_id)?;
+        let actual_root = canonicalize_library_path(Path::new(&library.root), library_id)?;
         if actual_root != expected_root {
             return Err(AppError::Storage(format!(
                 "library root is outside its registered content-library path: {library_id}"
@@ -103,6 +120,25 @@ impl Storage {
 
     pub fn library_root(&self, library_id: &str) -> Result<PathBuf, AppError> {
         Ok(PathBuf::from(self.get_library(library_id)?.root))
+    }
+
+    /// Fail every job and query run a previous server process left in
+    /// `running`: this process has run nothing yet, so they were interrupted
+    /// by its shutdown or crash, and nothing else would ever transition them
+    /// out of that state. Runs at startup, before staging reconciliation.
+    pub fn reap_interrupted_runs(&self) -> Result<(), AppError> {
+        const INTERRUPTED: &str = "interrupted by server restart";
+        let now = Utc::now().to_rfc3339();
+        let connection = self.db()?;
+        connection.execute(
+            "UPDATE jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE status = ?4",
+            params![JobState::Failed, INTERRUPTED, now, JobState::Running],
+        )?;
+        connection.execute(
+            "UPDATE query_runs SET status = ?1, error = ?2, updated_at = ?3 WHERE status = ?4",
+            params![JobState::Failed, INTERRUPTED, now, JobState::Running],
+        )?;
+        Ok(())
     }
 
     pub fn list_libraries(&self) -> Result<Vec<Library>, AppError> {
@@ -278,18 +314,140 @@ fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobStatus> {
 /// Library ids are the library names themselves (legacy ids with a random
 /// suffix remain valid), so the id character set is whatever is safe as a
 /// single directory-name component: non-empty, within the filesystem's
-/// 255-byte limit, no path separators, control characters or dot-names.
-/// Unicode letters and digits — CJK names included — are allowed; URLs
-/// travel percent-encoded and SQLite keys are plain TEXT.
+/// 255-byte limit, no path separators, control characters, dot-names or
+/// double quotes (the id travels inside a quoted Content-Disposition
+/// `filename` parameter on export). Unicode letters and digits — CJK names
+/// included — are allowed; URLs travel percent-encoded and SQLite keys are
+/// plain TEXT.
 fn validate_library_id(value: &str) -> Result<(), AppError> {
     let invalid = value.is_empty()
         || value.len() > 255
         || matches!(value, "." | "..")
         || value
             .chars()
-            .any(|character| character.is_control() || matches!(character, '/' | '\\'));
+            .any(|character| character.is_control() || matches!(character, '/' | '\\' | '"'));
     if invalid {
         return Err(AppError::BadRequest("invalid library_id".into()));
     }
     Ok(())
+}
+
+/// Canonicalize one library path, reporting a library whose directory is
+/// gone as `LibraryNotFound` (404) rather than a raw I/O error (500): a
+/// library without its tree is functionally absent.
+fn canonicalize_library_path(path: &Path, library_id: &str) -> Result<PathBuf, AppError> {
+    fs::canonicalize(path).map_err(|error| match error.kind() {
+        std::io::ErrorKind::NotFound => AppError::LibraryNotFound(library_id.into()),
+        _ => AppError::Io(error),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{CreateLibraryRequest, JobKind};
+
+    fn fixture() -> (tempfile::TempDir, Storage) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        (tmp, storage)
+    }
+
+    #[test]
+    fn create_library_conflict_never_touches_the_existing_library() {
+        let (_tmp, storage) = fixture();
+        let original = storage
+            .create_library(&CreateLibraryRequest {
+                name: "法规库".into(),
+                description: None,
+            })
+            .unwrap();
+        // Force the INSERT constraint path past the name pre-check: rename
+        // the existing row, then recreate under the original name — the id
+        // (and therefore the directory) collides on the PRIMARY KEY, which
+        // is exactly where the concurrent-creator race lands.
+        storage
+            .db()
+            .unwrap()
+            .execute(
+                "UPDATE libraries SET name = 'renamed' WHERE id = '法规库'",
+                [],
+            )
+            .unwrap();
+        let conflict = storage.create_library(&CreateLibraryRequest {
+            name: "法规库".into(),
+            description: None,
+        });
+        assert!(
+            matches!(conflict, Err(AppError::Conflict(_))),
+            "{conflict:?}"
+        );
+        // The winner's directory survived the loser's rollback.
+        let library = storage.get_library("法规库").unwrap();
+        assert_eq!(library.root, original.root);
+        assert!(
+            PathBuf::from(&library.root)
+                .join("library.sqlite")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn reap_interrupted_runs_fails_rows_left_running_by_a_dead_process() {
+        let (_tmp, storage) = fixture();
+        let library = storage
+            .create_library(&CreateLibraryRequest {
+                name: "回收库".into(),
+                description: None,
+            })
+            .unwrap();
+        let interrupted = storage.create_job(&library.id, JobKind::Ingest).unwrap();
+        storage
+            .update_job(
+                &library.id,
+                &interrupted.job_id,
+                JobState::Running,
+                None,
+                None,
+            )
+            .unwrap();
+        let finished = storage.create_job(&library.id, JobKind::Ingest).unwrap();
+        storage
+            .update_job(
+                &library.id,
+                &finished.job_id,
+                JobState::Completed,
+                None,
+                None,
+            )
+            .unwrap();
+        let query_id = storage.record_query(&library.id).unwrap();
+
+        storage.reap_interrupted_runs().unwrap();
+
+        let interrupted = storage.get_job(&library.id, &interrupted.job_id).unwrap();
+        assert_eq!(interrupted.status, JobState::Failed);
+        assert_eq!(
+            interrupted.error.as_deref(),
+            Some("interrupted by server restart")
+        );
+        assert_eq!(
+            storage
+                .get_job(&library.id, &finished.job_id)
+                .unwrap()
+                .status,
+            JobState::Completed
+        );
+        let (status, error): (JobState, Option<String>) = storage
+            .db()
+            .unwrap()
+            .query_row(
+                "SELECT status, error FROM query_runs WHERE id = ?1",
+                params![query_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, JobState::Failed);
+        assert_eq!(error.as_deref(), Some("interrupted by server restart"));
+    }
 }

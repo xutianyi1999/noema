@@ -1,6 +1,6 @@
 //! Content-library persistence: the control-plane database (libraries,
 //! jobs, query runs) plus each library's on-disk tree and per-library
-//! database (documents, node registry, full-text index).
+//! database (documents, full-text index).
 //!
 //! The `Storage` impl is split across submodules by concern: `control`
 //! (control-plane CRUD), `documents` (per-library document store, derived
@@ -26,6 +26,7 @@ mod layout;
 mod staging;
 
 pub(crate) use fsutil::copy_path;
+pub(crate) use staging::referenced_sources;
 
 use crate::error::AppError;
 
@@ -58,6 +59,7 @@ impl Storage {
         fs::create_dir_all(root.join("jobs"))?;
         let root = fs::canonicalize(root)?;
         let connection = Connection::open(root.join("control.sqlite"))?;
+        connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
             "
             PRAGMA foreign_keys = ON;

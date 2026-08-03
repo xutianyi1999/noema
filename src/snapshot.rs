@@ -5,7 +5,7 @@
 //! library: the raw sources, compiled wiki nodes (LLM-WIKI contract),
 //! reviews, graphify artifacts, the `.opencode` project (skills/plugins),
 //! the derived index and the per-library SQLite database (dedupe records,
-//! node registry, content FTS). Importing a snapshot always creates a
+//! content FTS). Importing a snapshot always creates a
 //! brand-new, fully isolated library — fresh id, fresh root directory,
 //! fresh control-plane row. Libraries never share files and never
 //! cross-reference each other, so a base "regulation library" can be
@@ -103,7 +103,7 @@ fn import_inner(
 ) -> Result<Library, AppError> {
     let file = fs::File::open(archive_path)?;
     let mut archive = Archive::new(GzDecoder::new(BufReader::new(file)));
-    unpack_validated(&mut archive, scratch)?;
+    unpack_validated(&mut archive, scratch, MAX_UNPACKED_BYTES)?;
 
     let manifest = read_snapshot_manifest(scratch)?;
     let had_opencode = scratch.join(".opencode").is_dir();
@@ -206,10 +206,21 @@ fn is_excluded(relative: &Path) -> bool {
     false
 }
 
+/// Cumulative unpacked-size ceiling for one snapshot, independent of the
+/// HTTP upload cap: a small gzip archive can decompress to terabytes (gzip
+/// bomb), so the decompressed byte count is bounded in its own right.
+const MAX_UNPACKED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
 /// Unpack an archive into `destination`, rejecting every entry that is not a
 /// plain relative path to a regular file or directory: absolute paths, `..`
 /// components, symbolic links and hard links all fail the import outright.
-fn unpack_validated<R: Read>(archive: &mut Archive<R>, destination: &Path) -> Result<(), AppError> {
+/// `max_unpacked` bounds the cumulative decompressed size.
+fn unpack_validated<R: Read>(
+    archive: &mut Archive<R>,
+    destination: &Path,
+    max_unpacked: u64,
+) -> Result<(), AppError> {
+    let mut unpacked: u64 = 0;
     for entry in archive.entries()? {
         let mut entry = entry?;
         let entry_type = entry.header().entry_type();
@@ -232,7 +243,12 @@ fn unpack_validated<R: Read>(archive: &mut Archive<R>, destination: &Path) -> Re
                     fs::create_dir_all(parent)?;
                 }
                 let mut file = fs::File::create(&target)?;
-                io::copy(&mut entry, &mut file)?;
+                unpacked += io::copy(&mut entry, &mut file)?;
+                if unpacked > max_unpacked {
+                    return Err(AppError::BadRequest(format!(
+                        "snapshot unpacks to more than {max_unpacked} bytes"
+                    )));
+                }
             }
             other => {
                 return Err(AppError::BadRequest(format!(
@@ -405,24 +421,25 @@ mod tests {
     }
 
     /// The `tar` crate's own builder refuses `..` paths, but archives from
-    /// other tools (GNU tar, python tarfile) may contain them. Craft a raw
-    /// 512-byte POSIX header to prove unpack validation rejects those too.
-    fn malicious_archive_bytes(path: &str, payload: &[u8]) -> Vec<u8> {
-        let mut header = [0u8; 512];
-        header[..path.len()].copy_from_slice(path.as_bytes());
-        header[100..108].copy_from_slice(b"0000644\0");
-        header[124..136].copy_from_slice(format!("{:011o}\0", payload.len()).as_bytes());
-        header[156] = b'0'; // regular file
-        header[257..263].copy_from_slice(b"ustar\0");
-        header[263..265].copy_from_slice(b"00");
-        header[148..156].copy_from_slice(b"        "); // checksum field as spaces
-        let checksum: u32 = header.iter().map(|&byte| u32::from(byte)).sum();
-        header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
-
+    /// other tools (GNU tar, python tarfile) may contain them. Craft raw
+    /// 512-byte POSIX headers to prove unpack validation rejects those too.
+    fn archive_bytes(entries: &[(&str, &[u8])]) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend_from_slice(&header);
-        bytes.extend_from_slice(payload);
-        bytes.extend(std::iter::repeat_n(0u8, (512 - payload.len() % 512) % 512));
+        for (path, payload) in entries {
+            let mut header = [0u8; 512];
+            header[..path.len()].copy_from_slice(path.as_bytes());
+            header[100..108].copy_from_slice(b"0000644\0");
+            header[124..136].copy_from_slice(format!("{:011o}\0", payload.len()).as_bytes());
+            header[156] = b'0'; // regular file
+            header[257..263].copy_from_slice(b"ustar\0");
+            header[263..265].copy_from_slice(b"00");
+            header[148..156].copy_from_slice(b"        "); // checksum field as spaces
+            let checksum: u32 = header.iter().map(|&byte| u32::from(byte)).sum();
+            header[148..156].copy_from_slice(format!("{checksum:06o}\0 ").as_bytes());
+            bytes.extend_from_slice(&header);
+            bytes.extend_from_slice(payload);
+            bytes.extend(std::iter::repeat_n(0u8, (512 - payload.len() % 512) % 512));
+        }
         bytes.extend_from_slice(&[0u8; 1024]); // end-of-archive marker
         bytes
     }
@@ -430,11 +447,25 @@ mod tests {
     #[test]
     fn unpack_rejects_dotdot_entries_from_foreign_archives() {
         let scratch = tempfile::tempdir().unwrap();
-        let bytes = malicious_archive_bytes("../evil.md", b"pwned");
+        let bytes = archive_bytes(&[("../evil.md", &b"pwned"[..])]);
         let mut archive = Archive::new(&bytes[..]);
-        let error = unpack_validated(&mut archive, scratch.path()).unwrap_err();
+        let error = unpack_validated(&mut archive, scratch.path(), MAX_UNPACKED_BYTES).unwrap_err();
         assert!(error.to_string().contains("escapes"), "{error}");
         assert!(!scratch.path().parent().unwrap().join("evil.md").exists());
+    }
+
+    #[test]
+    fn unpack_rejects_archives_that_expand_past_the_ceiling() {
+        let scratch = tempfile::tempdir().unwrap();
+        let first = b"x".repeat(60);
+        let second = b"y".repeat(60);
+        let bytes = archive_bytes(&[("one.md", first.as_slice()), ("two.md", second.as_slice())]);
+        let mut archive = Archive::new(&bytes[..]);
+        let error = unpack_validated(&mut archive, scratch.path(), 100).unwrap_err();
+        assert!(
+            error.to_string().contains("unpacks to more than"),
+            "{error}"
+        );
     }
 
     #[test]

@@ -131,9 +131,19 @@ pub(crate) fn present_answer(root: &Path, block: &str) -> (String, Vec<Reference
         }
         Err(error) => {
             tracing::warn!(%error, "answer is not valid contract JSON; returning it without references");
-            (block.to_string(), Vec::new())
+            (strip_answer_markers(block), Vec::new())
         }
     }
+}
+
+/// The degradation path must not leak the marker protocol into user-facing
+/// text (an agent may emit a dangling open marker and no JSON at all).
+fn strip_answer_markers(block: &str) -> String {
+    block
+        .replace(crate::runtime::ANSWER_OPEN, "")
+        .replace(crate::runtime::ANSWER_CLOSE, "")
+        .trim()
+        .to_string()
 }
 
 /// Resolve the Agent's declared citations against the library at `root`.
@@ -478,6 +488,15 @@ mod tests {
         let tmp = fixture();
         let (answer, references) = present_answer(tmp.path(), "不是契约 JSON 的散文答案。");
         assert_eq!(answer, "不是契约 JSON 的散文答案。");
+        assert!(references.is_empty());
+    }
+
+    #[test]
+    fn degraded_answer_never_leaks_the_marker_protocol() {
+        let tmp = fixture();
+        let (answer, references) =
+            present_answer(tmp.path(), "<noema-answer>散文答案，收尾标记丢了");
+        assert_eq!(answer, "散文答案，收尾标记丢了");
         assert!(references.is_empty());
     }
 }

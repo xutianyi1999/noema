@@ -4,17 +4,29 @@
 //! library root.
 
 use std::{
+    collections::{BTreeMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
 
+use sha2::{Digest, Sha256};
 use walkdir::WalkDir;
 
 use super::{Storage, fsutil::copy_path, layout::LibraryLayout};
 use crate::{error::AppError, models::JobState};
 
 impl Storage {
-    pub fn prepare_staging(&self, library_id: &str, job_id: &str) -> Result<PathBuf, AppError> {
+    /// Copy the library's knowledge inputs into `staging/{job_id}` and
+    /// capture the protected-path baseline validation compares against.
+    /// The baseline comes from the staging copy itself, not the live root:
+    /// submissions keep landing in the live `raw/` while a job runs
+    /// (document upload is not gated by the ingest lock), and those must
+    /// read as baseline matches rather than tampering.
+    pub fn prepare_staging(
+        &self,
+        library_id: &str,
+        job_id: &str,
+    ) -> Result<(PathBuf, StagingBaseline), AppError> {
         let root = self.library_root(library_id)?;
         let staging = root.join("staging").join(job_id);
         if staging.exists() {
@@ -28,7 +40,8 @@ impl Storage {
                 copy_path(&source, &destination)?;
             }
         }
-        Ok(staging)
+        let baseline = StagingBaseline::capture(&staging)?;
+        Ok((staging, baseline))
     }
 
     pub fn promote_staging(&self, library_id: &str, job_id: &str) -> Result<(), AppError> {
@@ -58,9 +71,13 @@ impl Storage {
         Ok(())
     }
 
-    pub fn validate_staging(&self, library_id: &str, job_id: &str) -> Result<(), AppError> {
-        let root = self.library_root(library_id)?;
-        let staging = root.join("staging").join(job_id);
+    pub fn validate_staging(
+        &self,
+        library_id: &str,
+        job_id: &str,
+        baseline: &StagingBaseline,
+    ) -> Result<(), AppError> {
+        let staging = self.library_root(library_id)?.join("staging").join(job_id);
         if !staging.is_dir() {
             return Err(AppError::Storage(format!(
                 "missing staging directory {job_id}"
@@ -98,9 +115,15 @@ impl Storage {
         // The Agent is allowed to install/update runtime dependencies in the
         // staging project's .opencode directory. It is intentionally not part
         // of the promoted output, so only knowledge inputs and the library
-        // contract are compared against the baseline.
+        // contract are compared against the baseline captured at preparation
+        // time — not the live root, which concurrent submissions keep
+        // changing while this job runs.
         for relative in LibraryLayout::PROTECTED_PATHS {
-            if !same_tree(&root.join(relative), &staging.join(relative))? {
+            let expected = baseline
+                .digests
+                .get(relative)
+                .and_then(|digest| digest.as_deref());
+            if tree_digest(&staging.join(relative))?.as_deref() != expected {
                 return Err(AppError::Storage(format!(
                     "staging modified protected path: {relative}"
                 )));
@@ -154,39 +177,95 @@ impl Storage {
     }
 }
 
-fn same_tree(left: &Path, right: &Path) -> Result<bool, AppError> {
-    if !left.exists() || !right.exists() {
-        return Ok(left.exists() == right.exists());
-    }
-    if left.is_file() || right.is_file() {
-        return Ok(left.is_file() && right.is_file() && fs::read(left)? == fs::read(right)?);
-    }
-    if !left.is_dir() || !right.is_dir() {
-        return Ok(false);
-    }
-
-    let left_entries = tree_entries(left)?;
-    let right_entries = tree_entries(right)?;
-    if left_entries != right_entries {
-        return Ok(false);
-    }
-    for (relative, is_dir) in left_entries {
-        if !is_dir && fs::read(left.join(&relative))? != fs::read(right.join(&relative))? {
-            return Ok(false);
-        }
-    }
-    Ok(true)
+/// Per-protected-path content digests of a freshly prepared staging copy.
+/// Validation recomputes the same digests after the session ran: staging is
+/// sealed while a job runs (the ingest lock serializes jobs per library and
+/// nothing else writes there), so any difference was written by the session
+/// itself.
+#[derive(Debug, Clone)]
+pub struct StagingBaseline {
+    digests: BTreeMap<String, Option<String>>,
 }
 
-fn tree_entries(root: &Path) -> Result<Vec<(PathBuf, bool)>, AppError> {
-    let mut entries = Vec::new();
-    for entry in WalkDir::new(root).follow_links(false).min_depth(1) {
-        let entry = entry?;
-        let relative = entry.path().strip_prefix(root)?.to_path_buf();
-        entries.push((relative, entry.file_type().is_dir()));
+impl StagingBaseline {
+    fn capture(staging: &Path) -> Result<Self, AppError> {
+        let mut digests = BTreeMap::new();
+        for relative in LibraryLayout::PROTECTED_PATHS {
+            digests.insert(relative.to_string(), tree_digest(&staging.join(relative))?);
+        }
+        Ok(Self { digests })
     }
-    entries.sort();
-    Ok(entries)
+}
+
+/// Content digest of one staging path — file or subtree — as a sha256 over
+/// every file's relative path and content, sorted so directory iteration
+/// order cannot matter. `None` when the path is absent.
+fn tree_digest(path: &Path) -> Result<Option<String>, AppError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let mut files = Vec::new();
+    for entry in WalkDir::new(path).follow_links(false) {
+        let entry = entry?;
+        if entry.file_type().is_file() {
+            files.push(entry.path().to_path_buf());
+        }
+    }
+    files.sort();
+    let mut hasher = Sha256::new();
+    for file in files {
+        let relative = file.strip_prefix(path)?;
+        hasher.update(relative.to_string_lossy().as_bytes());
+        hasher.update(b"\0");
+        hasher.update(fs::read(file)?);
+        hasher.update(b"\n");
+    }
+    Ok(Some(hex::encode(hasher.finalize())))
+}
+
+/// Every `raw/` path some wiki node claims in its `sources` frontmatter —
+/// the set of documents ingestion has already compiled. Used to name the
+/// documents a failed job left behind in `raw/` without nodes, and to tell
+/// a genuine no-op duplicate from one that must be re-ingested. A missing
+/// directory yields the empty set; files without frontmatter or with
+/// malformed `sources` entries contribute nothing; unparseable YAML is an
+/// error, as in [`validate_wiki_nodes`].
+pub(crate) fn referenced_sources(wiki_dir: &Path) -> Result<HashSet<String>, AppError> {
+    if !wiki_dir.exists() {
+        return Ok(HashSet::new());
+    }
+    let mut referenced = HashSet::new();
+    for entry in WalkDir::new(wiki_dir).follow_links(false) {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let content = fs::read_to_string(entry.path())?;
+        let Some(frontmatter) = extract_frontmatter(&content) else {
+            continue;
+        };
+        let mapping: yaml_serde::Mapping = yaml_serde::from_str(&frontmatter).map_err(|error| {
+            AppError::Storage(format!(
+                "wiki node has invalid YAML frontmatter: {}: {error}",
+                entry.path().display()
+            ))
+        })?;
+        let Some(yaml_serde::Value::Sequence(items)) = mapping.get("sources") else {
+            continue;
+        };
+        for item in items {
+            // The contract shape is a `{path: ..., locator: ...}` mapping; a
+            // bare string is tolerated.
+            let path = match item {
+                yaml_serde::Value::Mapping(item) => item.get("path"),
+                plain => Some(plain),
+            };
+            if let Some(yaml_serde::Value::String(path)) = path {
+                referenced.insert(path.clone());
+            }
+        }
+    }
+    Ok(referenced)
 }
 
 /// The frontmatter keys every wiki node must declare — the node contract,
@@ -340,5 +419,69 @@ mod tests {
     fn reconcile_staging_tolerates_a_library_without_a_staging_directory() {
         let (_tmp, storage, library_id) = fixture();
         storage.reconcile_staging(&library_id).unwrap();
+    }
+
+    #[test]
+    fn validate_staging_compares_against_the_preparation_baseline_not_the_live_root() {
+        let (_tmp, storage, library_id) = fixture();
+        storage
+            .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
+            .unwrap();
+        let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
+        let (_staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
+
+        // A concurrent submission lands in the live raw/ (and a manual edit
+        // rewrites purpose.md) while the job runs: validation compares the
+        // staging copy against its preparation baseline and ignores the live
+        // root entirely.
+        let root = storage.library_root(&library_id).unwrap();
+        fs::write(root.join("raw/late.md"), "# Late arrival").unwrap();
+        fs::write(root.join("purpose.md"), "rewritten live").unwrap();
+        storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap();
+    }
+
+    #[test]
+    fn validate_staging_rejects_every_modification_inside_staging() {
+        let (_tmp, storage, library_id) = fixture();
+        storage
+            .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
+            .unwrap();
+        let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
+        let (staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
+        let purpose = fs::read_to_string(staging.join("purpose.md")).unwrap();
+
+        // A file added under a protected staging path.
+        fs::write(staging.join("raw/smuggled.md"), "# smuggled").unwrap();
+        let error = storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap_err();
+        assert!(error.to_string().contains("protected path: raw"), "{error}");
+        fs::remove_file(staging.join("raw/smuggled.md")).unwrap();
+
+        // A protected staging file edited.
+        fs::write(staging.join("purpose.md"), "rewritten by the agent").unwrap();
+        let error = storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("protected path: purpose.md"),
+            "{error}"
+        );
+        fs::write(staging.join("purpose.md"), purpose).unwrap();
+
+        // A protected file deleted from staging.
+        fs::remove_file(staging.join("raw/source.md")).unwrap();
+        let error = storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap_err();
+        assert!(error.to_string().contains("protected path: raw"), "{error}");
+        fs::write(staging.join("raw/source.md"), "# Source\n\nBody.").unwrap();
+
+        // Restored byte-for-byte: the digests match again.
+        storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap();
     }
 }

@@ -6,7 +6,7 @@ use std::sync::Arc;
 
 use axum::{
     Router,
-    body::Body,
+    body::{Body, to_bytes},
     http::{Request, StatusCode, header},
 };
 use noema::{
@@ -97,6 +97,41 @@ async fn health_stays_open_for_probes() {
         status_of(router, "GET", "/v1/health", None).await,
         StatusCode::OK
     );
+}
+
+#[tokio::test]
+async fn health_withholds_server_internals_from_unauthenticated_probes() {
+    let (router, _tempdir) = fixture(Some("s3cret"));
+    let probe = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/health")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(probe.status(), StatusCode::OK);
+    let body = to_bytes(probe.into_body(), usize::MAX).await.unwrap();
+    let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(health["status"], "ok");
+    assert!(health.get("data_dir").is_none(), "{health}");
+
+    // An authorized probe (the CLI's `status` command) sees the details.
+    let authorized = router
+        .oneshot(
+            Request::builder()
+                .uri("/v1/health")
+                .header(header::AUTHORIZATION, "Bearer s3cret")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let body = to_bytes(authorized.into_body(), usize::MAX).await.unwrap();
+    let health: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert!(health["data_dir"].is_string(), "{health}");
 }
 
 #[tokio::test]

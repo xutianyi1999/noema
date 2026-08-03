@@ -5,8 +5,10 @@
 
 use std::{
     fs,
+    io::Read,
     path::Path,
     process::{Command, Stdio},
+    time::{Duration, Instant},
 };
 
 use crate::error::AppError;
@@ -33,19 +35,59 @@ pub(crate) fn skill_files() -> [(&'static str, &'static str); 4] {
     ]
 }
 
+/// The installer is an offline file-copying tool; anything taking longer
+/// than this is wedged and gets killed instead of parking a blocking thread
+/// forever.
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// Installer diagnostics beyond this are noise; keep a bounded tail for the
+/// error message without buffering a chatty release wholesale.
+const STDERR_CAP: u64 = 16 * 1024;
+
 /// Run the upstream graphify installer in one library project (offline;
 /// writes the `.opencode/` plugins/skills/config and `AGENTS.md`).
 pub(crate) fn install_graphify(root: &Path) -> Result<(), AppError> {
-    let output = Command::new("graphify")
+    let mut child = Command::new("graphify")
         .args(["install", "--platform", "opencode", "--project"])
         .current_dir(root)
         .stdin(Stdio::null())
-        .output()
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|error| AppError::Runtime(format!("unable to run graphify installer: {error}")))?;
-    if !output.status.success() {
+    // Drain stderr on a helper thread (bounded): an undrained pipe would let
+    // the installer block once the OS buffer fills.
+    let stderr = child.stderr.take().expect("stderr is piped");
+    let reader = std::thread::spawn(|| {
+        let mut bytes = Vec::new();
+        let _ = stderr.take(STDERR_CAP).read_to_end(&mut bytes);
+        String::from_utf8_lossy(&bytes).into_owned()
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if started.elapsed() > INSTALL_TIMEOUT {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(AppError::Runtime(format!(
+                        "graphify installer timed out after {} s",
+                        INSTALL_TIMEOUT.as_secs()
+                    )));
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(error) => {
+                return Err(AppError::Runtime(format!(
+                    "graphify installer error: {error}"
+                )));
+            }
+        }
+    };
+    let stderr = reader.join().unwrap_or_default();
+    if !status.success() {
         return Err(AppError::Runtime(format!(
-            "graphify installer failed: {}",
-            String::from_utf8_lossy(&output.stderr)
+            "graphify installer failed: {stderr}"
         )));
     }
     Ok(())

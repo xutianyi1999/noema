@@ -17,7 +17,7 @@ use crate::{
     },
     references::safe_knowledge_path,
     runtime::{AgentRunRequest, OpenCodeAgent, OpenCodeRuntime},
-    storage::{Storage, StoredDocument},
+    storage::{Storage, StoredDocument, referenced_sources},
 };
 
 pub struct AppService<R: OpenCodeRuntime> {
@@ -54,6 +54,11 @@ const STAGING_RECONCILE_DELAY: Duration = Duration::from_secs(600);
 
 impl AppService<OpenCodeAgent> {
     pub fn new(config: Config) -> Result<Self, AppError> {
+        if config.max_sessions == 0 {
+            return Err(AppError::BadRequest(
+                "max_sessions must be at least 1".into(),
+            ));
+        }
         let config = Arc::new(config);
         let storage = Storage::open(config.data_dir.clone())?;
         let runtime = Arc::new(OpenCodeAgent::new(config.clone()));
@@ -72,6 +77,11 @@ impl AppService<OpenCodeAgent> {
 
 impl<R: OpenCodeRuntime> AppService<R> {
     pub fn with_runtime(config: Config, runtime: Arc<R>) -> Result<Self, AppError> {
+        if config.max_sessions == 0 {
+            return Err(AppError::BadRequest(
+                "max_sessions must be at least 1".into(),
+            ));
+        }
         let config = Arc::new(config);
         let storage = Storage::open(config.data_dir.clone())?;
         let sessions = Arc::new(Semaphore::new(config.max_sessions));
@@ -86,18 +96,32 @@ impl<R: OpenCodeRuntime> AppService<R> {
         Ok(service)
     }
 
-    pub fn health(&self) -> HealthResponse {
-        HealthResponse {
-            status: "ok",
-            data_dir: self.config.data_dir.display().to_string(),
-            opencode_url: self.config.opencode_url.clone(),
-            configured_model: self.config.opencode_model.clone(),
+    /// Liveness plus, when `detailed`, server internals. The HTTP probe
+    /// passes `detailed` only for authorized callers (or when the API runs
+    /// open); MCP tools always pass it — that endpoint is authenticated
+    /// whenever the API is.
+    pub fn health(&self, detailed: bool) -> HealthResponse {
+        if detailed {
+            HealthResponse {
+                status: "ok",
+                data_dir: Some(self.storage.root().display().to_string()),
+                opencode_url: Some(self.config.opencode_url.clone()),
+                configured_model: Some(self.config.opencode_model.clone()),
+            }
+        } else {
+            HealthResponse {
+                status: "ok",
+                data_dir: None,
+                opencode_url: None,
+                configured_model: None,
+            }
         }
     }
 
-    /// Data directory this service manages (control plane + library roots).
+    /// Data directory this service manages (control plane + library roots),
+    /// canonicalized by [`Storage::open`].
     pub fn data_dir(&self) -> &Path {
-        &self.config.data_dir
+        self.storage.root()
     }
 
     /// The configured bearer token, when API authentication is enabled.
@@ -123,6 +147,9 @@ impl<R: OpenCodeRuntime> AppService<R> {
     /// created by older binaries onto the current system-prompt contract.
     /// Per-library failures only log and never block startup.
     fn startup_maintenance(&self) {
+        if let Err(error) = self.storage.reap_interrupted_runs() {
+            tracing::warn!(%error, "could not reap runs interrupted by the previous process");
+        }
         match self.storage.list_libraries() {
             Ok(libraries) => {
                 for library in libraries {
@@ -177,14 +204,21 @@ impl<R: OpenCodeRuntime> AppService<R> {
         )?;
         let job = self.storage.create_job(&library_id, JobKind::Ingest)?;
         if stored.duplicate {
-            self.storage
-                .update_job(&library_id, &job.job_id, JobState::Skipped, None, None)?;
-            return Ok(SubmitDocumentResponse {
-                library_id,
-                job_id: job.job_id,
-                document_path: Some(stored.record.path),
-                duplicate: true,
-            });
+            // A duplicate the wiki already compiles is a no-op skip. One no
+            // node references is a document a job left behind by failing
+            // before promotion: fall through and re-run ingestion on it —
+            // dedupe would otherwise lose it forever.
+            let root = self.storage.library_root(&library_id)?;
+            if referenced_sources(&root.join("wiki"))?.contains(&stored.record.path) {
+                self.storage
+                    .update_job(&library_id, &job.job_id, JobState::Skipped, None, None)?;
+                return Ok(SubmitDocumentResponse {
+                    library_id,
+                    job_id: job.job_id,
+                    document_path: Some(stored.record.path),
+                    duplicate: true,
+                });
+            }
         }
 
         let service = self.clone();
@@ -347,16 +381,23 @@ impl<R: OpenCodeRuntime> AppService<R> {
 
         self.storage
             .update_job(library_id, job_id, JobState::Running, None, None)?;
-        let staging = match self.storage.prepare_staging(library_id, job_id) {
-            Ok(path) => path,
+        let (staging, baseline) = match self.storage.prepare_staging(library_id, job_id) {
+            Ok(prepared) => prepared,
             Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
         };
         let incremental = staging.join("graphify-out/graph.json").is_file();
+        let extras =
+            match uncompiled_documents(&self.storage, library_id, &staging, &stored.record.path) {
+                Ok(extras) => extras,
+                Err(error) => {
+                    return Err(self.record_job_failure(library_id, job_id, None, error));
+                }
+            };
         let request = AgentRunRequest {
             library_id: library_id.into(),
             workdir: staging,
             title: format!("Noema ingestion {job_id}"),
-            prompt: format_ingest_task(&stored.record.path, job_id, incremental),
+            prompt: format_ingest_task(&stored.record.path, job_id, incremental, &extras),
         };
         let result = match self.runtime.run_new_session(request).await {
             Ok(result) => result,
@@ -364,7 +405,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
         };
         if let Err(error) = self
             .storage
-            .validate_staging(library_id, job_id)
+            .validate_staging(library_id, job_id, &baseline)
             .and_then(|_| self.storage.promote_staging(library_id, job_id))
             .and_then(|_| self.storage.rebuild_index(library_id))
         {
@@ -375,7 +416,6 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 error,
             ));
         }
-        self.storage.cleanup_staging(library_id, job_id)?;
         self.storage.update_job(
             library_id,
             job_id,
@@ -383,6 +423,12 @@ impl<R: OpenCodeRuntime> AppService<R> {
             Some(&result.session_id),
             None,
         )?;
+        // Clean up only after the job is durably completed: a cleanup
+        // failure must not strand an already-promoted job as `running` —
+        // reconciliation removes leftover workspaces of completed jobs.
+        if let Err(error) = self.storage.cleanup_staging(library_id, job_id) {
+            tracing::warn!(library_id = %library_id, job_id = %job_id, %error, "staging cleanup failed");
+        }
         // OpenCode writes this session's tombstone back into the staging
         // project directory minutes after the cleanup above, resurrecting
         // an empty skeleton; re-reconcile past that write-back window so a
@@ -409,17 +455,49 @@ impl<R: OpenCodeRuntime> AppService<R> {
     }
 }
 
+/// The raw/ documents no wiki node references yet: uploads a predecessor job
+/// left behind by failing before promotion. Nothing else would ever compile
+/// them — dedupe skips their resubmission and later jobs' prompts name only
+/// the newly submitted document — so the current session compiles them too.
+fn uncompiled_documents(
+    storage: &Storage,
+    library_id: &str,
+    staging: &Path,
+    current: &str,
+) -> Result<Vec<String>, AppError> {
+    let referenced = referenced_sources(&staging.join("wiki"))?;
+    Ok(storage
+        .list_documents(library_id)?
+        .into_iter()
+        .map(|document| document.path)
+        .filter(|path| path != current && !referenced.contains(path))
+        .collect())
+}
+
 /// The ingest task message (user role): job-specific facts only. All policy
 /// — the node contract, citation discipline, library boundaries — lives in
 /// the library's generated `AGENTS.md` contract and reaches the Agent
 /// through OpenCode's system prompt.
-fn format_ingest_task(source_path: &str, job_id: &str, incremental: bool) -> String {
+fn format_ingest_task(
+    source_path: &str,
+    job_id: &str,
+    incremental: bool,
+    extras: &[String],
+) -> String {
     let graphify_step = if incremental {
         "当前 staging 已有 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify . --update`。这是上游 Skill 的文档/文本增量流程；不要替换成裸 `graphify update .`，后者主要只更新代码 AST。"
     } else {
         "当前 staging 尚无 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify .` 完整首次建图流程。"
     };
+    let extras_step = if extras.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "此外，以下源文档已入库但尚无任何 wiki 节点引用（此前的摄入在落盘前失败）：{}。请将它们与本源文档一视同仁地编译为 wiki 节点并登记 index.md。\n\n",
+            extras.join("、")
+        )
+    };
     format!(
-        "摄入任务 {job_id}。先阅读 purpose.md 和 schema.md，再阅读源文档 {source_path}；节点落盘后同步更新 index.md。项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT。\n\n{graphify_step} 让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
+        "摄入任务 {job_id}。先阅读 purpose.md 和 schema.md，再阅读源文档 {source_path}；节点落盘后同步更新 index.md。项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT。\n\n{extras_step}{graphify_step} 让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
     )
 }

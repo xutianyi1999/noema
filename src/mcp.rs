@@ -83,7 +83,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
 
     #[tool(description = "Return Noema service health and the configured OpenCode model.")]
     async fn kb_health(&self) -> Result<String, rmcp::ErrorData> {
-        json_response(&self.service.health())
+        json_response(&self.service.health(true))
     }
 }
 

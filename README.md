@@ -117,7 +117,7 @@ noema --transcript=false        # 显式关闭（覆盖环境变量时）
 名字即身份，不做任何改写（不加哈希前缀、不拼随机后缀、不做拼音转写）：
 
 - **内容库**：库名 NFC 归一化后原样用作 id 与目录名（`libraries/产品知识库/`），全服务唯一；重名创建返回 `409 Conflict`。名称不得含路径分隔符与控制字符，不超过文件系统的 255 字节限制。
-- **文档**：原文件名存入 `raw/`（`raw/design.md`）。同内容重复提交（SHA-256 相同）返回 `duplicate: true` 并跳过摄入；**同名不同内容返回 409**——`raw/` 是只进不出的证据层，改名再传而不是覆盖。
+- **文档**：原文件名存入 `raw/`（`raw/design.md`）。同内容重复提交（SHA-256 相同）默认返回 `duplicate: true` 并跳过摄入；唯一的例外是该文档尚无任何 wiki 节点引用——上次摄入在落盘前失败、把它遗留在 `raw/` 中——此时重新触发摄入（返回 `duplicate: false`），把它补编译进知识库。**同名不同内容返回 409**——`raw/` 是只进不出的证据层，改名再传而不是覆盖。
 - 兼容：历史数据中带随机后缀的旧式 id 照常工作；旧数据中若存在重名库，按名称选择会返回 400 并要求改用 id。
 
 ## 架构
@@ -261,8 +261,8 @@ sequenceDiagram
 ```mermaid
 stateDiagram-v2
     [*] --> queued: 任务创建
-    queued --> skipped: 文档内容重复
-    queued --> running: 开始处理
+    queued --> skipped: 内容重复且已编译
+    queued --> running: 开始处理（含未编译重复文档的补摄入）
     running --> completed: 编译 → 校验 → 提交 → 重建索引
     running --> failed: 任一环节出错
     skipped --> [*]
@@ -350,5 +350,5 @@ Streamable HTTP 端点 `POST /mcp`，工具：`kb_ingest_document`、`kb_query`�
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-- 库内单元测试 + `tests/service.rs`：假 OpenCode runtime 覆盖服务层（摄入、查询、内容库隔离、SHA-256 去重、库名与文件名唯一性、NFC 归一化、CJK 引用提取、graphify 增量建图提示词）、HTTP 与 MCP 挂载、快照导入导出与恶意归档拒绝；
+- 库内单元测试 + `tests/service.rs`：假 OpenCode runtime 覆盖服务层（摄入、查询、内容库隔离、SHA-256 去重与未编译重复文档补摄入、摄入中途并发落盘不误判校验失败、失败作业由下一次摄入补编译、库名与文件名唯一性、NFC 归一化、CJK 引用提取、graphify 增量建图提示词）、HTTP 与 MCP 挂载、快照导入导出与恶意归档拒绝；
 - `tests/cli.rs`：拉起真实 `noema` 及其 OpenCode Server 子进程，验证 noema-cli 经 HTTP 的导出→导入往返。建库真实执行 graphify 安装器（离线可用）；不需要模型或网络，但 PATH 上需要 `opencode` 与 `graphify`。

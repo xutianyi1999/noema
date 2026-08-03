@@ -70,7 +70,6 @@ impl Storage {
 
         let id = Uuid::new_v4().to_string();
         let relative_path = format!("raw/{filename}");
-        write_atomic(&root.join(&relative_path), content.as_bytes())?;
         let title = title
             .filter(|value| !value.trim().is_empty())
             .map(ToOwned::to_owned)
@@ -89,7 +88,12 @@ impl Storage {
             sha256,
             created_at: now,
         };
-        connection.execute(
+        // Register the document BEFORE writing the raw/ file: the INSERT's
+        // UNIQUE constraints (sha256, path) arbitrate concurrent uploads, so
+        // whoever inserts first owns the filename and the loser can never
+        // overwrite the winner's file on disk (which would leave the DB
+        // checksum describing different content than raw/ holds).
+        match connection.execute(
             "INSERT INTO documents (id, filename, title, path, sha256, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 record.id,
@@ -99,12 +103,58 @@ impl Storage {
                 record.sha256,
                 record.created_at.to_rfc3339(),
             ],
-        )?;
+        ) {
+            Ok(_) => {}
+            // Lost a race the pre-checks above could not see: identical
+            // content landed concurrently → duplicate; the filename was
+            // taken with different content → conflict.
+            Err(rusqlite::Error::SqliteFailure(failure, _))
+                if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
+            {
+                if let Some(existing) = connection
+                    .query_row(
+                        "SELECT id, filename, title, path, sha256, created_at FROM documents WHERE sha256 = ?1",
+                        params![record.sha256],
+                        document_from_row,
+                    )
+                    .optional()?
+                {
+                    return Ok(StoredDocument {
+                        record: existing,
+                        duplicate: true,
+                    });
+                }
+                return Err(AppError::Conflict(format!(
+                    "a document named {} already exists with different content",
+                    record.filename
+                )));
+            }
+            Err(error) => return Err(error.into()),
+        }
+        if let Err(error) = write_atomic(&root.join(&record.path), content.as_bytes()) {
+            // Keep raw/ and the documents table consistent: no file, no
+            // record.
+            let _ = connection.execute("DELETE FROM documents WHERE id = ?1", params![record.id]);
+            return Err(error);
+        }
         self.write_manifest(library_id)?;
         Ok(StoredDocument {
             record,
             duplicate: false,
         })
+    }
+
+    /// Every document record of one library in submission order (oldest
+    /// first) — the raw/ side of what ingestion must have compiled.
+    pub fn list_documents(&self, library_id: &str) -> Result<Vec<DocumentRecord>, AppError> {
+        let root = self.library_root(library_id)?;
+        let connection = open_library_db(&root.join("library.sqlite"))?;
+        let mut statement = connection.prepare(
+            "SELECT id, filename, title, path, sha256, created_at FROM documents ORDER BY created_at",
+        )?;
+        Ok(statement
+            .query_map([], document_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     pub fn write_manifest(&self, library_id: &str) -> Result<(), AppError> {
@@ -175,12 +225,6 @@ pub(super) fn init_library_db(path: &Path) -> Result<(), AppError> {
             sha256 TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL
         );
-        CREATE TABLE IF NOT EXISTS nodes (
-            node_id TEXT PRIMARY KEY,
-            path TEXT NOT NULL UNIQUE,
-            canonical_name TEXT NOT NULL,
-            updated_at TEXT NOT NULL
-        );
         CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(path, title, body);
         ",
     )?;
@@ -188,8 +232,12 @@ pub(super) fn init_library_db(path: &Path) -> Result<(), AppError> {
 }
 
 fn rebuild_content_fts(root: &Path) -> Result<(), AppError> {
-    let connection = open_library_db(&root.join("library.sqlite"))?;
-    connection.execute("DELETE FROM content_fts", [])?;
+    let mut connection = open_library_db(&root.join("library.sqlite"))?;
+    // One transaction: concurrent queries never observe an empty or
+    // half-built index, and the rebuild is one commit instead of one per
+    // file.
+    let transaction = connection.transaction()?;
+    transaction.execute("DELETE FROM content_fts", [])?;
 
     for directory in ["raw", "wiki"] {
         let directory_path = root.join(directory);
@@ -221,12 +269,13 @@ fn rebuild_content_fts(root: &Path) -> Result<(), AppError> {
                 .file_stem()
                 .and_then(|value| value.to_str())
                 .unwrap_or_default();
-            connection.execute(
+            transaction.execute(
                 "INSERT INTO content_fts (path, title, body) VALUES (?1, ?2, ?3)",
                 params![relative, title, body],
             )?;
         }
     }
+    transaction.commit()?;
     Ok(())
 }
 
@@ -262,4 +311,94 @@ fn validate_filename(value: &str) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::CreateLibraryRequest;
+
+    fn fixture() -> (tempfile::TempDir, Storage, String) {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let library = storage
+            .create_library(&CreateLibraryRequest {
+                name: "文档库".into(),
+                description: None,
+            })
+            .unwrap();
+        (tmp, storage, library.id)
+    }
+
+    #[test]
+    fn concurrent_uploads_of_the_same_name_never_corrupt_the_sha256_invariant() {
+        let (_tmp, storage, library_id) = fixture();
+        let results = std::thread::scope(|scope| {
+            (0..2)
+                .map(|index| {
+                    let storage = storage.clone();
+                    let library_id = library_id.clone();
+                    scope.spawn(move || {
+                        storage.store_document(
+                            &library_id,
+                            "race.md",
+                            None,
+                            &format!("content {index}"),
+                        )
+                    })
+                })
+                .map(|handle| handle.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let successes = results.iter().filter(|result| result.is_ok()).count();
+        assert_eq!(successes, 1, "{results:?}");
+        assert!(
+            results
+                .iter()
+                .any(|result| matches!(result, Err(AppError::Conflict(_)))),
+            "{results:?}"
+        );
+        // The surviving DB record describes exactly what is on disk.
+        let root = storage.library_root(&library_id).unwrap();
+        let on_disk = fs::read_to_string(root.join("raw/race.md")).unwrap();
+        let connection = rusqlite::Connection::open(root.join("library.sqlite")).unwrap();
+        let (path, sha256): (String, String) = connection
+            .query_row("SELECT path, sha256 FROM documents", [], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(path, "raw/race.md");
+        let mut hasher = Sha256::new();
+        hasher.update(on_disk.as_bytes());
+        assert_eq!(sha256, hex::encode(hasher.finalize()));
+    }
+
+    #[test]
+    fn concurrent_uploads_of_the_same_content_report_exactly_one_duplicate() {
+        let (_tmp, storage, library_id) = fixture();
+        let results = std::thread::scope(|scope| {
+            ["a.md", "b.md"]
+                .map(|filename| {
+                    let storage = storage.clone();
+                    let library_id = library_id.clone();
+                    scope.spawn(move || {
+                        storage.store_document(&library_id, filename, None, "identical")
+                    })
+                })
+                .map(|handle| handle.join().unwrap())
+        });
+        let fresh = results
+            .iter()
+            .filter(|result| result.as_ref().is_ok_and(|stored| !stored.duplicate))
+            .count();
+        let duplicates = results
+            .iter()
+            .filter(|result| result.as_ref().is_ok_and(|stored| stored.duplicate))
+            .count();
+        assert_eq!(fresh, 1, "{results:?}");
+        assert_eq!(duplicates, 1, "{results:?}");
+        // Exactly one raw/ file: the duplicate never wrote a second copy.
+        let root = storage.library_root(&library_id).unwrap();
+        assert_eq!(fs::read_dir(root.join("raw")).unwrap().count(), 1);
+    }
 }
