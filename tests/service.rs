@@ -162,13 +162,13 @@ async fn library_with_source(
         .await
         .unwrap();
     let submitted = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "source.md".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: title.map(str::to_string),
-            },
+            }],
         )
         .await
         .unwrap();
@@ -195,17 +195,17 @@ async fn library_ingestion_query_and_session_isolation_work() {
     assert!(root.join(".opencode/skills/kb-query/SKILL.md").is_file());
 
     let submitted = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "source.md".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: Some("来源文档".into()),
-            },
+            }],
         )
         .await
         .unwrap();
-    assert!(!submitted.duplicate);
+    assert!(!submitted.documents[0].duplicate);
     let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
     assert_eq!(status.status, JobState::Completed, "{status:?}");
     assert!(status.session_id.is_some());
@@ -214,14 +214,14 @@ async fn library_ingestion_query_and_session_isolation_work() {
     assert!(root.join("wiki/session-context.md").is_file());
 
     let second = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "second.md".into(),
                 content: "# Second Context\n\nA second source for incremental graph updates."
                     .into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
@@ -233,17 +233,17 @@ async fn library_ingestion_query_and_session_isolation_work() {
     );
 
     let duplicate = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "other.txt".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
-    assert!(duplicate.duplicate);
+    assert!(duplicate.documents[0].duplicate && duplicate.documents[0].skipped);
     assert_eq!(
         service
             .job_status(&library.id, &duplicate.job_id)
@@ -295,13 +295,13 @@ async fn libraries_are_isolated_and_invalid_documents_are_rejected() {
     assert_ne!(first.root, second.root);
 
     let invalid = service
-        .submit_document(
+        .submit_documents(
             &first.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "../escape.md".into(),
                 content: "should fail".into(),
                 title: None,
-            },
+            }],
         )
         .await;
     assert!(matches!(invalid, Err(AppError::BadRequest(_))));
@@ -310,24 +310,24 @@ async fn libraries_are_isolated_and_invalid_documents_are_rejected() {
     // Filenames are stable identities: the same name with different content
     // is rejected instead of coexisting under a hash prefix.
     service
-        .submit_document(
+        .submit_documents(
             &first.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "note.md".into(),
                 content: "first version".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
     let conflict = service
-        .submit_document(
+        .submit_documents(
             &first.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "note.md".into(),
                 content: "second, different version".into(),
                 title: None,
-            },
+            }],
         )
         .await;
     assert!(matches!(conflict, Err(AppError::Conflict(_))));
@@ -348,13 +348,13 @@ async fn libraries_are_addressable_by_unique_name() {
     assert!(PathBuf::from(&library.root).ends_with("libraries/法规库"));
 
     let submitted = service
-        .submit_document(
+        .submit_documents(
             "法规库",
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "source.md".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
@@ -408,24 +408,24 @@ async fn concurrent_submissions_to_one_library_are_serialized() {
 
     // Two documents in without waiting: both jobs are accepted at once.
     let first = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "one.md".into(),
                 content: "# One\n\nFirst source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
     let second = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "two.md".into(),
                 content: "# Two\n\nSecond source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
@@ -642,13 +642,13 @@ async fn a_submission_landing_mid_ingest_no_longer_fails_validation() {
     }));
 
     let submitted = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "source.md".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
@@ -670,13 +670,13 @@ async fn a_job_that_failed_before_promotion_is_recompiled_by_the_next_ingest() {
     runtime.fail_next_ingests.store(1, Ordering::SeqCst);
 
     let first = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "doc1.md".into(),
                 content: "# One\n\nFirst source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
@@ -684,13 +684,13 @@ async fn a_job_that_failed_before_promotion_is_recompiled_by_the_next_ingest() {
     assert_eq!(first_status.status, JobState::Failed, "{first_status:?}");
 
     let second = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "doc2.md".into(),
                 content: "# Two\n\nSecond source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
@@ -729,13 +729,13 @@ async fn a_document_compiled_by_a_predecessor_job_is_not_ingested_twice() {
     // job1 fails before promotion and leaves a.md in raw/ without a node.
     runtime.fail_next_ingests.store(1, Ordering::SeqCst);
     let first = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "a.md".into(),
                 content: "# A\n\nFirst source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
@@ -745,13 +745,13 @@ async fn a_document_compiled_by_a_predecessor_job_is_not_ingested_twice() {
     // job2 compiles both a.md (named as an uncompiled extra) and b.md — the
     // fake runtime references every raw/ document from its node.
     let second = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "b.md".into(),
                 content: "# B\n\nSecond source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
@@ -762,13 +762,13 @@ async fn a_document_compiled_by_a_predecessor_job_is_not_ingested_twice() {
     // submission, the same skip happens synchronously — either way no third
     // session runs.)
     let third = service
-        .submit_document(
+        .submit_documents(
             &library.id,
-            DocumentInput {
+            vec![DocumentInput {
                 filename: "b.md".into(),
                 content: "# B\n\nSecond source.".into(),
                 title: None,
-            },
+            }],
         )
         .await
         .unwrap();
@@ -820,6 +820,497 @@ async fn startup_repairs_a_library_whose_bootstrap_was_interrupted() {
 }
 
 #[tokio::test]
+async fn a_batch_of_documents_is_compiled_in_one_ingestion_job() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "批量摄入库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+
+    let submitted = service
+        .submit_documents(
+            &library.id,
+            vec![
+                DocumentInput {
+                    filename: "a.md".into(),
+                    content: "# A\n\nFirst source.".into(),
+                    title: None,
+                },
+                DocumentInput {
+                    filename: "b.md".into(),
+                    content: "# B\n\nSecond source.".into(),
+                    title: None,
+                },
+                DocumentInput {
+                    filename: "c.md".into(),
+                    content: "# C\n\nThird source.".into(),
+                    title: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert_eq!(submitted.documents.len(), 3);
+    for entry in &submitted.documents {
+        assert!(!entry.duplicate, "{entry:?}");
+        assert!(!entry.skipped, "{entry:?}");
+    }
+    let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
+    assert_eq!(status.status, JobState::Completed, "{status:?}");
+
+    // One batch = one staging workspace = one agent session naming every
+    // document, with the cross-document merge clause.
+    let prompts: Vec<String> = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.title.contains("ingestion"))
+        .map(|request| request.prompt.clone())
+        .collect();
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(prompts[0].contains("依次阅读以下源文档"), "{}", prompts[0]);
+    for path in ["raw/a.md", "raw/b.md", "raw/c.md"] {
+        assert!(prompts[0].contains(path), "{}", prompts[0]);
+    }
+    assert!(prompts[0].contains("合并为一个节点"), "{}", prompts[0]);
+
+    let root = service.storage.library_root(&library.id).unwrap();
+    let node = fs::read_to_string(root.join("wiki/session-context.md")).unwrap();
+    for path in ["raw/a.md", "raw/b.md", "raw/c.md"] {
+        assert!(node.contains(path), "{node}");
+    }
+}
+
+#[tokio::test]
+async fn a_batch_of_already_compiled_documents_is_a_noop_skip() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "批量重提库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let batch = || {
+        vec![
+            DocumentInput {
+                filename: "a.md".into(),
+                content: "# A\n\nFirst source.".into(),
+                title: None,
+            },
+            DocumentInput {
+                filename: "b.md".into(),
+                content: "# B\n\nSecond source.".into(),
+                title: None,
+            },
+        ]
+    };
+
+    let first = service
+        .submit_documents(&library.id, batch())
+        .await
+        .unwrap();
+    let first_status = wait_for_completion(&service, &library.id, &first.job_id).await;
+    assert_eq!(first_status.status, JobState::Completed, "{first_status:?}");
+
+    // Resubmitting the identical batch stores nothing new and skips: every
+    // entry is a genuine no-op, and no second session ever runs.
+    let second = service
+        .submit_documents(&library.id, batch())
+        .await
+        .unwrap();
+    for entry in &second.documents {
+        assert!(entry.duplicate, "{entry:?}");
+        assert!(entry.skipped, "{entry:?}");
+    }
+    assert_eq!(
+        service
+            .job_status(&library.id, &second.job_id)
+            .unwrap()
+            .status,
+        JobState::Skipped
+    );
+    let ingest_sessions = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.title.contains("ingestion"))
+        .count();
+    assert_eq!(ingest_sessions, 1);
+}
+
+#[tokio::test]
+async fn a_batch_mixing_compiled_and_fresh_documents_skips_only_the_compiled() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "批量混合库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let alone = service
+        .submit_documents(
+            &library.id,
+            vec![DocumentInput {
+                filename: "a.md".into(),
+                content: "# A\n\nFirst source.".into(),
+                title: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let alone_status = wait_for_completion(&service, &library.id, &alone.job_id).await;
+    assert_eq!(alone_status.status, JobState::Completed, "{alone_status:?}");
+
+    let submitted = service
+        .submit_documents(
+            &library.id,
+            vec![
+                DocumentInput {
+                    filename: "a.md".into(),
+                    content: "# A\n\nFirst source.".into(),
+                    title: None,
+                },
+                DocumentInput {
+                    filename: "b.md".into(),
+                    content: "# B\n\nSecond source.".into(),
+                    title: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    assert!(
+        submitted.documents[0].duplicate,
+        "{:?}",
+        submitted.documents
+    );
+    assert!(submitted.documents[0].skipped, "{:?}", submitted.documents);
+    assert!(
+        !submitted.documents[1].duplicate,
+        "{:?}",
+        submitted.documents
+    );
+    assert!(!submitted.documents[1].skipped, "{:?}", submitted.documents);
+    let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
+    assert_eq!(status.status, JobState::Completed, "{status:?}");
+
+    // Only the fresh document needed a session: one earlier plus one now.
+    let ingest_sessions = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.title.contains("ingestion"))
+        .count();
+    assert_eq!(ingest_sessions, 2);
+}
+
+#[tokio::test]
+async fn an_empty_batch_is_rejected() {
+    let (_tempdir, service, _runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "空批库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let result = service.submit_documents(&library.id, Vec::new()).await;
+    assert!(matches!(result, Err(AppError::BadRequest(_))));
+}
+
+#[tokio::test]
+async fn a_batch_with_an_empty_document_is_rejected_naming_the_filename() {
+    let (_tempdir, service, _runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "空文档批库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let result = service
+        .submit_documents(
+            &library.id,
+            vec![
+                DocumentInput {
+                    filename: "ok.md".into(),
+                    content: "# Ok\n\nFine.".into(),
+                    title: None,
+                },
+                DocumentInput {
+                    filename: "empty.md".into(),
+                    content: String::new(),
+                    title: None,
+                },
+            ],
+        )
+        .await;
+    match result {
+        Err(AppError::BadRequest(message)) => assert!(message.contains("empty.md"), "{message}"),
+        other => panic!("expected BadRequest naming the empty document, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_batch_with_the_same_name_but_different_content_is_rejected() {
+    let (_tempdir, service, _runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "批内冲突库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let result = service
+        .submit_documents(
+            &library.id,
+            vec![
+                DocumentInput {
+                    filename: "a.md".into(),
+                    content: "one version".into(),
+                    title: None,
+                },
+                DocumentInput {
+                    filename: "a.md".into(),
+                    content: "another version".into(),
+                    title: None,
+                },
+            ],
+        )
+        .await;
+    assert!(matches!(result, Err(AppError::Conflict(_))));
+}
+
+#[tokio::test]
+async fn a_batch_with_identical_duplicate_entries_collapses_to_one() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "批内折叠库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let batch = vec![
+        DocumentInput {
+            filename: "a.md".into(),
+            content: "# A\n\nFirst source.".into(),
+            title: None,
+        },
+        DocumentInput {
+            filename: "a.md".into(),
+            content: "# A\n\nFirst source.".into(),
+            title: None,
+        },
+    ];
+    let submitted = service.submit_documents(&library.id, batch).await.unwrap();
+    assert_eq!(submitted.documents.len(), 1, "{:?}", submitted.documents);
+    let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
+    assert_eq!(status.status, JobState::Completed, "{status:?}");
+    let ingest_sessions = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.title.contains("ingestion"))
+        .count();
+    assert_eq!(ingest_sessions, 1);
+}
+
+#[tokio::test]
+async fn a_batch_with_duplicate_content_across_names_reports_both_entries_and_one_ingest() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "跨名重复批库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let submitted = service
+        .submit_documents(
+            &library.id,
+            vec![
+                DocumentInput {
+                    filename: "a.md".into(),
+                    content: "# Shared\n\nOne content.".into(),
+                    title: None,
+                },
+                DocumentInput {
+                    filename: "b.md".into(),
+                    content: "# Shared\n\nOne content.".into(),
+                    title: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    // sha256 dedupe maps the second entry onto the first's stored record:
+    // both entries are reported, but the job covers the shared path once.
+    assert_eq!(submitted.documents.len(), 2, "{:?}", submitted.documents);
+    assert!(
+        !submitted.documents[0].duplicate,
+        "{:?}",
+        submitted.documents
+    );
+    assert!(
+        submitted.documents[1].duplicate,
+        "{:?}",
+        submitted.documents
+    );
+    assert_eq!(
+        submitted.documents[0].document_path,
+        submitted.documents[1].document_path
+    );
+    let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
+    assert_eq!(status.status, JobState::Completed, "{status:?}");
+    let prompts: Vec<String> = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.title.contains("ingestion"))
+        .map(|request| request.prompt.clone())
+        .collect();
+    assert_eq!(prompts.len(), 1, "{prompts:?}");
+    assert!(prompts[0].contains("raw/a.md"), "{}", prompts[0]);
+    assert!(!prompts[0].contains("raw/b.md"), "{}", prompts[0]);
+}
+
+#[tokio::test]
+async fn a_failed_batch_is_recompiled_by_the_next_ingest_via_extras() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "批量补编译库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    runtime.fail_next_ingests.store(1, Ordering::SeqCst);
+
+    let failed = service
+        .submit_documents(
+            &library.id,
+            vec![
+                DocumentInput {
+                    filename: "doc1.md".into(),
+                    content: "# One\n\nFirst source.".into(),
+                    title: None,
+                },
+                DocumentInput {
+                    filename: "doc2.md".into(),
+                    content: "# Two\n\nSecond source.".into(),
+                    title: None,
+                },
+            ],
+        )
+        .await
+        .unwrap();
+    let failed_status = wait_for_completion(&service, &library.id, &failed.job_id).await;
+    assert_eq!(failed_status.status, JobState::Failed, "{failed_status:?}");
+
+    // The failed batch left both documents in raw/ without any node; the
+    // next submission's prompt names them alongside the new document.
+    let next = service
+        .submit_documents(
+            &library.id,
+            vec![DocumentInput {
+                filename: "doc3.md".into(),
+                content: "# Three\n\nThird source.".into(),
+                title: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let next_status = wait_for_completion(&service, &library.id, &next.job_id).await;
+    assert_eq!(next_status.status, JobState::Completed, "{next_status:?}");
+
+    let prompts: Vec<String> = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.title.contains("ingestion"))
+        .map(|request| request.prompt.clone())
+        .collect();
+    assert_eq!(prompts.len(), 2, "{prompts:?}");
+    for path in ["raw/doc1.md", "raw/doc2.md", "raw/doc3.md"] {
+        assert!(prompts[1].contains(path), "{}", prompts[1]);
+    }
+}
+
+#[tokio::test]
+async fn document_submission_is_served_over_http() {
+    let (_tempdir, service, _runtime) = service_fixture().await;
+    service
+        .create_library(CreateLibraryRequest {
+            name: "batchlib".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let app = http_api::router(service);
+
+    let body = serde_json::json!({
+        "documents": [
+            { "filename": "a.md", "content": "# A\n\nFirst source." },
+            { "filename": "b.md", "content": "# B\n\nSecond source." }
+        ]
+    });
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/libraries/batchlib/documents")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(value["library_id"], "batchlib");
+    assert_eq!(value["documents"].as_array().unwrap().len(), 2);
+    let job_id = value["job_id"].as_str().unwrap().to_string();
+
+    // Poll the job over HTTP too, so the batch's ingest finishes before
+    // the fixture is torn down.
+    for _ in 0..500 {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/v1/libraries/batchlib/jobs/{job_id}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let status: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        match status["status"].as_str() {
+            Some("completed") => return,
+            Some("queued") | Some("running") => {}
+            _ => panic!("batch job did not complete: {status}"),
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    panic!("batch ingestion job did not finish: {job_id}");
+}
+
+#[tokio::test]
 async fn an_uncompiled_duplicate_is_reingested_instead_of_skipped() {
     let (_tempdir, service, runtime) = service_fixture().await;
     let library = service
@@ -837,10 +1328,10 @@ async fn an_uncompiled_duplicate_is_reingested_instead_of_skipped() {
     };
 
     let first = service
-        .submit_document(&library.id, document.clone())
+        .submit_documents(&library.id, vec![document.clone()])
         .await
         .unwrap();
-    assert!(!first.duplicate);
+    assert!(!first.documents[0].duplicate);
     let first_status = wait_for_completion(&service, &library.id, &first.job_id).await;
     assert_eq!(first_status.status, JobState::Failed, "{first_status:?}");
 
@@ -848,10 +1339,10 @@ async fn an_uncompiled_duplicate_is_reingested_instead_of_skipped() {
     // references it, so the submission runs a real ingestion instead of
     // skipping.
     let second = service
-        .submit_document(&library.id, document.clone())
+        .submit_documents(&library.id, vec![document.clone()])
         .await
         .unwrap();
-    assert!(!second.duplicate);
+    assert!(second.documents[0].duplicate && !second.documents[0].skipped);
     let second_status = wait_for_completion(&service, &library.id, &second.job_id).await;
     assert_eq!(
         second_status.status,
@@ -861,10 +1352,10 @@ async fn an_uncompiled_duplicate_is_reingested_instead_of_skipped() {
 
     // The node exists now: the third submission is the genuine no-op skip.
     let third = service
-        .submit_document(&library.id, document)
+        .submit_documents(&library.id, vec![document])
         .await
         .unwrap();
-    assert!(third.duplicate);
+    assert!(third.documents[0].duplicate && third.documents[0].skipped);
     assert_eq!(
         service
             .job_status(&library.id, &third.job_id)

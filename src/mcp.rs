@@ -10,7 +10,7 @@ use rmcp::{
 };
 
 use crate::{
-    models::{DocumentInput, McpIngestRequest, McpJobRequest, McpQueryRequest},
+    models::{McpIngestRequest, McpJobRequest, McpQueryRequest},
     runtime::OpenCodeRuntime,
     service::AppService,
 };
@@ -33,22 +33,15 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
 #[tool_router]
 impl<R: OpenCodeRuntime> McpHandler<R> {
     #[tool(
-        description = "Submit one UTF-8 Markdown or TXT document to an isolated Noema content library."
+        description = "Submit one or more UTF-8 Markdown or TXT documents to an isolated Noema content library. All documents are compiled together in a single ingestion job."
     )]
-    async fn kb_ingest_document(
+    async fn kb_ingest_documents(
         &self,
         Parameters(request): Parameters<McpIngestRequest>,
     ) -> Result<String, rmcp::ErrorData> {
         let response = self
             .service
-            .submit_document(
-                &request.library_id,
-                DocumentInput {
-                    filename: request.filename,
-                    content: request.content,
-                    title: request.title,
-                },
-            )
+            .submit_documents(&request.library_id, request.documents)
             .await
             .map_err(|error| to_mcp_error(&error))?;
         json_response(&response)

@@ -72,13 +72,14 @@ enum Command {
         #[arg(long)]
         description: Option<String>,
     },
-    /// 提交本地 .md/.txt 文档到内容库，触发异步摄入
+    /// 提交本地 .md/.txt 文档到内容库，触发异步摄入（多个文档合并为一次摄入任务）
     Submit {
         /// 内容库 id，或唯一的内容库名称
         library: String,
-        /// 本地文档路径（.md/.txt，单级文件名）
-        file: PathBuf,
-        /// 文档标题
+        /// 本地文档路径（.md/.txt，单级文件名；可传多个）
+        #[arg(value_name = "FILE", num_args = 1..)]
+        files: Vec<PathBuf>,
+        /// 文档标题（仅单文件提交可用）
         #[arg(long)]
         title: Option<String>,
     },
@@ -151,9 +152,9 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
         }
         Command::Submit {
             library,
-            file,
+            files,
             title,
-        } => cmd_submit(&client, &base, library, file, title.as_deref()).await,
+        } => cmd_submit(&client, &base, library, files, title.as_deref()).await,
         Command::Job { library, job_id } => cmd_job(&client, &base, library, job_id).await,
         Command::Query { library, prompt } => cmd_query(&client, &base, library, prompt).await,
     }
@@ -304,35 +305,65 @@ async fn cmd_submit(
     client: &reqwest::Client,
     base: &str,
     library: String,
-    file: PathBuf,
+    files: Vec<PathBuf>,
     title: Option<&str>,
 ) -> Result<(), BoxError> {
-    let filename = file
-        .file_name()
-        .and_then(|value| value.to_str())
-        .ok_or_else(|| format!("invalid file name: {}", file.display()))?
-        .to_string();
-    let content = tokio::fs::read_to_string(&file)
-        .await
-        .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+    if files.len() > 1 && title.is_some() {
+        return Err("--title 只支持单个文件提交".into());
+    }
+    let mut documents = Vec::with_capacity(files.len());
+    for file in &files {
+        let filename = file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| format!("invalid file name: {}", file.display()))?
+            .to_string();
+        let content = tokio::fs::read_to_string(file)
+            .await
+            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+        documents.push(json!({ "filename": filename, "content": content, "title": title }));
+    }
+    // One submission route for one file or many; every response entry names
+    // its stored path and whether the ingest job covers it.
     let response = send(
         client
             .post(format!(
                 "{base}/v1/libraries/{}/documents",
                 encode(&library)
             ))
-            .json(&json!({ "filename": filename, "content": content, "title": title })),
+            .json(&json!({ "documents": documents })),
     )
     .await?;
     let value = response.json::<Value>().await?;
-    let path = string_field(&value, "document_path");
-    let job_id = string_field(&value, "job_id");
-    let headline = if value["duplicate"].as_bool().unwrap_or(false) {
-        paint(YELLOW, "● 内容重复（SHA-256）——已登记，未触发摄入")
+    let entries = value["documents"].as_array().cloned().unwrap_or_default();
+    if let [entry] = entries.as_slice() {
+        let path = string_field(entry, "document_path");
+        let headline = if entry["skipped"].as_bool().unwrap_or(false) {
+            paint(YELLOW, "● 内容重复（SHA-256）——已登记，未触发摄入")
+        } else {
+            paint(GREEN, "✔ 已提交，摄入任务已创建")
+        };
+        let _ = writeln!(stdout(), "{headline}  {path}");
     } else {
-        paint(GREEN, "✔ 已提交，摄入任务已创建")
-    };
-    let _ = writeln!(stdout(), "{headline}  {path}");
+        let _ = writeln!(
+            stdout(),
+            "{}",
+            paint(
+                GREEN,
+                &format!("✔ 已提交 {} 个文档，合并为一次摄入任务", entries.len())
+            )
+        );
+        for entry in &entries {
+            let path = string_field(entry, "document_path");
+            let line = if entry["skipped"].as_bool().unwrap_or(false) {
+                paint(YELLOW, "● 内容重复（SHA-256）——已登记，未触发摄入")
+            } else {
+                paint(GREEN, "✔ 已提交")
+            };
+            let _ = writeln!(stdout(), "  {line}  {path}");
+        }
+    }
+    let job_id = string_field(&value, "job_id");
     print_kv(vec![
         ("任务", plain(job_id.clone())),
         (

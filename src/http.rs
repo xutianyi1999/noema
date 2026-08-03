@@ -25,8 +25,8 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use crate::{
     error::AppError,
     models::{
-        CreateLibraryRequest, DocumentInput, HealthResponse, JobStatus, Library, QueryRequest,
-        QueryResponse, SubmitDocumentResponse,
+        CreateLibraryRequest, HealthResponse, JobStatus, Library, QueryRequest, QueryResponse,
+        SubmitDocumentsRequest, SubmitDocumentsResponse,
     },
     runtime::OpenCodeRuntime,
     service::AppService,
@@ -50,7 +50,7 @@ pub fn router<R: OpenCodeRuntime>(service: AppService<R>) -> Router {
             "/v1/libraries/{library_id}/documents",
             // axum's default JSON body limit is 2 MiB — below the size of
             // real regulatory texts. Snapshots keep their own 512 MB cap.
-            post(submit_document::<R>).layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
+            post(submit_documents::<R>).layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
         )
         .route(
             "/v1/libraries/{library_id}/jobs/{job_id}",
@@ -261,12 +261,19 @@ async fn import_library<R: OpenCodeRuntime>(
     Ok((StatusCode::CREATED, Json(imported)))
 }
 
-async fn submit_document<R: OpenCodeRuntime>(
+/// The one submission route, for one document or many: every document in
+/// the array is stored, and all non-skipped ones are compiled together in
+/// a single ingestion job.
+async fn submit_documents<R: OpenCodeRuntime>(
     State(service): State<AppService<R>>,
     Path(library_id): Path<String>,
-    Json(document): Json<DocumentInput>,
-) -> Result<Json<SubmitDocumentResponse>, AppError> {
-    Ok(Json(service.submit_document(&library_id, document).await?))
+    Json(request): Json<SubmitDocumentsRequest>,
+) -> Result<Json<SubmitDocumentsResponse>, AppError> {
+    Ok(Json(
+        service
+            .submit_documents(&library_id, request.documents)
+            .await?,
+    ))
 }
 
 async fn job_status<R: OpenCodeRuntime>(

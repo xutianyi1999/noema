@@ -1,11 +1,12 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Duration,
 };
 
 use tokio::sync::Semaphore;
+use unicode_normalization::UnicodeNormalization;
 
 use crate::{
     answer,
@@ -13,7 +14,7 @@ use crate::{
     error::AppError,
     models::{
         CreateLibraryRequest, DocumentInput, HealthResponse, JobKind, JobState, JobStatus, Library,
-        QueryResponse, SubmitDocumentResponse,
+        QueryResponse, SubmitDocumentsResponse, SubmittedDocument,
     },
     references::{contained_file, safe_knowledge_path},
     runtime::{AgentRunRequest, OpenCodeAgent, OpenCodeRuntime},
@@ -177,34 +178,99 @@ impl<R: OpenCodeRuntime> AppService<R> {
         Ok(library)
     }
 
+    /// The one submission entry, for one document or many: every document
+    /// is stored, and all non-skipped ones are compiled together in ONE
+    /// ingestion job — one staging workspace, one agent session.
+    /// Same-library ingests are serialized by the ingest lock and promotion
+    /// swaps the compiled tree wholesale, so N separate jobs would only
+    /// queue up N full pipelines without any concurrency gain, while one
+    /// session can merge concepts that span the documents.
+    ///
     /// `library` accepts an exact id or a unique library name; it is
     /// resolved once here and every downstream call uses the resolved id.
-    pub async fn submit_document(
+    pub async fn submit_documents(
         &self,
         library: &str,
-        document: DocumentInput,
-    ) -> Result<SubmitDocumentResponse, AppError> {
-        if document.content.is_empty() {
-            return Err(AppError::BadRequest(
-                "document content cannot be empty".into(),
-            ));
+        documents: Vec<DocumentInput>,
+    ) -> Result<SubmitDocumentsResponse, AppError> {
+        if documents.is_empty() {
+            return Err(AppError::BadRequest("documents cannot be empty".into()));
+        }
+        for document in &documents {
+            if document.content.is_empty() {
+                return Err(AppError::BadRequest(format!(
+                    "document {} content cannot be empty",
+                    document.filename
+                )));
+            }
         }
         let library_id = self.storage.resolve_library(library)?.id;
-        let stored = self.storage.store_document(
-            &library_id,
-            &document.filename,
-            document.title.as_deref(),
-            &document.content,
-        )?;
-        // A duplicate the wiki already compiles is a no-op skip. One no node
-        // references is a document a job left behind by failing before
-        // promotion: fall through and re-run ingestion on it — dedupe would
-        // otherwise lose it forever. Decided before the job row exists so no
-        // failure below can strand a forever-queued job.
-        let skip =
-            stored.duplicate && self.document_already_compiled(&library_id, &stored.record.path)?;
+        // Normalization within one submission: the NFC-normalized filename
+        // is the identity (same as store_document). A repeated name with
+        // identical content collapses to one entry; different content is a
+        // conflict.
+        let mut kept: Vec<DocumentInput> = Vec::new();
+        let mut seen: HashMap<String, String> = HashMap::new();
+        for document in documents {
+            let filename: String = document.filename.nfc().collect();
+            match seen.get(&filename) {
+                Some(first) if *first != document.content => {
+                    return Err(AppError::Conflict(format!(
+                        "a document named {filename} appears more than once in the submission with different content"
+                    )));
+                }
+                Some(_) => continue,
+                None => {}
+            }
+            seen.insert(filename.clone(), document.content.clone());
+            kept.push(DocumentInput {
+                filename,
+                content: document.content,
+                title: document.title,
+            });
+        }
+        // Store loop. A mid-submission error (e.g. a name conflict against
+        // content already in the library) fails the whole call; documents
+        // stored earlier stay in raw/ uncompiled and self-heal via the
+        // extras mechanism on the next ingest — the same residue state a
+        // job that failed before promotion leaves behind.
+        let mut stored_documents: Vec<(DocumentInput, StoredDocument)> = Vec::new();
+        for document in kept {
+            let stored = self.storage.store_document(
+                &library_id,
+                &document.filename,
+                document.title.as_deref(),
+                &document.content,
+            )?;
+            stored_documents.push((document, stored));
+        }
+        // One wiki walk for the whole submission (per-path walks would be
+        // O(documents × wiki)).
+        let referenced = referenced_sources(&self.storage.library_root(&library_id)?.join("wiki"))?;
+        let mut entries: Vec<SubmittedDocument> = Vec::new();
+        let mut to_ingest: Vec<StoredDocument> = Vec::new();
+        let mut seen_paths: HashSet<String> = HashSet::new();
+        for (document, stored) in stored_documents {
+            // A duplicate the wiki already compiles is a no-op skip. One no
+            // node references is a document a job left behind by failing
+            // before promotion: fall through and re-run ingestion on it —
+            // dedupe would otherwise lose it forever. Decided before the job
+            // row exists so no failure below can strand a forever-queued job.
+            let skip = stored.duplicate && referenced.contains(&stored.record.path);
+            entries.push(SubmittedDocument {
+                filename: document.filename,
+                document_path: stored.record.path.clone(),
+                duplicate: stored.duplicate,
+                skipped: skip,
+            });
+            // Identical content submitted under two names shares one stored
+            // record: the same file must not be named twice in the prompt.
+            if !skip && seen_paths.insert(stored.record.path.clone()) {
+                to_ingest.push(stored);
+            }
+        }
         let job = self.storage.create_job(&library_id, JobKind::Ingest)?;
-        if skip {
+        if to_ingest.is_empty() {
             // Record the skip durably; a failure here must mark the job
             // failed rather than leave it queued forever.
             if let Err(error) =
@@ -213,32 +279,29 @@ impl<R: OpenCodeRuntime> AppService<R> {
             {
                 return Err(self.record_job_failure(&library_id, &job.job_id, None, error));
             }
-            return Ok(SubmitDocumentResponse {
+            return Ok(SubmitDocumentsResponse {
                 library_id,
                 job_id: job.job_id,
-                document_path: Some(stored.record.path),
-                duplicate: true,
+                documents: entries,
             });
         }
 
         let service = self.clone();
         let job_id = job.job_id.clone();
         let task_library_id = library_id.clone();
-        let document_path = stored.record.path.clone();
         tokio::spawn(async move {
             if let Err(error) = service
-                .process_ingest(&task_library_id, &job_id, stored)
+                .process_ingest(&task_library_id, &job_id, to_ingest)
                 .await
             {
                 tracing::error!(library_id = %task_library_id, job_id = %job_id, error = %error, "ingestion failed");
             }
         });
 
-        Ok(SubmitDocumentResponse {
+        Ok(SubmitDocumentsResponse {
             library_id,
             job_id: job.job_id,
-            document_path: Some(document_path),
-            duplicate: false,
+            documents: entries,
         })
     }
 
@@ -360,7 +423,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
         &self,
         library_id: &str,
         job_id: &str,
-        stored: StoredDocument,
+        stored: Vec<StoredDocument>,
     ) -> Result<(), AppError> {
         // One ingest at a time per library: promotion replaces wiki/,
         // reviews/ and the graph wholesale, so two overlapping ingests
@@ -379,25 +442,30 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .await
             .map_err(|_| sessions_closed())?;
 
-        // A predecessor job may have compiled this document in the meantime:
-        // it names the uncompiled documents it finds, and the same content
-        // resubmitted mid-run spawns a second job for it. Re-checked here
-        // under the library lock so the late job skips instead of redoing a
-        // whole ingest session over an already-compiled document.
-        match self.document_already_compiled(library_id, &stored.record.path) {
-            Ok(true) => {
-                if let Err(error) =
-                    self.storage
-                        .update_job(library_id, job_id, JobState::Skipped, None, None)
-                {
-                    return Err(self.record_job_failure(library_id, job_id, None, error));
-                }
-                return Ok(());
+        // A predecessor job may have compiled some of these documents in the
+        // meantime: it names the uncompiled documents it finds, and the same
+        // content resubmitted mid-run spawns a second job for it. Re-checked
+        // here under the library lock so the late job skips instead of
+        // redoing a whole ingest session over already-compiled documents.
+        let referenced =
+            match referenced_sources(&self.storage.library_root(library_id)?.join("wiki")) {
+                Ok(referenced) => referenced,
+                // Like every other failure below, record it on the job row: a
+                // bare `?` would leave the job stranded as `queued`.
+                Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
+            };
+        let pending: Vec<StoredDocument> = stored
+            .into_iter()
+            .filter(|stored| !referenced.contains(&stored.record.path))
+            .collect();
+        if pending.is_empty() {
+            if let Err(error) =
+                self.storage
+                    .update_job(library_id, job_id, JobState::Skipped, None, None)
+            {
+                return Err(self.record_job_failure(library_id, job_id, None, error));
             }
-            // Like every other failure below, record it on the job row: a
-            // bare `?` would leave the job stranded as `queued`.
-            Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
-            Ok(false) => {}
+            return Ok(());
         }
 
         if let Err(error) =
@@ -411,18 +479,21 @@ impl<R: OpenCodeRuntime> AppService<R> {
             Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
         };
         let incremental = staging.join("graphify-out/graph.json").is_file();
-        let extras =
-            match uncompiled_documents(&self.storage, library_id, &staging, &stored.record.path) {
-                Ok(extras) => extras,
-                Err(error) => {
-                    return Err(self.record_job_failure(library_id, job_id, None, error));
-                }
-            };
+        let paths: Vec<String> = pending
+            .iter()
+            .map(|stored| stored.record.path.clone())
+            .collect();
+        let extras = match uncompiled_documents(&self.storage, library_id, &staging, &paths) {
+            Ok(extras) => extras,
+            Err(error) => {
+                return Err(self.record_job_failure(library_id, job_id, None, error));
+            }
+        };
         let request = AgentRunRequest {
             library_id: library_id.into(),
             workdir: staging,
             title: format!("Noema ingestion {job_id}"),
-            prompt: format_ingest_task(&stored.record.path, job_id, incremental, &extras),
+            prompt: format_ingest_task(&paths, job_id, incremental, &extras),
         };
         let result = match self.runtime.run_new_session(request).await {
             Ok(result) => result,
@@ -488,13 +559,6 @@ impl<R: OpenCodeRuntime> AppService<R> {
         }
     }
 
-    /// Whether some wiki node already lists `path` as a source — i.e.
-    /// ingestion has compiled the document it points to.
-    fn document_already_compiled(&self, library_id: &str, path: &str) -> Result<bool, AppError> {
-        let root = self.storage.library_root(library_id)?;
-        Ok(referenced_sources(&root.join("wiki"))?.contains(path))
-    }
-
     async fn bootstrap_library(&self, library: &Library) -> Result<(), AppError> {
         // Only the installer + skill refresh run on the blocking pool; the
         // control-plane insert and any rollback stay on the async task.
@@ -508,12 +572,12 @@ impl<R: OpenCodeRuntime> AppService<R> {
 /// The raw/ documents no wiki node references yet: uploads a predecessor job
 /// left behind by failing before promotion. Nothing else would ever compile
 /// them — dedupe skips their resubmission and later jobs' prompts name only
-/// the newly submitted document — so the current session compiles them too.
+/// the newly submitted documents — so the current session compiles them too.
 fn uncompiled_documents(
     storage: &Storage,
     library_id: &str,
     staging: &Path,
-    current: &str,
+    current: &[String],
 ) -> Result<Vec<String>, AppError> {
     let referenced = referenced_sources(&staging.join("wiki"))?;
     Ok(storage
@@ -521,7 +585,7 @@ fn uncompiled_documents(
         .into_iter()
         .map(|document| document.path)
         .filter(|path| {
-            path != current
+            !current.contains(path)
                 && !referenced.contains(path)
                 // Submissions are not gated by the ingest lock, so a document
                 // submitted after this staging copy was prepared is already
@@ -544,7 +608,7 @@ fn sessions_closed() -> AppError {
 /// the library's generated `AGENTS.md` contract and reaches the Agent
 /// through OpenCode's system prompt.
 fn format_ingest_task(
-    source_path: &str,
+    source_paths: &[String],
     job_id: &str,
     incremental: bool,
     extras: &[String],
@@ -562,8 +626,19 @@ fn format_ingest_task(
             extras.join("、")
         )
     };
+    let reading_step = if source_paths.len() == 1 {
+        format!(
+            "再阅读源文档 {}；节点落盘后同步更新 index.md。",
+            source_paths[0]
+        )
+    } else {
+        format!(
+            "再依次阅读以下源文档：{}；多个文档中描述同一概念的内容合并为一个节点，并在该节点的 sources 中列出全部来源。节点落盘后同步更新 index.md。",
+            source_paths.join("、")
+        )
+    };
     format!(
-        "摄入任务 {job_id}。先阅读 purpose.md 和 schema.md，再阅读源文档 {source_path}；节点落盘后同步更新 index.md。项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT。\n\n{extras_step}{graphify_step} 让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
+        "摄入任务 {job_id}。先阅读 purpose.md 和 schema.md，{reading_step}项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT。\n\n{extras_step}{graphify_step} 让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
     )
 }
 
@@ -593,8 +668,78 @@ mod tests {
         let staging = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(staging.path().join("raw")).unwrap();
         std::fs::write(staging.path().join("raw/a.md"), "content a").unwrap();
-        let extras =
-            uncompiled_documents(&storage, &library.id, staging.path(), "raw/a.md").unwrap();
+        let extras = uncompiled_documents(
+            &storage,
+            &library.id,
+            staging.path(),
+            &["raw/a.md".to_string()],
+        )
+        .unwrap();
         assert!(extras.is_empty(), "{extras:?}");
+    }
+
+    #[test]
+    fn uncompiled_documents_excludes_every_path_of_the_current_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let library = storage
+            .create_library(&CreateLibraryRequest {
+                name: "批量库".into(),
+                description: None,
+            })
+            .unwrap();
+        for (name, content) in [
+            ("a.md", "content a"),
+            ("b.md", "content b"),
+            ("c.md", "content c"),
+        ] {
+            storage
+                .store_document(&library.id, name, None, content)
+                .unwrap();
+        }
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(staging.path().join("raw")).unwrap();
+        for name in ["a.md", "b.md", "c.md"] {
+            std::fs::write(
+                staging.path().join(format!("raw/{name}")),
+                format!("content {}", &name[..1]),
+            )
+            .unwrap();
+        }
+        let extras = uncompiled_documents(
+            &storage,
+            &library.id,
+            staging.path(),
+            &["raw/a.md".to_string(), "raw/b.md".to_string()],
+        )
+        .unwrap();
+        assert_eq!(extras, vec!["raw/c.md".to_string()], "{extras:?}");
+    }
+
+    /// The single-document prompt is the long-deployed contract; the batch
+    /// refactor must not drift a single byte of it.
+    #[test]
+    fn format_ingest_task_single_path_is_byte_stable() {
+        let prompt = format_ingest_task(&["raw/a.md".to_string()], "job-1", false, &[]);
+        assert_eq!(
+            prompt,
+            "摄入任务 job-1。先阅读 purpose.md 和 schema.md，再阅读源文档 raw/a.md；节点落盘后同步更新 index.md。项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT。\n\n当前 staging 尚无 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify .` 完整首次建图流程。 让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
+        );
+    }
+
+    #[test]
+    fn format_ingest_task_multiple_paths_names_each_and_merges_concepts() {
+        let prompt = format_ingest_task(
+            &["raw/a.md".to_string(), "raw/b.md".to_string()],
+            "job-2",
+            true,
+            &[],
+        );
+        assert!(
+            prompt.contains("再依次阅读以下源文档：raw/a.md、raw/b.md"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("合并为一个节点"), "{prompt}");
+        assert!(prompt.contains("/graphify . --update"), "{prompt}");
     }
 }

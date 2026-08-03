@@ -107,14 +107,35 @@ pub struct DocumentInput {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubmitDocumentResponse {
-    pub library_id: String,
-    pub job_id: String,
-    pub document_path: Option<String>,
-    /// `true` only for the genuine no-op: identical content already
-    /// compiled into wiki nodes. A resubmission of content a failed job
-    /// left uncompiled reports `false` — it runs a real ingestion.
+pub struct SubmitDocumentsRequest {
+    pub documents: Vec<DocumentInput>,
+}
+
+/// One batch entry's outcome. Every entry is stored; only the skipped ones
+/// stay out of the batch's ingestion job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmittedDocument {
+    /// The filename as submitted (NFC-normalized); a duplicate entry's
+    /// stored record may carry the original file's name instead.
+    pub filename: String,
+    /// Library-relative path under `raw/`; two entries with identical
+    /// content share one path.
+    pub document_path: String,
+    /// `true` when sha256 dedupe matched content already in the library.
     pub duplicate: bool,
+    /// `true` only for the genuine no-op: duplicate content already
+    /// compiled into wiki nodes. A duplicate a failed job left uncompiled
+    /// reports `false` — it runs in the batch's ingestion.
+    pub skipped: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubmitDocumentsResponse {
+    pub library_id: String,
+    /// The one ingestion job covering every non-skipped entry; entries all
+    /// compile together in a single staging workspace and session.
+    pub job_id: String,
+    pub documents: Vec<SubmittedDocument>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -170,10 +191,7 @@ pub struct McpQueryRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpIngestRequest {
     pub library_id: String,
-    pub filename: String,
-    pub content: String,
-    #[serde(default)]
-    pub title: Option<String>,
+    pub documents: Vec<DocumentInput>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

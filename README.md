@@ -44,6 +44,7 @@ noema --data-dir ~/.local/share/noema
 noema-cli status                          # 健康检查 + 数据目录与模型配置
 noema-cli create 产品知识库                # 库名即 id、即目录名，全服务唯一
 noema-cli submit 产品知识库 ./design.md    # 触发异步摄入，返回 job_id
+noema-cli submit 产品知识库 ./a.md ./b.md ./c.md   # 多个文档合并为一次摄入任务
 noema-cli job 产品知识库 <job_id>          # 轮询到 completed
 noema-cli query 产品知识库 "Session Context 是怎么设计的？"
 ```
@@ -106,7 +107,7 @@ noema --transcript=false        # 显式关闭（覆盖环境变量时）
 | `noema-cli status` | 健康检查，显示数据目录、OpenCode 地址与模型 |
 | `noema-cli create <名称> [--description <描述>]` | 创建内容库（名称唯一；重名返回 409） |
 | `noema-cli list` | 列出所有内容库（id / 名称 / 路径） |
-| `noema-cli submit <lib> <file.md\|file.txt> [--title <标题>]` | 提交本地文档，触发异步摄入 |
+| `noema-cli submit <lib> <file.md\|file.txt>... [--title <标题>]` | 提交本地文档，触发异步摄入；多个文件合并为一次摄入任务（`--title` 仅单文件可用） |
 | `noema-cli job <lib> <job_id>` | 查询摄入任务状态 |
 | `noema-cli query <lib> "<自然语言问题>"` | 自然语言查询（每次创建全新 Agent session） |
 | `noema-cli export <lib> [-o <文件>]` | 导出快照到本地 `.tar.gz` |
@@ -117,7 +118,7 @@ noema --transcript=false        # 显式关闭（覆盖环境变量时）
 名字即身份，不做任何改写（不加哈希前缀、不拼随机后缀、不做拼音转写）：
 
 - **内容库**：库名 NFC 归一化后原样用作 id 与目录名（`libraries/产品知识库/`），全服务唯一；重名创建返回 `409 Conflict`。名称不得含路径分隔符与控制字符，不超过文件系统的 255 字节限制。
-- **文档**：原文件名存入 `raw/`（`raw/design.md`）。同内容重复提交（SHA-256 相同）默认返回 `duplicate: true` 并跳过摄入；唯一的例外是该文档尚无任何 wiki 节点引用——上次摄入在落盘前失败、把它遗留在 `raw/` 中——此时重新触发摄入（返回 `duplicate: false`），把它补编译进知识库。**同名不同内容返回 409**——`raw/` 是只进不出的证据层，改名再传而不是覆盖。
+- **文档**：原文件名存入 `raw/`（`raw/design.md`）。同内容重复提交（SHA-256 相同）默认在响应条目中标 `duplicate` 且 `skipped`、跳过摄入；唯一的例外是该文档尚无任何 wiki 节点引用——上次摄入在落盘前失败、把它遗留在 `raw/` 中——此时虽标 `duplicate` 但不 `skipped`，重新触发摄入把它补编译进知识库。**同名不同内容返回 409**——`raw/` 是只进不出的证据层，改名再传而不是覆盖。
 - 兼容：历史数据中带随机后缀的旧式 id 照常工作；旧数据中若存在重名库，按名称选择会返回 400 并要求改用 id。
 
 ## 架构
@@ -274,6 +275,8 @@ stateDiagram-v2
 
 同一内容库的摄入作业串行执行：后到的作业等前一个完成后再开始，等待期间保持 `queued`（轮询 job 状态可见排队），因此每次摄入都在上一次提交的图谱之上增量更新，并行提交不会相互覆盖。不同内容库之间完全并行；查询不受摄入排队影响，只与摄入共享全局 `--max-sessions` 上限。
 
+提交接口只有一个（`POST /v1/libraries/{library_id}/documents`、`kb_ingest_documents`、`noema-cli submit`），一次可交一篇或多篇文档，整次提交合并为**一个**摄入作业：一个 staging 工作区、一次 Agent 会话，跨文档描述同一概念的内容合并为一个节点（`sources` 列出全部来源）。同一次提交内同名同内容折叠为一条，同名异内容返回 409；内容重复（SHA-256）且已编译的条目在响应中标 `skipped`，其余条目照常入库。由于提交按整树原子校验与提交，任一部分导致校验失败时整次提交拒绝——已入库文档留在 `raw/`，由下一次摄入补编译，重试即恢复。一个会话的时长受 `--opencode-timeout-secs` 约束，过大的一次提交应分次进行。
+
 ### 隔离与快照复用
 
 ```mermaid
@@ -302,7 +305,7 @@ graphify 生命周期：空库只安装插件和 Skill；首篇文档摄入时�
 | `POST /v1/libraries` | 创建内容库（`{"name","description"}`；重名 409） |
 | `POST /v1/libraries/import` | 导入快照（请求体为 gzip tar；`?name=&description=` 可选） |
 | `GET /v1/libraries/{library_id}/export` | 导出快照（返回 gzip tar） |
-| `POST /v1/libraries/{library_id}/documents` | 提交文档（`{"filename","content","title"}`；同名异内容 409） |
+| `POST /v1/libraries/{library_id}/documents` | 提交文档（`{"documents":[{"filename","content","title"}]}`，一篇或多篇；同名异内容 409） |
 | `GET /v1/libraries/{library_id}/jobs/{job_id}` | 摄入任务状态 |
 | `POST /v1/libraries/{library_id}/query` | 自然语言查询（`{"prompt"}`） |
 | `GET /v1/libraries/{library_id}/files/{path}` | 读取 `raw/` 或 `wiki/` 下的知识文件原文（供前端渲染法规页等，配合引用的 `#char=` 偏移高亮；带 `Last-Modified`） |
@@ -320,7 +323,7 @@ curl -X POST http://127.0.0.1:8787/v1/libraries \
 
 curl -X POST http://127.0.0.1:8787/v1/libraries/产品知识库/documents \
   -H 'content-type: application/json' \
-  -d '{"filename":"session-context.md","content":"# Session Context\n\n文档内容"}'
+  -d '{"documents":[{"filename":"session-context.md","content":"# Session Context\n\n文档内容"}]}'
 
 curl -X POST http://127.0.0.1:8787/v1/libraries/产品知识库/query \
   -H 'content-type: application/json' \
@@ -329,7 +332,7 @@ curl -X POST http://127.0.0.1:8787/v1/libraries/产品知识库/query \
 
 ## MCP
 
-Streamable HTTP 端点 `POST /mcp`，工具：`kb_ingest_document`、`kb_query`、`kb_job_status`、`kb_health`。除健康检查外都显式接收 `library_id`。Noema 不提供 stdio MCP 入口，也不把自定义知识库工具注入 OpenCode——OpenCode 直接使用内容库工作区与已安装 Skill。
+Streamable HTTP 端点 `POST /mcp`，工具：`kb_ingest_documents`（一篇或多篇，合并为一次摄入任务）、`kb_query`、`kb_job_status`、`kb_health`。除健康检查外都显式接收 `library_id`。Noema 不提供 stdio MCP 入口，也不把自定义知识库工具注入 OpenCode——OpenCode 直接使用内容库工作区与已安装 Skill。
 
 ## 快照格式
 
@@ -350,5 +353,5 @@ Streamable HTTP 端点 `POST /mcp`，工具：`kb_ingest_document`、`kb_query`�
 cargo fmt && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-- 库内单元测试 + `tests/service.rs`：假 OpenCode runtime 覆盖服务层（摄入、查询、内容库隔离、SHA-256 去重与未编译重复文档补摄入、摄入中途并发落盘不误判校验失败、失败作业由下一次摄入补编译、库名与文件名唯一性、NFC 归一化、CJK 引用提取、graphify 增量建图提示词）、HTTP 与 MCP 挂载、快照导入导出与恶意归档拒绝；
+- 库内单元测试 + `tests/service.rs`：假 OpenCode runtime 覆盖服务层（摄入、查询、内容库隔离、SHA-256 去重与未编译重复文档补摄入、摄入中途并发落盘不误判校验失败、失败作业由下一次摄入补编译、库名与文件名唯一性、NFC 归一化、CJK 引用提取、graphify 增量建图提示词、多文档合并摄入/提交内去重与冲突/失败提交补编译/HTTP 路由）、HTTP 与 MCP 挂载、快照导入导出与恶意归档拒绝；
 - `tests/cli.rs`：拉起真实 `noema` 及其 OpenCode Server 子进程，验证 noema-cli 经 HTTP 的导出→导入往返。建库真实执行 graphify 安装器（离线可用）；不需要模型或网络，但 PATH 上需要 `opencode` 与 `graphify`。
