@@ -54,35 +54,23 @@ const STAGING_RECONCILE_DELAY: Duration = Duration::from_secs(600);
 
 impl AppService<OpenCodeAgent> {
     pub fn new(config: Config) -> Result<Self, AppError> {
-        if config.max_sessions == 0 {
-            return Err(AppError::BadRequest(
-                "max_sessions must be at least 1".into(),
-            ));
-        }
         let config = Arc::new(config);
-        let storage = Storage::open(config.data_dir.clone())?;
         let runtime = Arc::new(OpenCodeAgent::new(config.clone()));
-        let sessions = Arc::new(Semaphore::new(config.max_sessions));
-        let service = Self {
-            storage,
-            config,
-            runtime,
-            ingest_locks: Arc::new(Mutex::new(HashMap::new())),
-            sessions,
-        };
-        service.startup_maintenance();
-        Ok(service)
+        Self::from_parts(config, runtime)
     }
 }
 
 impl<R: OpenCodeRuntime> AppService<R> {
     pub fn with_runtime(config: Config, runtime: Arc<R>) -> Result<Self, AppError> {
+        Self::from_parts(Arc::new(config), runtime)
+    }
+
+    fn from_parts(config: Arc<Config>, runtime: Arc<R>) -> Result<Self, AppError> {
         if config.max_sessions == 0 {
             return Err(AppError::BadRequest(
                 "max_sessions must be at least 1".into(),
             ));
         }
-        let config = Arc::new(config);
         let storage = Storage::open(config.data_dir.clone())?;
         let sessions = Arc::new(Semaphore::new(config.max_sessions));
         let service = Self {
@@ -101,20 +89,11 @@ impl<R: OpenCodeRuntime> AppService<R> {
     /// open); MCP tools always pass it — that endpoint is authenticated
     /// whenever the API is.
     pub fn health(&self, detailed: bool) -> HealthResponse {
-        if detailed {
-            HealthResponse {
-                status: "ok",
-                data_dir: Some(self.storage.root().display().to_string()),
-                opencode_url: Some(self.config.opencode_url.clone()),
-                configured_model: Some(self.config.opencode_model.clone()),
-            }
-        } else {
-            HealthResponse {
-                status: "ok",
-                data_dir: None,
-                opencode_url: None,
-                configured_model: None,
-            }
+        HealthResponse {
+            status: "ok",
+            data_dir: detailed.then(|| self.storage.root().display().to_string()),
+            opencode_url: detailed.then(|| self.config.opencode_url.clone()),
+            configured_model: detailed.then(|| self.config.opencode_model.clone()),
         }
     }
 
@@ -263,7 +242,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .sessions
             .acquire()
             .await
-            .map_err(|_| AppError::Runtime("session semaphore closed".into()))?;
+            .map_err(|_| sessions_closed())?;
         let query_id = self.storage.record_query(&library_id)?;
         // The user question goes in unmodified: all policy (the answer
         // contract, citation discipline, library boundaries) reaches the
@@ -377,10 +356,14 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .sessions
             .acquire()
             .await
-            .map_err(|_| AppError::Runtime("session semaphore closed".into()))?;
+            .map_err(|_| sessions_closed())?;
 
-        self.storage
-            .update_job(library_id, job_id, JobState::Running, None, None)?;
+        if let Err(error) =
+            self.storage
+                .update_job(library_id, job_id, JobState::Running, None, None)
+        {
+            return Err(self.record_job_failure(library_id, job_id, None, error));
+        }
         let (staging, baseline) = match self.storage.prepare_staging(library_id, job_id) {
             Ok(prepared) => prepared,
             Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
@@ -416,19 +399,29 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 error,
             ));
         }
-        self.storage.update_job(
+        if let Err(error) = self.storage.update_job(
             library_id,
             job_id,
             JobState::Completed,
             Some(&result.session_id),
             None,
-        )?;
+        ) {
+            // The promotion is durable — only the status write failed. Drop
+            // the staging copy anyway (unlike a genuine ingest failure
+            // there is nothing left to inspect) and report the job failed
+            // with the true cause instead of leaving it `running`.
+            self.cleanup_staging(library_id, job_id);
+            return Err(self.record_job_failure(
+                library_id,
+                job_id,
+                Some(&result.session_id),
+                error,
+            ));
+        }
         // Clean up only after the job is durably completed: a cleanup
         // failure must not strand an already-promoted job as `running` —
         // reconciliation removes leftover workspaces of completed jobs.
-        if let Err(error) = self.storage.cleanup_staging(library_id, job_id) {
-            tracing::warn!(library_id = %library_id, job_id = %job_id, %error, "staging cleanup failed");
-        }
+        self.cleanup_staging(library_id, job_id);
         // OpenCode writes this session's tombstone back into the staging
         // project directory minutes after the cleanup above, resurrecting
         // an empty skeleton; re-reconcile past that write-back window so a
@@ -443,6 +436,14 @@ impl<R: OpenCodeRuntime> AppService<R> {
             }
         });
         Ok(())
+    }
+
+    /// Drop one job's staging workspace; a failure only logs — the startup
+    /// reconciliation sweep eventually removes whatever is left behind.
+    fn cleanup_staging(&self, library_id: &str, job_id: &str) {
+        if let Err(error) = self.storage.cleanup_staging(library_id, job_id) {
+            tracing::warn!(library_id = %library_id, job_id = %job_id, %error, "staging cleanup failed");
+        }
     }
 
     async fn bootstrap_library(&self, library: &Library) -> Result<(), AppError> {
@@ -470,8 +471,23 @@ fn uncompiled_documents(
         .list_documents(library_id)?
         .into_iter()
         .map(|document| document.path)
-        .filter(|path| path != current && !referenced.contains(path))
+        .filter(|path| {
+            path != current
+                && !referenced.contains(path)
+                // Submissions are not gated by the ingest lock, so a document
+                // submitted after this staging copy was prepared is already
+                // in the database but absent from staging raw/: its own
+                // queued job will compile it; naming it here would ask the
+                // session to read a file its workspace does not contain.
+                && staging.join(path).is_file()
+        })
         .collect())
+}
+
+/// The global session semaphore is only closed at shutdown; a refused
+/// permit means the server is winding down and admits no new work.
+fn sessions_closed() -> AppError {
+    AppError::Runtime("session semaphore closed".into())
 }
 
 /// The ingest task message (user role): job-specific facts only. All policy
@@ -500,4 +516,36 @@ fn format_ingest_task(
     format!(
         "摄入任务 {job_id}。先阅读 purpose.md 和 schema.md，再阅读源文档 {source_path}；节点落盘后同步更新 index.md。项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT。\n\n{extras_step}{graphify_step} 让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extras_never_name_documents_absent_from_the_staging_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let storage = Storage::open(tmp.path()).unwrap();
+        let library = storage
+            .create_library(&CreateLibraryRequest {
+                name: "暂存库".into(),
+                description: None,
+            })
+            .unwrap();
+        storage
+            .store_document(&library.id, "a.md", None, "content a")
+            .unwrap();
+        storage
+            .store_document(&library.id, "b.md", None, "content b")
+            .unwrap();
+        // Staging copy taken before b.md landed: its DB row must not leak
+        // into the extras list — the session would be told to compile a
+        // file its workspace does not contain.
+        let staging = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(staging.path().join("raw")).unwrap();
+        std::fs::write(staging.path().join("raw/a.md"), "content a").unwrap();
+        let extras =
+            uncompiled_documents(&storage, &library.id, staging.path(), "raw/a.md").unwrap();
+        assert!(extras.is_empty(), "{extras:?}");
+    }
 }

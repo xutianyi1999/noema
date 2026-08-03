@@ -33,9 +33,7 @@ impl Storage {
             .optional()?
             .is_some();
         if taken {
-            return Err(AppError::Conflict(format!(
-                "a library named {name} already exists"
-            )));
+            return Err(library_name_conflict(&name));
         }
 
         let id = name.clone();
@@ -74,10 +72,7 @@ impl Storage {
             Err(rusqlite::Error::SqliteFailure(failure, _))
                 if failure.code == rusqlite::ErrorCode::ConstraintViolation =>
             {
-                Err(AppError::Conflict(format!(
-                    "a library named {} already exists",
-                    library.name
-                )))
+                Err(library_name_conflict(&library.name))
             }
             Err(error) => {
                 let _ = fs::remove_dir_all(&root);
@@ -93,16 +88,7 @@ impl Storage {
             .query_row(
                 "SELECT id, name, description, root, created_at FROM libraries WHERE id = ?1",
                 params![library_id],
-                |row| {
-                    let created_at: String = row.get(4)?;
-                    Ok(Library {
-                        id: row.get(0)?,
-                        name: row.get(1)?,
-                        description: row.get(2)?,
-                        root: row.get(3)?,
-                        created_at: parse_timestamp_or_now(&created_at),
-                    })
-                },
+                library_from_row,
             )
             .optional()?;
         let mut library = row.ok_or_else(|| AppError::LibraryNotFound(library_id.into()))?;
@@ -122,17 +108,24 @@ impl Storage {
         Ok(PathBuf::from(self.get_library(library_id)?.root))
     }
 
-    /// Fail every job and query run a previous server process left in
-    /// `running`: this process has run nothing yet, so they were interrupted
-    /// by its shutdown or crash, and nothing else would ever transition them
-    /// out of that state. Runs at startup, before staging reconciliation.
+    /// Fail every run a previous server process left non-terminal: jobs
+    /// still `running` died mid-session, jobs still `queued` died waiting
+    /// for their library lock, and `running` query runs died the same way.
+    /// This process has spawned nothing yet, so nothing else would ever
+    /// transition them. Runs at startup, before staging reconciliation.
     pub fn reap_interrupted_runs(&self) -> Result<(), AppError> {
         const INTERRUPTED: &str = "interrupted by server restart";
         let now = Utc::now().to_rfc3339();
         let connection = self.db()?;
         connection.execute(
-            "UPDATE jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE status = ?4",
-            params![JobState::Failed, INTERRUPTED, now, JobState::Running],
+            "UPDATE jobs SET status = ?1, error = ?2, updated_at = ?3 WHERE status IN (?4, ?5)",
+            params![
+                JobState::Failed,
+                INTERRUPTED,
+                now,
+                JobState::Running,
+                JobState::Queued
+            ],
         )?;
         connection.execute(
             "UPDATE query_runs SET status = ?1, error = ?2, updated_at = ?3 WHERE status = ?4",
@@ -146,19 +139,9 @@ impl Storage {
         let mut statement = connection.prepare(
             "SELECT id, name, description, root, created_at FROM libraries ORDER BY created_at",
         )?;
-        let libraries = statement
-            .query_map([], |row| {
-                let created_at: String = row.get(4)?;
-                Ok(Library {
-                    id: row.get(0)?,
-                    name: row.get(1)?,
-                    description: row.get(2)?,
-                    root: row.get(3)?,
-                    created_at: parse_timestamp_or_now(&created_at),
-                })
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(libraries)
+        Ok(statement
+            .query_map([], library_from_row)?
+            .collect::<Result<Vec<_>, _>>()?)
     }
 
     /// Resolve a protocol-layer library selector: an exact id first, then an
@@ -296,6 +279,21 @@ impl Storage {
     }
 }
 
+fn library_name_conflict(name: &str) -> AppError {
+    AppError::Conflict(format!("a library named {name} already exists"))
+}
+
+fn library_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Library> {
+    let created_at: String = row.get(4)?;
+    Ok(Library {
+        id: row.get(0)?,
+        name: row.get(1)?,
+        description: row.get(2)?,
+        root: row.get(3)?,
+        created_at: parse_timestamp_or_now(&created_at),
+    })
+}
+
 fn job_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<JobStatus> {
     let created_at: String = row.get(6)?;
     let updated_at: String = row.get(7)?;
@@ -421,6 +419,8 @@ mod tests {
                 None,
             )
             .unwrap();
+        // A task that died waiting for the library lock stays `queued`.
+        let queued = storage.create_job(&library.id, JobKind::Ingest).unwrap();
         let query_id = storage.record_query(&library.id).unwrap();
 
         storage.reap_interrupted_runs().unwrap();
@@ -429,6 +429,12 @@ mod tests {
         assert_eq!(interrupted.status, JobState::Failed);
         assert_eq!(
             interrupted.error.as_deref(),
+            Some("interrupted by server restart")
+        );
+        let queued = storage.get_job(&library.id, &queued.job_id).unwrap();
+        assert_eq!(queued.status, JobState::Failed);
+        assert_eq!(
+            queued.error.as_deref(),
             Some("interrupted by server restart")
         );
         assert_eq!(

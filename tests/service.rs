@@ -14,7 +14,7 @@ use axum::{
 };
 use noema::{
     AppError, AppService, http as http_api,
-    models::{CreateLibraryRequest, DocumentInput, JobState},
+    models::{CreateLibraryRequest, DocumentInput, JobState, Library},
     runtime::{AgentRunRequest, AgentRunResult, OpenCodeRuntime},
 };
 use tempfile::TempDir;
@@ -142,6 +142,36 @@ async fn wait_for_completion(
         sleep(Duration::from_millis(10)).await;
     }
     panic!("ingestion job did not finish: {job_id}");
+}
+
+/// Standard opening for most tests: a fresh library whose one source
+/// document is already compiled.
+async fn library_with_source(
+    service: &AppService<FakeRuntime>,
+    name: &str,
+    title: Option<&str>,
+) -> Library {
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: name.into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let submitted = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "source.md".into(),
+                content: "# Session Context\n\nTest source.".into(),
+                title: title.map(str::to_string),
+            },
+        )
+        .await
+        .unwrap();
+    let status = wait_for_completion(service, &library.id, &submitted.job_id).await;
+    assert_eq!(status.status, JobState::Completed, "{status:?}");
+    library
 }
 
 #[tokio::test]
@@ -427,25 +457,7 @@ async fn concurrent_submissions_to_one_library_are_serialized() {
 #[tokio::test]
 async fn citations_are_verified_and_unverified_markers_are_stripped() {
     let (_tempdir, service, _runtime) = service_fixture().await;
-    let library = service
-        .create_library(CreateLibraryRequest {
-            name: "引文库".into(),
-            description: None,
-        })
-        .await
-        .unwrap();
-    let submitted = service
-        .submit_document(
-            &library.id,
-            DocumentInput {
-                filename: "source.md".into(),
-                content: "# Session Context\n\nTest source.".into(),
-                title: Some("来源文档".into()),
-            },
-        )
-        .await
-        .unwrap();
-    wait_for_completion(&service, &library.id, &submitted.job_id).await;
+    let library = library_with_source(&service, "引文库", Some("来源文档")).await;
 
     // The first declared citation quotes text the source does not contain:
     // it is dropped and its [1] marker stripped; the honest second citation
@@ -466,25 +478,7 @@ async fn citations_are_verified_and_unverified_markers_are_stripped() {
 #[tokio::test]
 async fn non_contract_answer_degrades_to_plain_text_without_references() {
     let (_tempdir, service, _runtime) = service_fixture().await;
-    let library = service
-        .create_library(CreateLibraryRequest {
-            name: "降级库".into(),
-            description: None,
-        })
-        .await
-        .unwrap();
-    let submitted = service
-        .submit_document(
-            &library.id,
-            DocumentInput {
-                filename: "source.md".into(),
-                content: "# Session Context\n\nTest source.".into(),
-                title: None,
-            },
-        )
-        .await
-        .unwrap();
-    wait_for_completion(&service, &library.id, &submitted.job_id).await;
+    let library = library_with_source(&service, "降级库", None).await;
 
     let answer = service
         .query(&library.id, "bad-contract 场景")
@@ -504,24 +498,7 @@ async fn non_contract_answer_degrades_to_plain_text_without_references() {
 #[tokio::test]
 async fn knowledge_files_are_served_with_safety_checks() {
     let (_tempdir, service, _runtime) = service_fixture().await;
-    let library = service
-        .create_library(CreateLibraryRequest {
-            name: "fileslib".into(),
-            description: None,
-        })
-        .await
-        .unwrap();
-    service
-        .submit_document(
-            &library.id,
-            DocumentInput {
-                filename: "source.md".into(),
-                content: "# Session Context\n\nTest source.".into(),
-                title: None,
-            },
-        )
-        .await
-        .unwrap();
+    library_with_source(&service, "fileslib", None).await;
     let app = http_api::router(service);
 
     let response = app

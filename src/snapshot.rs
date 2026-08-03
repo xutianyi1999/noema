@@ -31,19 +31,19 @@ use crate::{
 };
 
 /// Name of the manifest entry stored at the front of every snapshot.
-pub const SNAPSHOT_MANIFEST: &str = "noema-snapshot.json";
+const SNAPSHOT_MANIFEST: &str = "noema-snapshot.json";
 const SNAPSHOT_FORMAT: &str = "noema-library-snapshot";
 const SNAPSHOT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SnapshotManifest {
-    pub format: String,
-    pub version: u32,
-    pub name: String,
+struct SnapshotManifest {
+    format: String,
+    version: u32,
+    name: String,
     #[serde(default)]
-    pub description: Option<String>,
-    pub source_library_id: String,
-    pub exported_at: String,
+    description: Option<String>,
+    source_library_id: String,
+    exported_at: String,
 }
 
 /// Export one content library (selected by id or, if unique, by name) as a

@@ -249,7 +249,10 @@ async fn cmd_import(
     name: Option<&str>,
     description: Option<&str>,
 ) -> Result<(), BoxError> {
-    let bytes = tokio::fs::read(&archive)
+    // Stream the archive from disk: snapshots can approach the server's
+    // 512 MiB upload cap, and buffering the whole file would needlessly
+    // double the CLI's memory footprint.
+    let file = tokio::fs::File::open(&archive)
         .await
         .map_err(|error| format!("cannot read {}: {error}", archive.display()))?;
     let mut query: Vec<(&str, &str)> = Vec::new();
@@ -264,7 +267,9 @@ async fn cmd_import(
             .post(format!("{base}/v1/libraries/import"))
             .query(&query)
             .header(reqwest::header::CONTENT_TYPE, "application/gzip")
-            .body(bytes),
+            .body(reqwest::Body::wrap_stream(
+                tokio_util::io::ReaderStream::new(file),
+            )),
     )
     .await?;
     print_library("✔ 已导入为全新内容库", &response.json::<Value>().await?);

@@ -16,6 +16,7 @@ use axum::{
 };
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
+use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
 use tokio::io::AsyncReadExt;
@@ -80,15 +81,19 @@ async fn require_auth(
     if request.uri().path() == "/v1/health" {
         return Ok(next.run(request).await);
     }
-    let presented = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "));
-    match presented {
+    match bearer_token(request.headers()) {
         Some(candidate) if tokens_match(candidate, &token) => Ok(next.run(request).await),
         _ => Err(AppError::Unauthorized),
     }
+}
+
+/// The token of an `Authorization: Bearer <token>` header, when present,
+/// well-formed UTF-8, and actually bearer-shaped.
+fn bearer_token(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
 }
 
 /// Constant-time string equality, so response timing never reveals how many
@@ -127,11 +132,9 @@ fn probe_carries_the_token<R: OpenCodeRuntime>(
 ) -> bool {
     match service.auth_token() {
         None => true,
-        Some(expected) => headers
-            .get(header::AUTHORIZATION)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.strip_prefix("Bearer "))
-            .is_some_and(|candidate| tokens_match(candidate, expected)),
+        Some(expected) => {
+            bearer_token(headers).is_some_and(|candidate| tokens_match(candidate, expected))
+        }
     }
 }
 
@@ -176,7 +179,15 @@ async fn export_library<R: OpenCodeRuntime>(
         .header(header::CONTENT_LENGTH, length)
         .header(
             header::CONTENT_DISPOSITION,
-            format!("attachment; filename=\"{}.tar.gz\"", library.id),
+            // The plain `filename` parameter is ASCII-only by RFC 6266, so
+            // CJK library ids travel percent-encoded in `filename*` (RFC
+            // 5987); modern clients prefer it, legacy ones still get a
+            // syntactically valid quoted-string.
+            format!(
+                "attachment; filename=\"{id}.tar.gz\"; filename*=UTF-8''{encoded}.tar.gz",
+                id = library.id,
+                encoded = utf8_percent_encode(&library.id, NON_ALPHANUMERIC)
+            ),
         )
         .body(Body::from_stream(body))?)
 }
@@ -276,16 +287,17 @@ async fn knowledge_file<R: OpenCodeRuntime>(
     // deleted mid-request) is the same 404 as any absent path — and never an
     // error body carrying the resolved absolute path.
     let not_found = || AppError::FileNotFound(path.clone());
-    let metadata = tokio::fs::metadata(&resolved)
+    // Open first, then stat the open handle: metadata captured before the
+    // open could describe a version a concurrent promotion already
+    // replaced, advertising a Content-Length the body disagrees with.
+    let file = tokio::fs::File::open(&resolved)
         .await
         .map_err(|_| not_found())?;
+    let metadata = file.metadata().await.map_err(|_| not_found())?;
     let content_type = match resolved.extension().and_then(|value| value.to_str()) {
         Some("md") => "text/markdown; charset=utf-8",
         _ => "text/plain; charset=utf-8",
     };
-    let file = tokio::fs::File::open(&resolved)
-        .await
-        .map_err(|_| not_found())?;
     Ok(Response::builder()
         .header(header::CONTENT_TYPE, content_type)
         .header(header::CONTENT_LENGTH, metadata.len())
