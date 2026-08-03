@@ -190,10 +190,11 @@ pub struct Reference {
     /// Stable 1-based citation id matching the `[n]` markers in the answer;
     /// ids of citations that failed verification are skipped, never reused.
     pub id: u32,
-    /// Display name: the document's registered title for `raw/` sources
-    /// (filename stem as fallback), the node stem for `wiki/` sources.
+    /// Display name: the document's registered title (filename stem as
+    /// fallback).
     pub title: String,
-    /// Library-relative path, under `raw/` or `wiki/`.
+    /// Library-relative path under `raw/`. Citations stand on primary
+    /// evidence only, so wiki nodes are never cited.
     pub source: String,
     /// The source's own address for the cited passage (e.g. `第三十三条`),
     /// exactly as the Agent declared it; not interpreted by the server.

@@ -64,9 +64,9 @@ pub(crate) fn agents_contract() -> String {
 ### 摄入任务（用户消息形如「摄入任务 <job_id>…」）\n\n\
 你是 Noema 的知识编译 Agent，只能在当前暂存内容库项目内工作。写入节点前先调用 OpenCode 的 `skill` 工具加载 knowledge-compiler Skill 并遵循其节点契约；创建节点前检查已有 wiki 节点，避免重复。创建或更新可追溯的知识节点：frontmatter 恰好包含契约定义的 9 个键，不要添加额外键；正文包含定义、证据/推理、示例或反例、局限性、RAG Version（100–300 字高密度压缩摘要，不是版本变更记录）和引用。sources 的 locator 按来源自身编号标注（如 第三十三条第二款、5.2.1）；法条、合同条款、公文与标准原文等规范文本必须从 raw/ 原文逐字引用，不得改写，RAG Version 只压缩评述与关系。未解决的冲突、低置信度关系与新旧文本矛盾放入 reviews/，用 opposite_to 表达。不要修改 raw 原文、.graphifyignore、.opencode、library.sqlite，也不要访问暂存项目外的路径。\n\n\
 ### 查询任务（用户消息为自然语言问题）\n\n\
-你是 Noema 内容库查询 Agent，只能在当前内容库项目内工作。先阅读 purpose.md 和 schema.md，再阅读 index.md；摘要优先——先读相关 wiki 节点的定义和 RAG Version 压缩摘要，不足时再读完整节点与 raw/ 原文；涉及关系问题时按需运行 graphify query。不要写入、编辑或删除文件，也不要访问项目外路径。\n\n\
+你是 Noema 内容库查询 Agent，只能在当前内容库项目内工作。先阅读 purpose.md 和 schema.md，再阅读 index.md；摘要优先——先读相关 wiki 节点的定义和 RAG Version 压缩摘要，不足时再读完整节点与 raw/ 原文。涉及多节点枚举、跨概念关系或需要先摸清库内相关内容版图的问题，先调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，按其查询流程定位相关节点，再读取命中的文件；单一概念的定义或单点事实问题直接读文件即可。不要写入、编辑或删除文件，也不要访问项目外路径。\n\n\
 只依据内容库证据回答，简洁说明推理过程。最终答案用 <noema-answer> 与 </noema-answer> 包裹，标记之间只放一个符合以下 JSON Schema 的 JSON 对象（不要输出 Schema 以外的键）：\n{schema}\n\n\
-字段要求：answer 是答案正文，格式不限（Markdown 或用户要求的任何格式），并为每个事实性结论在句末标注 [n]，n 是该结论引用的来源在 references 数组中的序号（从 1 开始）；references 每项给出 source（raw/ 或 wiki/ 下的相对路径）、quote（从来源文件中逐字复制的引文，不得改写或省略）与 locator（按来源自身编号标注的地址），若能精确计算可附 start/end（quote 在文件中的 Unicode 字符偏移，end 不含）。规范文本（法条、合同条款、公文与标准原文）必须逐字引用；无法在来源中逐字核验的说法不得标注引用。\n\n\
+字段要求：answer 是答案正文，格式不限（Markdown 或用户要求的任何格式），并为每个事实性结论在句末标注 [n]，n 是该结论引用的来源在 references 数组中的序号（从 1 开始）；references 每项给出 source（raw/ 下的相对路径——引用只能指向 raw/ 原始文档，不得引用 wiki/ 节点；结论若经由 wiki 节点找到，沿其 frontmatter 的 sources 回溯到 raw/ 原文再引用）、quote（从来源文件中逐字复制的引文，不得改写或省略）与 locator（按来源自身编号标注的地址），若能精确计算可附 start/end（quote 在文件中的 Unicode 字符偏移，end 不含）。规范文本（法条、合同条款、公文与标准原文）必须逐字引用；无法在 raw/ 来源中逐字核验的说法不得标注引用。\n\n\
 格式示例（仅作演示，内容勿抄）：\n<noema-answer>\n{example}\n</noema-answer>\n",
         schema = answer_schema_json(),
         example = answer_example_json()
@@ -169,11 +169,12 @@ fn strip_answer_markers(block: &str) -> String {
 }
 
 /// Resolve the Agent's declared citations against the library at `root`.
-/// A citation survives only when its quote is a verbatim substring of the
-/// source file; agent-supplied offsets are adopted only if they slice out
-/// the quote exactly, and recomputed otherwise. Survivors keep their 1-based
-/// array position as `id`, so dropped citations leave id gaps that line up
-/// with the answer's `[n]` markers.
+/// A citation survives only when it points at a `raw/` source document
+/// (wiki nodes navigate but are never citable) and its quote is a verbatim
+/// substring of that file; agent-supplied offsets are adopted only if they
+/// slice out the quote exactly, and recomputed otherwise. Survivors keep
+/// their 1-based array position as `id`, so dropped citations leave id gaps
+/// that line up with the answer's `[n]` markers.
 pub(crate) fn resolve_references(root: &Path, declared: &[AgentReference]) -> Vec<Reference> {
     let titles = document_titles(root);
     declared
@@ -195,6 +196,13 @@ fn resolve_one(
         tracing::warn!(source = %declaration.source, "citation rejected: not a knowledge path or empty quote");
         return None;
     }
+    // Citations stand on primary evidence only: wiki nodes are compiled
+    // summaries and may only navigate, never be cited. The contract tells
+    // the Agent to trace a node's sources back to raw/ and cite that.
+    if !declaration.source.starts_with("raw/") {
+        tracing::warn!(source = %declaration.source, "citation rejected: only raw/ source documents are citable");
+        return None;
+    }
     // Resolve through the canonical path: the agent runs with full
     // permissions and could plant a symlink under raw/ pointing outside the
     // library; verification must never read (and "confirm") such a target.
@@ -212,7 +220,9 @@ fn resolve_one(
     let (start_byte, end_byte) = locate_quote(&content, declaration)?;
     let start = content[..start_byte].chars().count();
     let end = start + declaration.quote.chars().count();
-    let is_raw = declaration.source.starts_with("raw/");
+    // The compiled wiki node matching the cited raw document, when one
+    // exists: the "source → node" second hop of the traceability chain.
+    let node = format!("wiki/{}.md", stem_of(&declaration.source));
     Some(Reference {
         id,
         title: titles
@@ -228,12 +238,7 @@ fn resolve_one(
             line_at(&content, start_byte),
             line_at(&content, end_byte) - usize::from(declaration.quote.ends_with('\n')),
         )),
-        node: is_raw
-            .then(|| {
-                let node = format!("wiki/{}.md", stem_of(&declaration.source));
-                root.join(&node).is_file().then_some(node)
-            })
-            .flatten(),
+        node: root.join(&node).is_file().then_some(node),
     })
 }
 
@@ -474,6 +479,24 @@ mod tests {
             end: None,
         };
         assert!(resolve_references(tmp.path(), std::slice::from_ref(&unsafe_path)).is_empty());
+    }
+
+    /// Wiki nodes are compiled summaries: they may navigate the Agent to
+    /// the raw/ source behind a claim, but citations stand on primary
+    /// evidence only, so a wiki citation is dropped even when its quote is
+    /// verbatim in the node.
+    #[test]
+    fn drops_citations_whose_source_is_a_wiki_node() {
+        let tmp = fixture();
+        fs::write(tmp.path().join("wiki/担保法.md"), "连带责任保证的定义。").unwrap();
+        let declaration = AgentReference {
+            source: "wiki/担保法.md".into(),
+            quote: "连带责任保证的定义。".into(),
+            locator: None,
+            start: None,
+            end: None,
+        };
+        assert!(resolve_references(tmp.path(), std::slice::from_ref(&declaration)).is_empty());
     }
 
     /// The agent runs with full permissions and could plant a link under
