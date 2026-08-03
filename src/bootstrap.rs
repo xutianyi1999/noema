@@ -39,6 +39,16 @@ pub(crate) fn skill_files() -> [(&'static str, &'static str); 4] {
 /// than this is wedged and gets killed instead of parking a blocking thread
 /// forever.
 const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
+/// The graphify installer's project-scope skill for OpenCode. Its presence
+/// marks a library the installer has completed; startup re-runs the full
+/// bootstrap where it is missing.
+const GRAPHIFY_MARKER: &str = ".opencode/skills/graphify/SKILL.md";
+
+/// Whether the upstream graphify installer has completed in this library
+/// project.
+pub(crate) fn graphify_installed(root: &Path) -> bool {
+    root.join(GRAPHIFY_MARKER).is_file()
+}
 /// Installer diagnostics beyond this are noise; keep a bounded head for the
 /// error message without buffering a chatty release wholesale.
 const STDERR_CAP: u64 = 16 * 1024;

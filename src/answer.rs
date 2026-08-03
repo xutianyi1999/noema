@@ -28,13 +28,20 @@ use crate::{
     references::safe_knowledge_path,
 };
 
+/// The contract schema, generated once from the [`AgentAnswer`] type and
+/// shared by its JSON rendering and the answer validator.
+fn contract_schema() -> &'static serde_json::Value {
+    static SCHEMA: OnceLock<serde_json::Value> = OnceLock::new();
+    SCHEMA.get_or_init(|| {
+        serde_json::to_value(schemars::schema_for!(AgentAnswer)).expect("schema serializes")
+    })
+}
+
 /// The contract schema as compact JSON, installed into each library's
 /// generated `AGENTS.md` contract.
 pub(crate) fn answer_schema_json() -> &'static str {
-    static SCHEMA: OnceLock<String> = OnceLock::new();
-    SCHEMA.get_or_init(|| {
-        serde_json::to_string(&schemars::schema_for!(AgentAnswer)).expect("schema serializes")
-    })
+    static SCHEMA_JSON: OnceLock<String> = OnceLock::new();
+    SCHEMA_JSON.get_or_init(|| serde_json::to_string(contract_schema()).expect("schema serializes"))
 }
 
 /// A worked contract example, serialized from an [`AgentAnswer`] value
@@ -91,9 +98,7 @@ fn answer_example() -> AgentAnswer {
 fn contract_validator() -> &'static jsonschema::Validator {
     static VALIDATOR: OnceLock<jsonschema::Validator> = OnceLock::new();
     VALIDATOR.get_or_init(|| {
-        let schema =
-            serde_json::to_value(schemars::schema_for!(AgentAnswer)).expect("schema serializes");
-        jsonschema::validator_for(&schema).expect("generated schema is itself valid")
+        jsonschema::validator_for(contract_schema()).expect("generated schema is itself valid")
     })
 }
 

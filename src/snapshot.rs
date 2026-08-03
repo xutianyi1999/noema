@@ -106,6 +106,9 @@ fn import_inner(
     unpack_validated(&mut archive, scratch, MAX_UNPACKED_BYTES)?;
 
     let manifest = read_snapshot_manifest(scratch)?;
+    // The manifest is snapshot metadata, not library content: drop it so it
+    // never settles into the imported library root (and every later export).
+    let _ = fs::remove_file(scratch.join(SNAPSHOT_MANIFEST));
     let had_opencode = scratch.join(".opencode").is_dir();
     // The snapshot records the source library's name; importers keep it
     // unless they pass an explicit one. Names are unique, so re-importing
@@ -414,6 +417,8 @@ mod tests {
         // Runtime state and links never travel.
         assert!(!imported_root.join("staging/job-x").exists());
         assert!(!imported_root.join("raw/evil-link").exists());
+        // The snapshot manifest is metadata, not library content.
+        assert!(!imported_root.join(SNAPSHOT_MANIFEST).exists());
         // Noema skills were refreshed to this binary's contract.
         let skill =
             fs::read_to_string(imported_root.join(".opencode/skills/kb-query/SKILL.md")).unwrap();

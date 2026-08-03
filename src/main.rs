@@ -57,9 +57,7 @@ struct Cli {
 
 fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            std::env::var("RUST_LOG").unwrap_or_else(|_| "noema=info,tower_http=info".into()),
-        )
+        .with_env_filter(std::env::var("RUST_LOG").unwrap_or_else(|_| "noema=info".into()))
         .with_target(false)
         .init();
 
@@ -100,7 +98,6 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     let managed = spawn_opencode_server().await?;
     let config = Config {
         data_dir: cli.data_dir,
-        bind,
         // 客户端连接始终指向刚刚拉起的这个实例。
         opencode_url: managed.url().to_string(),
         opencode_model: cli.model,

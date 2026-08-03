@@ -240,16 +240,9 @@ pub(crate) fn referenced_sources(wiki_dir: &Path) -> Result<HashSet<String>, App
         if !entry.file_type().is_file() {
             continue;
         }
-        let content = fs::read_to_string(entry.path())?;
-        let Some(frontmatter) = extract_frontmatter(&content) else {
+        let Some(mapping) = frontmatter_mapping(entry.path())? else {
             continue;
         };
-        let mapping: yaml_serde::Mapping = yaml_serde::from_str(&frontmatter).map_err(|error| {
-            AppError::Storage(format!(
-                "wiki node has invalid YAML frontmatter: {}: {error}",
-                entry.path().display()
-            ))
-        })?;
         let Some(yaml_serde::Value::Sequence(items)) = mapping.get("sources") else {
             continue;
         };
@@ -300,41 +293,71 @@ fn extract_frontmatter(content: &str) -> Option<String> {
     None
 }
 
+/// The YAML frontmatter of one node file as a mapping, or `None` when the
+/// file has no frontmatter block; unparseable YAML is an error.
+fn frontmatter_mapping(path: &Path) -> Result<Option<yaml_serde::Mapping>, AppError> {
+    let content = fs::read_to_string(path)?;
+    let Some(frontmatter) = extract_frontmatter(&content) else {
+        return Ok(None);
+    };
+    let mapping = yaml_serde::from_str(&frontmatter).map_err(|error| {
+        AppError::Storage(format!(
+            "wiki node has invalid YAML frontmatter: {}: {error}",
+            path.display()
+        ))
+    })?;
+    Ok(Some(mapping))
+}
+
 fn validate_wiki_nodes(root: &Path) -> Result<(), AppError> {
     if !root.exists() {
         return Ok(());
     }
     for entry in WalkDir::new(root).follow_links(false) {
         let entry = entry?;
+        let path = entry.path();
         if !entry.file_type().is_file()
-            || entry
-                .path()
+            || path
                 .extension()
                 .and_then(|value| value.to_str())
                 .is_none_or(|value| !value.eq_ignore_ascii_case("md"))
         {
             continue;
         }
-        let content = fs::read_to_string(entry.path())?;
-        let Some(frontmatter) = extract_frontmatter(&content) else {
+        let Some(mapping) = frontmatter_mapping(path)? else {
             return Err(AppError::Storage(format!(
                 "wiki node is missing YAML frontmatter: {}",
-                entry.path().display()
+                path.display()
             )));
         };
-        let mapping: yaml_serde::Mapping = yaml_serde::from_str(&frontmatter).map_err(|error| {
-            AppError::Storage(format!(
-                "wiki node has invalid YAML frontmatter: {}: {error}",
-                entry.path().display()
-            ))
-        })?;
-        for key in WIKI_NODE_KEYS {
-            if !mapping.contains_key(yaml_serde::Value::String(key.into())) {
-                return Err(AppError::Storage(format!(
-                    "wiki node has incomplete YAML frontmatter: {}: missing `{key}`",
-                    entry.path().display()
-                )));
-            }
+        let missing: Vec<&str> = WIKI_NODE_KEYS
+            .iter()
+            .copied()
+            .filter(|key| !mapping.contains_key(yaml_serde::Value::String((*key).into())))
+            .collect();
+        if !missing.is_empty() {
+            return Err(AppError::Storage(format!(
+                "wiki node has incomplete YAML frontmatter: {}: missing {}",
+                path.display(),
+                missing.join(", ")
+            )));
+        }
+        // The contract allows exactly the nine node keys: extra keys fail
+        // validation instead of drifting into the promoted library.
+        let extra: Vec<String> = mapping
+            .keys()
+            .map(|key| match key {
+                yaml_serde::Value::String(key) => key.clone(),
+                other => format!("{other:?}"),
+            })
+            .filter(|key| !WIKI_NODE_KEYS.contains(&key.as_str()))
+            .collect();
+        if !extra.is_empty() {
+            return Err(AppError::Storage(format!(
+                "wiki node declares frontmatter keys outside the contract: {}: {}",
+                path.display(),
+                extra.join(", ")
+            )));
         }
     }
     Ok(())
@@ -440,6 +463,51 @@ mod tests {
         storage
             .validate_staging(&library_id, &job.job_id, &baseline)
             .unwrap();
+    }
+
+    /// A node whose frontmatter carries exactly the nine contract keys.
+    fn contract_node(extra: &str) -> String {
+        format!(
+            "---\nnode_id: n\ncanonical_name: N\nkind: concept\nsources:\n  - path: raw/source.md\n    locator: 第一条\nrelations:\n  depends_on: []\n  related_to: []\n  opposite_to: []\nclaim_type: observed\nconfidence: 1.0\ncreated_at: 2026-08-01T00:00:00Z\nupdated_at: 2026-08-01T00:00:00Z\n{extra}---\n\n# N\n"
+        )
+    }
+
+    #[test]
+    fn validate_staging_enforces_exactly_the_nine_contract_keys() {
+        let (_tmp, storage, library_id) = fixture();
+        storage
+            .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
+            .unwrap();
+        let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
+        let (staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
+
+        // Exactly the contract keys pass.
+        fs::write(staging.join("wiki/n.md"), contract_node("")).unwrap();
+        storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap();
+
+        // An extra key violates the node contract.
+        fs::write(
+            staging.join("wiki/n.md"),
+            contract_node("extra_key: not in the contract\n"),
+        )
+        .unwrap();
+        let error = storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap_err();
+        assert!(error.to_string().contains("extra_key"), "{error}");
+
+        // A missing key as well.
+        fs::write(
+            staging.join("wiki/n.md"),
+            contract_node("").replacen("confidence: 1.0\n", "", 1),
+        )
+        .unwrap();
+        let error = storage
+            .validate_staging(&library_id, &job.job_id, &baseline)
+            .unwrap_err();
+        assert!(error.to_string().contains("confidence"), "{error}");
     }
 
     #[test]

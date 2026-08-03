@@ -10,7 +10,6 @@ use opencode_rs::{
         session::CreateSessionRequest,
     },
 };
-use serde::Serialize;
 use tokio::time::{Instant, timeout_at};
 
 use crate::{config::Config, error::AppError, transcript::Transcript};
@@ -23,7 +22,7 @@ pub struct AgentRunRequest {
     pub title: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct AgentRunResult {
     pub session_id: String,
     pub answer: String,
@@ -145,7 +144,10 @@ struct CollectedEvents {
     answer: String,
     streamed_text: bool,
     streamed_message: Option<String>,
-    fallback_text: Vec<String>,
+    /// Latest text snapshot per part index of the fallback message: OpenCode
+    /// resends a part's whole text on every `message.part.updated`, so a new
+    /// snapshot of the same part replaces the old one instead of appending.
+    fallback_parts: Vec<(Option<usize>, String)>,
     fallback_message: Option<String>,
     tool_events: Vec<serde_json::Value>,
 }
@@ -180,10 +182,17 @@ impl CollectedEvents {
         if let Some(message_id) = &properties.message_id
             && self.fallback_message.as_deref() != Some(message_id)
         {
-            self.fallback_text.clear();
+            self.fallback_parts.clear();
             self.fallback_message = Some(message_id.clone());
         }
-        self.fallback_text.push(text.clone());
+        match self
+            .fallback_parts
+            .iter_mut()
+            .find(|(index, _)| *index == properties.index)
+        {
+            Some((_, snapshot)) => *snapshot = text.clone(),
+            None => self.fallback_parts.push((properties.index, text.clone())),
+        }
     }
 
     fn push_tool_event(&mut self, event: &Event) {
@@ -193,8 +202,13 @@ impl CollectedEvents {
     }
 
     fn finish(mut self) -> Self {
-        if !self.streamed_text && !self.fallback_text.is_empty() {
-            self.answer = self.fallback_text.join("\n");
+        if !self.streamed_text && !self.fallback_parts.is_empty() {
+            self.answer = self
+                .fallback_parts
+                .iter()
+                .map(|(_, text)| text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n");
         }
         if let Some(marked) = extract_marked_answer(&self.answer) {
             self.answer = marked;
@@ -419,5 +433,26 @@ mod tests {
         assert!(is_text_delta(&props(Some("text"), None)));
         assert!(is_text_delta(&props(None, None)));
         assert!(!is_text_delta(&props(Some("reasoning"), None)));
+    }
+
+    fn text_update(message_id: &str, index: usize, text: &str) -> MessagePartEventProps {
+        let mut properties = props(
+            None,
+            Some(part(serde_json::json!({ "type": "text", "text": text }))),
+        );
+        properties.message_id = Some(message_id.into());
+        properties.index = Some(index);
+        properties
+    }
+
+    #[test]
+    fn fallback_keeps_only_the_latest_snapshot_per_part() {
+        // OpenCode resends a part's whole text on every update; the fallback
+        // answer must hold each part once, not once per snapshot.
+        let mut collected = CollectedEvents::default();
+        collected.apply_part_update(&text_update("m1", 0, "hel"));
+        collected.apply_part_update(&text_update("m1", 0, "hello"));
+        collected.apply_part_update(&text_update("m1", 1, "world"));
+        assert_eq!(collected.finish().answer, "hello\nworld");
     }
 }

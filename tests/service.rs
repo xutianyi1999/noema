@@ -136,7 +136,10 @@ async fn wait_for_completion(
 ) -> noema::models::JobStatus {
     for _ in 0..100 {
         let status = service.job_status(library_id, job_id).unwrap();
-        if matches!(status.status, JobState::Completed | JobState::Failed) {
+        if matches!(
+            status.status,
+            JobState::Completed | JobState::Failed | JobState::Skipped
+        ) {
             return status;
         }
         sleep(Duration::from_millis(10)).await;
@@ -430,17 +433,13 @@ async fn concurrent_submissions_to_one_library_are_serialized() {
     let first_status = wait_for_completion(&service, &library.id, &first.job_id).await;
     let second_status = wait_for_completion(&service, &library.id, &second.job_id).await;
     assert_eq!(first_status.status, JobState::Completed, "{first_status:?}");
-    assert_eq!(
-        second_status.status,
-        JobState::Completed,
-        "{second_status:?}"
-    );
 
-    // The ingest lock made the second job prepare its staging after the
-    // first job's promotion, so the second prompt takes the incremental
-    // path. Without the lock both jobs would prepare while the library
-    // still has no graph (two full builds) and the later promotion would
-    // drop the earlier job's nodes.
+    // The ingest lock serializes same-library ingests: the second job only
+    // prepares its staging after the first promotion. Either it then ran on
+    // the first job's graph (the incremental prompt), or the first session
+    // already compiled its document (the fake agent references every raw/
+    // file in its staging) and it skipped outright. Never two overlapping
+    // promotions, never a second full build.
     let prompts: Vec<String> = runtime
         .requests
         .lock()
@@ -449,9 +448,19 @@ async fn concurrent_submissions_to_one_library_are_serialized() {
         .filter(|request| request.title.contains("ingestion"))
         .map(|request| request.prompt.clone())
         .collect();
-    assert_eq!(prompts.len(), 2);
-    assert!(prompts[0].contains("/graphify .` 完整首次建图流程"));
-    assert!(prompts[1].contains("/graphify . --update"));
+    if second_status.status == JobState::Completed {
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert!(prompts[0].contains("/graphify .` 完整首次建图流程"));
+        assert!(prompts[1].contains("/graphify . --update"));
+    } else {
+        assert_eq!(second_status.status, JobState::Skipped, "{second_status:?}");
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+    }
+    // Both documents are compiled either way.
+    let root = service.storage.library_root(&library.id).unwrap();
+    let node = fs::read_to_string(root.join("wiki/session-context.md")).unwrap();
+    assert!(node.contains("raw/one.md"), "{node}");
+    assert!(node.contains("raw/two.md"), "{node}");
 }
 
 #[tokio::test]
@@ -704,6 +713,109 @@ async fn a_job_that_failed_before_promotion_is_recompiled_by_the_next_ingest() {
     assert_eq!(prompts.len(), 2);
     assert!(prompts[1].contains("raw/doc1.md"), "{}", prompts[1]);
     assert!(prompts[1].contains("raw/doc2.md"), "{}", prompts[1]);
+}
+
+#[tokio::test]
+async fn a_document_compiled_by_a_predecessor_job_is_not_ingested_twice() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "防重库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    // job1 fails before promotion and leaves a.md in raw/ without a node.
+    runtime.fail_next_ingests.store(1, Ordering::SeqCst);
+    let first = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "a.md".into(),
+                content: "# A\n\nFirst source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    let first_status = wait_for_completion(&service, &library.id, &first.job_id).await;
+    assert_eq!(first_status.status, JobState::Failed, "{first_status:?}");
+
+    // job2 compiles both a.md (named as an uncompiled extra) and b.md — the
+    // fake runtime references every raw/ document from its node.
+    let second = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "b.md".into(),
+                content: "# B\n\nSecond source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+    // b.md resubmitted while job2 may still hold the library lock: dedupe
+    // sees no wiki node for it yet and accepts a second job. Once job2
+    // promotes, that late job must notice b.md is compiled and skip instead
+    // of running a redundant session. (If job2 already promoted before this
+    // submission, the same skip happens synchronously — either way no third
+    // session runs.)
+    let third = service
+        .submit_document(
+            &library.id,
+            DocumentInput {
+                filename: "b.md".into(),
+                content: "# B\n\nSecond source.".into(),
+                title: None,
+            },
+        )
+        .await
+        .unwrap();
+
+    let second_status = wait_for_completion(&service, &library.id, &second.job_id).await;
+    let third_status = wait_for_completion(&service, &library.id, &third.job_id).await;
+    let statuses = [second_status.status, third_status.status];
+    assert!(
+        statuses.contains(&JobState::Completed) && statuses.contains(&JobState::Skipped),
+        "{second_status:?} {third_status:?}"
+    );
+    // Exactly one session beyond the injected failure: the late job skipped.
+    let ingest_sessions = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|request| request.title.contains("ingestion"))
+        .count();
+    assert_eq!(
+        ingest_sessions, 2,
+        "no redundant session for an already-compiled document"
+    );
+}
+
+#[tokio::test]
+async fn startup_repairs_a_library_whose_bootstrap_was_interrupted() {
+    let (tempdir, service, _runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "自愈库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let marker = PathBuf::from(&library.root).join(".opencode/skills/graphify/SKILL.md");
+    assert!(marker.is_file(), "installer completed at creation");
+    // Simulate a creation interrupted before the installer finished.
+    fs::remove_file(&marker).unwrap();
+
+    // A fresh service over the same data directory runs startup maintenance
+    // and re-runs the full bootstrap for the broken library.
+    let _repaired = AppService::with_runtime(
+        common::config(tempdir.path().join("data"), None),
+        Arc::new(FakeRuntime::default()),
+    )
+    .unwrap();
+    assert!(marker.is_file(), "startup re-ran the graphify installer");
 }
 
 #[tokio::test]

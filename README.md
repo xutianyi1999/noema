@@ -69,7 +69,7 @@ noema [--bind 127.0.0.1:8787] [--data-dir data] [--model <MODEL>] \
 | `--auth-token` | `NOEMA_AUTH_TOKEN` | 无（API 开放） | HTTP API 的 Bearer 令牌（见下） |
 | `--transcript` | `NOEMA_TRANSCRIPT` | `false` | 实时打印会话中间过程（见下） |
 
-日志走 `RUST_LOG`（缺省 `noema=info,tower_http=info`）。
+日志走 `RUST_LOG`（缺省 `noema=info`）。
 
 ### `--auth-token`：API 鉴权
 

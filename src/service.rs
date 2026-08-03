@@ -34,6 +34,9 @@ pub struct AppService<R: OpenCodeRuntime> {
     sessions: Arc<Semaphore>,
 }
 
+// Every field is cheaply cloneable on its own; the manual impl keeps `R`
+// itself out of the bound (`Arc<R>` clones regardless of `R`), which a
+// derived `Clone` would add.
 impl<R: OpenCodeRuntime> Clone for AppService<R> {
     fn clone(&self) -> Self {
         Self {
@@ -124,7 +127,10 @@ impl<R: OpenCodeRuntime> AppService<R> {
     /// refresh the Noema skills and the generated `AGENTS.md` contract to
     /// this binary's versions — which is also what converges libraries
     /// created by older binaries onto the current system-prompt contract.
-    /// Per-library failures only log and never block startup.
+    /// A library whose creation died mid-installer has no graphify artifacts
+    /// yet; for it the full bootstrap is re-run so startup converges every
+    /// library to a working state. Per-library failures only log and never
+    /// block startup.
     fn startup_maintenance(&self) {
         if let Err(error) = self.storage.reap_interrupted_runs() {
             tracing::warn!(%error, "could not reap runs interrupted by the previous process");
@@ -135,8 +141,14 @@ impl<R: OpenCodeRuntime> AppService<R> {
                     if let Err(error) = self.storage.reconcile_staging(&library.id) {
                         tracing::warn!(library_id = %library.id, %error, "staging reconcile failed");
                     }
-                    if let Err(error) = crate::bootstrap::write_skills(Path::new(&library.root)) {
-                        tracing::warn!(library_id = %library.id, %error, "skills and contract refresh failed");
+                    let root = Path::new(&library.root);
+                    let refreshed = if crate::bootstrap::graphify_installed(root) {
+                        crate::bootstrap::write_skills(root)
+                    } else {
+                        crate::bootstrap::bootstrap(root)
+                    };
+                    if let Err(error) = refreshed {
+                        tracing::warn!(library_id = %library.id, %error, "library refresh failed");
                     }
                 }
             }
@@ -181,23 +193,23 @@ impl<R: OpenCodeRuntime> AppService<R> {
             document.title.as_deref(),
             &document.content,
         )?;
+        // A duplicate the wiki already compiles is a no-op skip. One no node
+        // references is a document a job left behind by failing before
+        // promotion: fall through and re-run ingestion on it — dedupe would
+        // otherwise lose it forever. Decided before the job row exists so no
+        // failure below can strand a forever-queued job.
+        let skip =
+            stored.duplicate && self.document_already_compiled(&library_id, &stored.record.path)?;
         let job = self.storage.create_job(&library_id, JobKind::Ingest)?;
-        if stored.duplicate {
-            // A duplicate the wiki already compiles is a no-op skip. One no
-            // node references is a document a job left behind by failing
-            // before promotion: fall through and re-run ingestion on it —
-            // dedupe would otherwise lose it forever.
-            let root = self.storage.library_root(&library_id)?;
-            if referenced_sources(&root.join("wiki"))?.contains(&stored.record.path) {
-                self.storage
-                    .update_job(&library_id, &job.job_id, JobState::Skipped, None, None)?;
-                return Ok(SubmitDocumentResponse {
-                    library_id,
-                    job_id: job.job_id,
-                    document_path: Some(stored.record.path),
-                    duplicate: true,
-                });
-            }
+        if skip {
+            self.storage
+                .update_job(&library_id, &job.job_id, JobState::Skipped, None, None)?;
+            return Ok(SubmitDocumentResponse {
+                library_id,
+                job_id: job.job_id,
+                document_path: Some(stored.record.path),
+                duplicate: true,
+            });
         }
 
         let service = self.clone();
@@ -358,6 +370,21 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .await
             .map_err(|_| sessions_closed())?;
 
+        // A predecessor job may have compiled this document in the meantime:
+        // it names the uncompiled documents it finds, and the same content
+        // resubmitted mid-run spawns a second job for it. Re-checked here
+        // under the library lock so the late job skips instead of redoing a
+        // whole ingest session over an already-compiled document.
+        if self.document_already_compiled(library_id, &stored.record.path)? {
+            if let Err(error) =
+                self.storage
+                    .update_job(library_id, job_id, JobState::Skipped, None, None)
+            {
+                return Err(self.record_job_failure(library_id, job_id, None, error));
+            }
+            return Ok(());
+        }
+
         if let Err(error) =
             self.storage
                 .update_job(library_id, job_id, JobState::Running, None, None)
@@ -444,6 +471,13 @@ impl<R: OpenCodeRuntime> AppService<R> {
         if let Err(error) = self.storage.cleanup_staging(library_id, job_id) {
             tracing::warn!(library_id = %library_id, job_id = %job_id, %error, "staging cleanup failed");
         }
+    }
+
+    /// Whether some wiki node already lists `path` as a source — i.e.
+    /// ingestion has compiled the document it points to.
+    fn document_already_compiled(&self, library_id: &str, path: &str) -> Result<bool, AppError> {
+        let root = self.storage.library_root(library_id)?;
+        Ok(referenced_sources(&root.join("wiki"))?.contains(path))
     }
 
     async fn bootstrap_library(&self, library: &Library) -> Result<(), AppError> {

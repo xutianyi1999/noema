@@ -24,97 +24,63 @@ pub enum JobState {
     Skipped,
 }
 
-impl JobKind {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Ingest => "ingest",
+/// The string conversions a lowercase string enum needs at the SQLite
+/// boundary and in display/parse paths, all keyed off one variant-to-string
+/// table so the five impls cannot drift apart.
+macro_rules! string_enum {
+    ($name:ident, $label:literal, { $($variant:ident => $text:literal),+ $(,)? }) => {
+        impl $name {
+            pub fn as_str(&self) -> &'static str {
+                match self {
+                    $(Self::$variant => $text),+
+                }
+            }
         }
-    }
-}
 
-impl JobState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            Self::Queued => "queued",
-            Self::Running => "running",
-            Self::Completed => "completed",
-            Self::Failed => "failed",
-            Self::Skipped => "skipped",
+        impl fmt::Display for $name {
+            fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+                formatter.write_str(self.as_str())
+            }
         }
-    }
-}
 
-impl fmt::Display for JobKind {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
+        impl FromStr for $name {
+            type Err = String;
 
-impl fmt::Display for JobState {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-impl FromStr for JobKind {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "ingest" => Ok(Self::Ingest),
-            other => Err(format!("unknown job kind: {other}")),
+            fn from_str(value: &str) -> Result<Self, Self::Err> {
+                match value {
+                    $($text => Ok(Self::$variant),)+
+                    other => Err(format!("unknown {}: {other}", $label)),
+                }
+            }
         }
-    }
-}
 
-impl FromStr for JobState {
-    type Err = String;
-
-    fn from_str(value: &str) -> Result<Self, Self::Err> {
-        match value {
-            "queued" => Ok(Self::Queued),
-            "running" => Ok(Self::Running),
-            "completed" => Ok(Self::Completed),
-            "failed" => Ok(Self::Failed),
-            "skipped" => Ok(Self::Skipped),
-            other => Err(format!("unknown job state: {other}")),
+        impl ToSql for $name {
+            fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+                Ok(ToSqlOutput::Borrowed(ValueRef::Text(
+                    self.as_str().as_bytes(),
+                )))
+            }
         }
-    }
+
+        impl FromSql for $name {
+            fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
+                value
+                    .as_str()?
+                    .parse()
+                    .map_err(|_| FromSqlError::InvalidType)
+            }
+        }
+    };
 }
 
-impl ToSql for JobKind {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(ValueRef::Text(
-            self.as_str().as_bytes(),
-        )))
-    }
-}
-
-impl ToSql for JobState {
-    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
-        Ok(ToSqlOutput::Borrowed(ValueRef::Text(
-            self.as_str().as_bytes(),
-        )))
-    }
-}
-
-impl FromSql for JobKind {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        value
-            .as_str()?
-            .parse()
-            .map_err(|_| FromSqlError::InvalidType)
-    }
-}
-
-impl FromSql for JobState {
-    fn column_result(value: ValueRef<'_>) -> FromSqlResult<Self> {
-        value
-            .as_str()?
-            .parse()
-            .map_err(|_| FromSqlError::InvalidType)
-    }
-}
+string_enum!(JobKind, "job kind", { Ingest => "ingest" });
+string_enum!(JobState, "job state", {
+    Queued => "queued",
+    Running => "running",
+    Completed => "completed",
+    Failed => "failed",
+    Skipped => "skipped",
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateLibraryRequest {
