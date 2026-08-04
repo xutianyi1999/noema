@@ -10,7 +10,10 @@ use rmcp::{
 };
 
 use crate::{
-    models::{McpIngestRequest, McpJobRequest, McpQueryRequest},
+    models::{
+        CreateLibraryRequest, McpEnsureLibraryRequest, McpIngestRequest, McpJobRequest,
+        McpQueryRequest,
+    },
     runtime::OpenCodeRuntime,
     service::AppService,
 };
@@ -33,7 +36,25 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
 #[tool_router]
 impl<R: OpenCodeRuntime> McpHandler<R> {
     #[tool(
-        description = "Submit one or more UTF-8 Markdown or TXT documents to an isolated Noema content library. All documents are compiled together in a single ingestion job."
+        description = "确保指定的隔离内容库已经存在；已存在时直接返回，不会重复创建。Agent 应在首次写入前调用它。"
+    )]
+    async fn kb_ensure_library(
+        &self,
+        Parameters(request): Parameters<McpEnsureLibraryRequest>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let response = self
+            .service
+            .ensure_library(CreateLibraryRequest {
+                name: request.name,
+                description: request.description,
+            })
+            .await
+            .map_err(|error| to_mcp_error(&error))?;
+        json_response(&response)
+    }
+
+    #[tool(
+        description = "向隔离的 Noema 内容库提交一篇或多篇 UTF-8 Markdown/TXT 文档。所有文档会合并到同一个摄入作业中编译。"
     )]
     async fn kb_ingest_documents(
         &self,
@@ -48,7 +69,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
     }
 
     #[tool(
-        description = "Query one isolated Noema content library with a natural-language prompt. Omit session_id to create a session, or pass a session_id returned by an earlier successful query in the same library to continue that conversation."
+        description = "使用自然语言提示词查询一个隔离的 Noema 内容库。省略 session_id 时创建会话；传入同一内容库此前成功查询返回的 session_id 时继续该会话。"
     )]
     async fn kb_query(
         &self,
@@ -66,7 +87,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
         json_response(&response)
     }
 
-    #[tool(description = "Get the status of an ingestion job in one isolated content library.")]
+    #[tool(description = "获取一个隔离内容库中的摄入作业状态。")]
     async fn kb_job_status(
         &self,
         Parameters(request): Parameters<McpJobRequest>,
@@ -78,7 +99,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
         json_response(&response)
     }
 
-    #[tool(description = "Return Noema service health and the configured OpenCode model.")]
+    #[tool(description = "返回 Noema 服务健康状态和已配置的 OpenCode 模型。")]
     async fn kb_health(&self) -> Result<String, rmcp::ErrorData> {
         json_response(&self.service.health(true))
     }
@@ -91,12 +112,10 @@ impl<R: OpenCodeRuntime> ServerHandler for McpHandler<R> {
             .with_server_info(
                 Implementation::new("noema", env!("CARGO_PKG_VERSION"))
                     .with_title("Noema")
-                    .with_description("OpenCode-driven isolated text knowledge-base service"),
+                    .with_description("由 OpenCode 驱动的隔离文本知识库服务"),
             )
             .with_instructions(
-                "Every tool takes an explicit library_id; content libraries are isolated. \
-                 kb_query creates a fresh OpenCode session when session_id is omitted, or \
-                 continues a successful query session from that same library.",
+                "每个工具都必须显式传入 library_id；内容库彼此隔离。省略 session_id 时，kb_query 创建新的 OpenCode 会话；传入同一内容库此前成功查询的 session_id 时继续该会话。",
             )
     }
 }

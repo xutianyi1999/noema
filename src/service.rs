@@ -201,6 +201,24 @@ impl<R: OpenCodeRuntime> AppService<R> {
         Ok(library)
     }
 
+    /// Return an existing library or create and bootstrap it exactly once.
+    /// Agent workflows use this instead of guessing whether a tenant library
+    /// has already been initialized.
+    pub async fn ensure_library(&self, request: CreateLibraryRequest) -> Result<Library, AppError> {
+        match self.storage.resolve_library(&request.name) {
+            Ok(library) => Ok(library),
+            Err(AppError::LibraryNotFound(_)) => {
+                let name = request.name.clone();
+                match self.create_library(request).await {
+                    Ok(library) => Ok(library),
+                    Err(AppError::Conflict(_)) => self.storage.resolve_library(&name),
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     /// The one submission entry, for one document or many: every document
     /// is stored, and all non-skipped ones are compiled together in ONE
     /// ingestion job — one staging workspace, one agent session.

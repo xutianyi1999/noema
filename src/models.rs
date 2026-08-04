@@ -201,6 +201,13 @@ pub struct McpIngestRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpEnsureLibraryRequest {
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpJobRequest {
     pub library_id: String,
     pub job_id: String,
