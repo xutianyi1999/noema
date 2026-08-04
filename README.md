@@ -47,6 +47,8 @@ noema-cli submit 产品知识库 ./design.md    # 触发异步摄入，返回 jo
 noema-cli submit 产品知识库 ./a.md ./b.md ./c.md   # 多个文档合并为一次摄入任务
 noema-cli job 产品知识库 <job_id>          # 轮询到 completed
 noema-cli query 产品知识库 "Session Context 是怎么设计的？"
+# 用上次返回的 session_id 继续同一段对话
+noema-cli query 产品知识库 --session-id <session_id> "它的来源是什么？"
 ```
 
 查询输出是 Agent 基于库内证据写出的答案（格式随问题而定），正文句末以 `[n]` 标注引用；末尾的来源清单每条都经服务端逐字核验，给出原文引文、字符偏移（`#char=start,end`）、行范围与条号定位，原文引用同时挂上对应知识节点（若存在）。
@@ -109,7 +111,7 @@ noema --transcript=false        # 显式关闭（覆盖环境变量时）
 | `noema-cli list` | 列出所有内容库（id / 名称 / 路径） |
 | `noema-cli submit <lib> <file.md\|file.txt>... [--title <标题>]` | 提交本地文档，触发异步摄入；多个文件合并为一次摄入任务（`--title` 仅单文件可用） |
 | `noema-cli job <lib> <job_id>` | 查询摄入任务状态 |
-| `noema-cli query <lib> "<自然语言问题>"` | 自然语言查询（每次创建全新 Agent session） |
+| `noema-cli query <lib> "<自然语言问题>" [--session-id <会话>]` | 自然语言查询；省略 `--session-id` 创建会话，传入同一内容库此前成功查询返回的 id 可继续对话 |
 | `noema-cli export <lib> [-o <文件>]` | 导出快照到本地 `.tar.gz` |
 | `noema-cli import <归档> [--name <名称>] [--description <描述>]` | 导入快照为全新内容库 |
 
@@ -307,7 +309,7 @@ graphify 生命周期：空库只安装插件和 Skill；首篇文档摄入时�
 | `GET /v1/libraries/{library_id}/export` | 导出快照（返回 gzip tar） |
 | `POST /v1/libraries/{library_id}/documents` | 提交文档（`{"documents":[{"filename","content","title"}]}`，一篇或多篇；同名异内容 409） |
 | `GET /v1/libraries/{library_id}/jobs/{job_id}` | 摄入任务状态 |
-| `POST /v1/libraries/{library_id}/query` | 自然语言查询（`{"prompt"}`） |
+| `POST /v1/libraries/{library_id}/query` | 自然语言查询（`{"prompt","session_id"?}`；省略 `session_id` 创建会话，传入该库此前成功查询返回的 id 可复用会话） |
 | `GET /v1/libraries/{library_id}/files/{path}` | 读取 `raw/` 或 `wiki/` 下的知识文件原文（供前端渲染法规页等，配合引用的 `#char=` 偏移高亮；带 `Last-Modified`） |
 
 `{library_id}` 路径段接受库名（新库名即 id）；URL 中的中文名按标准百分号编码。错误以 `{"error": "..."}` 返回：400 请求非法（含 files 路径越出 `raw/`\|`wiki/`）、404 库/任务/文件不存在、409 名称冲突、502 Agent 运行时失败。
@@ -328,11 +330,16 @@ curl -X POST http://127.0.0.1:8787/v1/libraries/产品知识库/documents \
 curl -X POST http://127.0.0.1:8787/v1/libraries/产品知识库/query \
   -H 'content-type: application/json' \
   -d '{"prompt":"解释 Session Context 的主要设计和证据来源"}'
+
+# 以上响应中的 session_id 可用于追问；会话只能在同一内容库中复用
+curl -X POST http://127.0.0.1:8787/v1/libraries/产品知识库/query \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"它的来源是什么？","session_id":"<上次响应中的 session_id>"}'
 ```
 
 ## MCP
 
-Streamable HTTP 端点 `POST /mcp`，工具：`kb_ingest_documents`（一篇或多篇，合并为一次摄入任务）、`kb_query`、`kb_job_status`、`kb_health`。除健康检查外都显式接收 `library_id`。Noema 不提供 stdio MCP 入口，也不把自定义知识库工具注入 OpenCode——OpenCode 直接使用内容库工作区与已安装 Skill。
+Streamable HTTP 端点 `POST /mcp`，工具：`kb_ingest_documents`（一篇或多篇，合并为一次摄入任务）、`kb_query`、`kb_job_status`、`kb_health`。除健康检查外都显式接收 `library_id`。`kb_query` 的可选 `session_id` 省略时创建会话，传入同一内容库此前成功查询响应的值可继续对话。Noema 不提供 stdio MCP 入口，也不把自定义知识库工具注入 OpenCode——OpenCode 直接使用内容库工作区与已安装 Skill。
 
 ## 快照格式
 

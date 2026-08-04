@@ -288,7 +288,11 @@ async fn query<R: OpenCodeRuntime>(
     Path(library_id): Path<String>,
     Json(request): Json<QueryRequest>,
 ) -> Result<Json<QueryResponse>, AppError> {
-    Ok(Json(service.query(&library_id, &request.prompt).await?))
+    Ok(Json(
+        service
+            .query(&library_id, &request.prompt, request.session_id.as_deref())
+            .await?,
+    ))
 }
 
 /// Serve one knowledge file (`raw/` or `wiki/`) for client-side rendering —

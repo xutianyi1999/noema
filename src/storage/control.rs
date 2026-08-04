@@ -263,6 +263,26 @@ impl Storage {
         Ok(())
     }
 
+    /// Whether `session_id` was returned by a completed query in `library_id`.
+    /// Session ids are OpenCode capabilities, so never let a caller attach an
+    /// arbitrary (or another library's) session to this library's workspace.
+    pub fn has_completed_query_session(
+        &self,
+        library_id: &str,
+        session_id: &str,
+    ) -> Result<bool, AppError> {
+        let exists = self
+            .db()?
+            .query_row(
+                "SELECT 1 FROM query_runs WHERE library_id = ?1 AND session_id = ?2 AND status = ?3 LIMIT 1",
+                params![library_id, session_id, JobState::Completed],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        Ok(exists)
+    }
+
     /// Remove a library completely: directory tree and every control-plane
     /// row. Reads the row directly instead of [`get_library`] so a library
     /// whose tree is missing or partial (a failed creation, a botched
