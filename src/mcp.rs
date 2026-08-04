@@ -48,7 +48,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
     }
 
     #[tool(
-        description = "Query one isolated Noema content library with a natural-language prompt. Every call creates a new OpenCode session."
+        description = "Query one isolated Noema content library with a natural-language prompt. Omit session_id to create a session, or pass a session_id returned by an earlier successful query in the same library to continue that conversation."
     )]
     async fn kb_query(
         &self,
@@ -56,7 +56,11 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
     ) -> Result<String, rmcp::ErrorData> {
         let response = self
             .service
-            .query(&request.library_id, &request.prompt)
+            .query(
+                &request.library_id,
+                &request.prompt,
+                request.session_id.as_deref(),
+            )
             .await
             .map_err(|error| to_mcp_error(&error))?;
         json_response(&response)
@@ -91,8 +95,8 @@ impl<R: OpenCodeRuntime> ServerHandler for McpHandler<R> {
             )
             .with_instructions(
                 "Every tool takes an explicit library_id; content libraries are isolated. \
-                 kb_query accepts only a natural-language prompt and always runs in a fresh \
-                 OpenCode session.",
+                 kb_query creates a fresh OpenCode session when session_id is omitted, or \
+                 continues a successful query session from that same library.",
             )
     }
 }

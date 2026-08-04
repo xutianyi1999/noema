@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
     time::Duration,
 };
 
@@ -29,6 +29,10 @@ pub struct AppService<R: OpenCodeRuntime> {
     /// graph wholesale, so same-library ingests must not overlap. Queued
     /// jobs wait on their library's lock and stay `queued` meanwhile.
     ingest_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// A reused OpenCode session has one event stream, so turns on that
+    /// session must not overlap. Weak entries disappear once no turn holds
+    /// the lock, avoiding a permanently growing map of client session ids.
+    query_session_locks: Arc<Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>>,
     /// Global cap on concurrently running OpenCode sessions (ingests and
     /// queries alike), keeping bursts from swamping the managed server and
     /// the model backend behind it.
@@ -45,6 +49,7 @@ impl<R: OpenCodeRuntime> Clone for AppService<R> {
             config: self.config.clone(),
             runtime: self.runtime.clone(),
             ingest_locks: self.ingest_locks.clone(),
+            query_session_locks: self.query_session_locks.clone(),
             sessions: self.sessions.clone(),
         }
     }
@@ -82,6 +87,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             config,
             runtime,
             ingest_locks: Arc::new(Mutex::new(HashMap::new())),
+            query_session_locks: Arc::new(Mutex::new(HashMap::new())),
             sessions,
         };
         service.startup_maintenance();
@@ -121,6 +127,23 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .entry(library_id.to_string())
             .or_default()
             .clone()
+    }
+
+    /// The serialization lock for a reusable OpenCode session. A fresh
+    /// session cannot be addressed by another request yet, so it needs no
+    /// per-session lock.
+    fn query_session_lock(&self, session_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self
+            .query_session_locks
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(session_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(session_id.to_string(), Arc::downgrade(&lock));
+        lock
     }
 
     /// Startup sweep, per library: drop leftover staging workspaces whose
@@ -312,13 +335,43 @@ impl<R: OpenCodeRuntime> AppService<R> {
     }
 
     /// `library` accepts an exact id or a unique library name.
-    pub async fn query(&self, library: &str, prompt: &str) -> Result<QueryResponse, AppError> {
+    pub async fn query(
+        &self,
+        library: &str,
+        prompt: &str,
+        session_id: Option<&str>,
+    ) -> Result<QueryResponse, AppError> {
         let prompt = prompt.trim();
         if prompt.is_empty() {
             return Err(AppError::BadRequest("prompt cannot be empty".into()));
         }
         let library_id = self.storage.resolve_library(library)?.id;
         let root = self.storage.library_root(&library_id)?;
+        let session_id = match session_id {
+            Some(session_id) => {
+                let session_id = session_id.trim();
+                if session_id.is_empty() {
+                    return Err(AppError::BadRequest("session_id cannot be empty".into()));
+                }
+                if !self
+                    .storage
+                    .has_completed_query_session(&library_id, session_id)?
+                {
+                    return Err(AppError::BadRequest(
+                        "session_id is not a completed query session for this library".into(),
+                    ));
+                }
+                Some(session_id.to_string())
+            }
+            None => None,
+        };
+        // OpenCode exposes one event stream per session. Take this before the
+        // global permit so turns waiting for the same conversation do not
+        // consume the service-wide agent concurrency budget.
+        let _session_turn_guard = match session_id.as_deref() {
+            Some(session_id) => Some(self.query_session_lock(session_id).lock_owned().await),
+            None => None,
+        };
         // Queries never queue behind ingests — readers keep the library
         // usable mid-ingestion — but they share the global session cap;
         // the run is only recorded once a permit is held.
@@ -339,7 +392,11 @@ impl<R: OpenCodeRuntime> AppService<R> {
             prompt: prompt.to_string(),
         };
 
-        let result = match self.runtime.run_new_session(request).await {
+        let result = match self
+            .runtime
+            .run_query_session(request, session_id.as_deref())
+            .await
+        {
             Ok(result) => result,
             Err(error) => return Err(self.record_query_failure(&query_id, error)),
         };

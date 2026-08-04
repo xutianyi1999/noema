@@ -90,12 +90,15 @@ enum Command {
         /// 任务 id
         job_id: String,
     },
-    /// 自然语言查询（服务端创建全新 Agent session 作答）
+    /// 自然语言查询（默认创建新 Agent session；可复用返回的会话）
     Query {
         /// 内容库 id，或唯一的内容库名称
         library: String,
         /// 查询提示词
         prompt: String,
+        /// 复用此前查询返回的会话 id
+        #[arg(long)]
+        session_id: Option<String>,
     },
 }
 
@@ -156,7 +159,11 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
             title,
         } => cmd_submit(&client, &base, library, files, title.as_deref()).await,
         Command::Job { library, job_id } => cmd_job(&client, &base, library, job_id).await,
-        Command::Query { library, prompt } => cmd_query(&client, &base, library, prompt).await,
+        Command::Query {
+            library,
+            prompt,
+            session_id,
+        } => cmd_query(&client, &base, library, prompt, session_id.as_deref()).await,
     }
 }
 
@@ -417,11 +424,16 @@ async fn cmd_query(
     base: &str,
     library: String,
     prompt: String,
+    session_id: Option<&str>,
 ) -> Result<(), BoxError> {
+    let mut body = json!({ "prompt": prompt });
+    if let Some(session_id) = session_id {
+        body["session_id"] = Value::String(session_id.to_string());
+    }
     let response = send(
         client
             .post(format!("{base}/v1/libraries/{}/query", encode(&library)))
-            .json(&json!({ "prompt": prompt })),
+            .json(&body),
     )
     .await?;
     let value = response.json::<Value>().await?;
@@ -450,6 +462,14 @@ async fn cmd_query(
             let _ = writeln!(stdout(), "{}", paint(DIM, &line));
         }
     }
+    // Always surface the id so a user can copy it into `--session-id` for a
+    // follow-up. The HTTP and MCP responses already include this field.
+    let _ = writeln!(
+        stdout(),
+        "{} {}",
+        paint(DIM, "会话:"),
+        string_field(&value, "session_id")
+    );
     Ok(())
 }
 

@@ -90,6 +90,8 @@ impl Storage {
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
+            CREATE INDEX IF NOT EXISTS query_runs_library_session_idx
+                ON query_runs (library_id, session_id);
             ",
         )?;
 

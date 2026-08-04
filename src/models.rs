@@ -141,6 +141,9 @@ pub struct SubmitDocumentsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueryRequest {
     pub prompt: String,
+    /// Continue a prior successful query in this library. When omitted, the
+    /// service creates a new OpenCode session.
+    pub session_id: Option<String>,
 }
 
 /// The JSON contract the query Agent must output inside its `<noema-answer>`
@@ -186,6 +189,9 @@ pub struct AgentReference {
 pub struct McpQueryRequest {
     pub library_id: String,
     pub prompt: String,
+    /// Continue a prior successful query in this library. When omitted, the
+    /// service creates a new OpenCode session.
+    pub session_id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]

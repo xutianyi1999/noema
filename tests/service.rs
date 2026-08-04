@@ -31,6 +31,7 @@ type SessionHook = Box<dyn Fn(&AgentRunRequest) + Send + Sync>;
 struct FakeRuntime {
     next_session: AtomicUsize,
     requests: Mutex<Vec<AgentRunRequest>>,
+    query_session_ids: Mutex<Vec<Option<String>>>,
     /// Remaining ingest sessions to fail with a runtime error. Only ingest
     /// sessions consume the counter; queries pass through untouched.
     fail_next_ingests: AtomicUsize,
@@ -39,14 +40,26 @@ struct FakeRuntime {
     on_session: Mutex<Option<SessionHook>>,
 }
 
-impl OpenCodeRuntime for FakeRuntime {
-    async fn run_new_session(&self, request: AgentRunRequest) -> Result<AgentRunResult, AppError> {
+impl FakeRuntime {
+    async fn run(
+        &self,
+        request: AgentRunRequest,
+        requested_session_id: Option<&str>,
+    ) -> Result<AgentRunResult, AppError> {
         if let Some(hook) = self.on_session.lock().unwrap().as_ref() {
             hook(&request);
         }
-        let number = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
-        let session_id = format!("fake-session-{number}");
         let is_ingest = request.title.contains("ingestion");
+        let session_id = requested_session_id.map(str::to_string).unwrap_or_else(|| {
+            let number = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+            format!("fake-session-{number}")
+        });
+        if !is_ingest {
+            self.query_session_ids
+                .lock()
+                .unwrap()
+                .push(requested_session_id.map(str::to_string));
+        }
         self.requests.lock().unwrap().push(request.clone());
         // Failure injection: consume one pending failure per ingest session,
         // after recording the request and before writing any artifact.
@@ -115,6 +128,20 @@ impl OpenCodeRuntime for FakeRuntime {
             answer,
             tool_events: Vec::new(),
         })
+    }
+}
+
+impl OpenCodeRuntime for FakeRuntime {
+    async fn run_new_session(&self, request: AgentRunRequest) -> Result<AgentRunResult, AppError> {
+        self.run(request, None).await
+    }
+
+    async fn run_query_session(
+        &self,
+        request: AgentRunRequest,
+        session_id: Option<&str>,
+    ) -> Result<AgentRunResult, AppError> {
+        self.run(request, session_id).await
     }
 }
 
@@ -253,14 +280,40 @@ async fn library_ingestion_query_and_session_isolation_work() {
     );
 
     let first = service
-        .query(&library.id, "这个概念是什么？")
+        .query(&library.id, "这个概念是什么？", None)
         .await
         .unwrap();
     let second = service
-        .query(&library.id, "它的来源是什么？")
+        .query(&library.id, "它的来源是什么？", None)
         .await
         .unwrap();
     assert_ne!(first.session_id, second.session_id);
+    let continued = service
+        .query(&library.id, "继续这个话题", Some(&first.session_id))
+        .await
+        .unwrap();
+    assert_eq!(continued.session_id, first.session_id);
+    assert_eq!(
+        runtime.query_session_ids.lock().unwrap().as_slice(),
+        &[None, None, Some(first.session_id.clone())]
+    );
+    let other_library = service
+        .create_library(CreateLibraryRequest {
+            name: "另一内容库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let error = service
+        .query(&other_library.id, "越库复用", Some(&first.session_id))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(_)));
+    let error = service
+        .query(&library.id, "空会话", Some("   "))
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AppError::BadRequest(_)));
     assert!(!first.references.is_empty());
     let requests = runtime.requests.lock().unwrap();
     let ingestion_prompts = requests
@@ -271,7 +324,7 @@ async fn library_ingestion_query_and_session_isolation_work() {
     assert_eq!(ingestion_prompts.len(), 2);
     assert!(ingestion_prompts[0].contains("/graphify .` 完整首次建图流程"));
     assert!(ingestion_prompts[1].contains("/graphify . --update"));
-    assert!(requests.len() >= 4);
+    assert!(requests.len() >= 5);
 }
 
 #[tokio::test]
@@ -361,7 +414,10 @@ async fn libraries_are_addressable_by_unique_name() {
     assert_eq!(submitted.library_id, library.id);
     let status = wait_for_completion(&service, "法规库", &submitted.job_id).await;
     assert_eq!(status.status, JobState::Completed, "{status:?}");
-    let answer = service.query("法规库", "这个概念是什么？").await.unwrap();
+    let answer = service
+        .query("法规库", "这个概念是什么？", None)
+        .await
+        .unwrap();
     assert_eq!(answer.library_id, library.id);
 
     // Names are unique identities now: a second library under the same name
@@ -471,7 +527,10 @@ async fn citations_are_verified_and_unverified_markers_are_stripped() {
     // The first declared citation quotes text the source does not contain:
     // it is dropped and its [1] marker stripped; the honest second citation
     // keeps its id (no renumbering) and carries server-computed offsets.
-    let answer = service.query(&library.id, "bad-quote 场景").await.unwrap();
+    let answer = service
+        .query(&library.id, "bad-quote 场景", None)
+        .await
+        .unwrap();
     assert_eq!(answer.answer, "错误结论。正确结论[2]。");
     assert_eq!(answer.references.len(), 1);
     let reference = &answer.references[0];
@@ -490,7 +549,7 @@ async fn non_contract_answer_degrades_to_plain_text_without_references() {
     let library = library_with_source(&service, "降级库", None).await;
 
     let answer = service
-        .query(&library.id, "bad-contract 场景")
+        .query(&library.id, "bad-contract 场景", None)
         .await
         .unwrap();
     assert!(

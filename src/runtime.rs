@@ -1,4 +1,9 @@
-use std::{future::Future, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    future::Future,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 use opencode_rs::{
     Client, ClientBuilder,
@@ -29,18 +34,37 @@ pub struct AgentRunResult {
     pub tool_events: Vec<serde_json::Value>,
 }
 
-/// Every call must create a brand-new OpenCode session; requests carry the
-/// `library_id` and callers never pass an existing session id. The trait is
-/// generic (static dispatch) rather than dyn-dispatched so it can use native
-/// async-trait support (`async fn` in traits is not dyn-compatible on stable
-/// Rust). The RPITIT signature pins the future as `Send` so services can
-/// spawn and serve it across threads; implementations may still be written
+/// Ingestion always creates a short-lived session. Queries may instead resume
+/// a successful session from the same library by passing its `session_id`.
+/// The trait is generic (static dispatch) rather than dyn-dispatched so it can
+/// use native async-trait support (`async fn` in traits is not dyn-compatible
+/// on stable Rust). The RPITIT signature pins the future as `Send` so services
+/// can spawn and serve it across threads; implementations may still be written
 /// with `async fn`.
 pub trait OpenCodeRuntime: Send + Sync + 'static {
     fn run_new_session(
         &self,
         request: AgentRunRequest,
     ) -> impl Future<Output = Result<AgentRunResult, AppError>> + Send;
+
+    /// Test and third-party runtimes that only support ephemeral sessions keep
+    /// working for fresh queries; implementations that support continuation
+    /// override this method.
+    fn run_query_session(
+        &self,
+        request: AgentRunRequest,
+        session_id: Option<&str>,
+    ) -> impl Future<Output = Result<AgentRunResult, AppError>> + Send {
+        let reusing_session = session_id.is_some();
+        async move {
+            if reusing_session {
+                return Err(AppError::Runtime(
+                    "this runtime does not support query session reuse".into(),
+                ));
+            }
+            self.run_new_session(request).await
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -52,15 +76,19 @@ impl OpenCodeAgent {
     pub fn new(config: Arc<Config>) -> Self {
         Self { config }
     }
+
+    fn client(&self, workdir: &Path) -> Result<Client, AppError> {
+        Ok(ClientBuilder::new()
+            .base_url(&self.config.opencode_url)
+            .directory(workdir.to_string_lossy())
+            .timeout_secs(self.config.opencode_timeout_secs)
+            .build()?)
+    }
 }
 
 impl OpenCodeRuntime for OpenCodeAgent {
     async fn run_new_session(&self, request: AgentRunRequest) -> Result<AgentRunResult, AppError> {
-        let client = ClientBuilder::new()
-            .base_url(&self.config.opencode_url)
-            .directory(request.workdir.to_string_lossy())
-            .timeout_secs(self.config.opencode_timeout_secs)
-            .build()?;
+        let client = self.client(&request.workdir)?;
 
         let session = client
             .sessions()
@@ -71,27 +99,97 @@ impl OpenCodeRuntime for OpenCodeAgent {
             })
             .await?;
 
-        // Run the turn on a detached task so its cleanup is cancellation
-        // safe: when a caller's future is dropped (client disconnect,
-        // shutdown), awaiting `drive_session` inline would skip the session
-        // deletion and leak the session on the OpenCode server until it
-        // restarts. The detached task always runs to the session's own
-        // deadline and deletes it on every exit path; the cost is that a
-        // cancelled turn still finishes server-side, which is the lesser
-        // evil. Ingest callers already run detached and are unaffected.
-        let config = self.config.clone();
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = drive_session(&client, &session.id, request, &config).await;
-            if let Err(error) = client.sessions().delete(&session.id).await {
-                tracing::warn!(session_id = %session.id, error = %error, "failed to delete OpenCode session");
-            }
-            let _ = result_tx.send(result);
-        });
-        result_rx
-            .await
-            .map_err(|_| AppError::Runtime("OpenCode session task aborted".into()))?
+        run_session(
+            client,
+            session.id,
+            request,
+            self.config.clone(),
+            SessionCleanup::Always,
+        )
+        .await
     }
+
+    async fn run_query_session(
+        &self,
+        request: AgentRunRequest,
+        session_id: Option<&str>,
+    ) -> Result<AgentRunResult, AppError> {
+        let client = self.client(&request.workdir)?;
+        if let Some(session_id) = session_id {
+            return run_session(
+                client,
+                session_id.to_string(),
+                request,
+                self.config.clone(),
+                SessionCleanup::Never,
+            )
+            .await;
+        }
+
+        let session = client
+            .sessions()
+            .create(&CreateSessionRequest {
+                title: Some(request.title.clone()),
+                permission: Some(all_permissions()),
+                ..Default::default()
+            })
+            .await?;
+
+        // A newly created query session is retained only after its answer is
+        // delivered. If its first turn fails or the HTTP/MCP caller goes away,
+        // deleting it avoids an unreachable session accumulating server-side.
+        run_session(
+            client,
+            session.id,
+            request,
+            self.config.clone(),
+            SessionCleanup::OnFailureOrCancellation,
+        )
+        .await
+    }
+}
+
+enum SessionCleanup {
+    /// Ingestion sessions stay strictly ephemeral.
+    Always,
+    /// A first query turn must make its session discoverable to retain it.
+    OnFailureOrCancellation,
+    /// The caller supplied an already-discoverable session id.
+    Never,
+}
+
+/// Drive one OpenCode turn on a detached task. Detaching makes cleanup safe
+/// when the request future is cancelled by a disconnected HTTP/MCP caller.
+async fn run_session(
+    client: Client,
+    session_id: String,
+    request: AgentRunRequest,
+    config: Arc<Config>,
+    cleanup: SessionCleanup,
+) -> Result<AgentRunResult, AppError> {
+    let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = drive_session(&client, &session_id, request, &config).await;
+        let delete_after_result = match cleanup {
+            SessionCleanup::Always => true,
+            SessionCleanup::OnFailureOrCancellation => result.is_err(),
+            SessionCleanup::Never => false,
+        };
+        let receiver_dropped = result_tx.send(result).is_err();
+        let delete = match cleanup {
+            SessionCleanup::Always => true,
+            SessionCleanup::OnFailureOrCancellation => delete_after_result || receiver_dropped,
+            SessionCleanup::Never => false,
+        };
+        if delete {
+            if let Err(error) = client.sessions().delete(&session_id).await {
+                tracing::warn!(%session_id, %error, "failed to delete OpenCode session");
+            }
+        }
+    });
+    result_rx
+        .await
+        .map_err(|_| AppError::Runtime("OpenCode session task aborted".into()))?
 }
 
 async fn drive_session(
