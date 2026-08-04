@@ -8,7 +8,7 @@
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use clap::Parser;
-use noema::{AppError, AppService, Config, http};
+use noema::{http, AppError, AppService, Config};
 use opencode_rs::server::{ManagedServer, ServerOptions};
 
 /// OpenCode 驱动的文本知识库服务：HTTP JSON API + Streamable HTTP MCP。
@@ -34,6 +34,9 @@ struct Cli {
     /// 单个 Agent session 超时（秒）
     #[arg(long, env = "OPENCODE_TIMEOUT_SECS", default_value_t = 1800)]
     opencode_timeout_secs: u64,
+    /// 已由容器入口启动的 OpenCode Server 地址；省略时由 Noema 自行拉起子进程。
+    #[arg(long, env = "NOEMA_OPENCODE_URL")]
+    opencode_url: Option<String>,
     /// 全局并发 Agent session 上限（摄入与查询之和），超出的请求排队等待
     #[arg(long, env = "NOEMA_MAX_SESSIONS", default_value_t = 4)]
     max_sessions: usize,
@@ -102,11 +105,23 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
     // installed, an early signal simply queues until the graceful
     // shutdown below starts.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-    let managed = spawn_opencode_server().await?;
+    let configured_opencode_url = cli
+        .opencode_url
+        .map(|url| url.trim_end_matches('/').to_owned())
+        .filter(|url| !url.is_empty());
+    let managed = if configured_opencode_url.is_some() {
+        tracing::info!(url = ?configured_opencode_url, "using externally managed OpenCode Server");
+        None
+    } else {
+        Some(spawn_opencode_server().await?)
+    };
+    let opencode_url = configured_opencode_url
+        .or_else(|| managed.as_ref().map(|server| server.url().to_string()))
+        .expect("managed or configured OpenCode URL");
     let config = Config {
         data_dir: cli.data_dir,
-        // 客户端连接始终指向刚刚拉起的这个实例。
-        opencode_url: managed.url().to_string(),
+        // Noema uses either the container-shared server or its managed child.
+        opencode_url,
         opencode_model: cli.model,
         opencode_timeout_secs: cli.opencode_timeout_secs,
         transcript: cli.transcript,
@@ -133,8 +148,10 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         .await
         .map_err(Into::into);
 
-    if let Err(error) = managed.stop().await {
-        tracing::warn!(%error, "failed to stop OpenCode Server");
+    if let Some(managed) = managed {
+        if let Err(error) = managed.stop().await {
+            tracing::warn!(%error, "failed to stop OpenCode Server");
+        }
     }
     result
 }
