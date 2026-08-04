@@ -56,6 +56,11 @@ struct Cli {
         value_parser = clap::builder::BoolishValueParser::new()
     )]
     transcript: bool,
+    /// 共享 OpenCode Server 上为其他调用方注册、但必须对 Noema 自身会话隐藏的
+    /// MCP 服务名（逗号分隔）。这些服务的工具不会出现在摄入/查询会话里，
+    /// 避免 Agent 拿 Noema 作业 id 去调用外部任务运行时。
+    #[arg(long, env = "NOEMA_HIDDEN_MCP", value_delimiter = ',')]
+    hidden_mcp: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -127,6 +132,12 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         transcript: cli.transcript,
         max_sessions: cli.max_sessions,
         auth_token: cli.auth_token,
+        hidden_mcp: cli
+            .hidden_mcp
+            .into_iter()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect(),
     };
     let service = AppService::new(config)?;
     let app = http::router(service);

@@ -15,4 +15,10 @@ pub struct Config {
     /// requires `Authorization: Bearer <token>` on every route except the
     /// health probe, making remote/container-network deployments safe.
     pub auth_token: Option<String>,
+    /// MCP servers that are registered on the shared OpenCode Server for
+    /// other callers (e.g. the host's task runtime) but must stay invisible
+    /// inside Noema's own sessions: a session that can see a foreign
+    /// task-runtime tool tends to call it with the Noema job id. Tools of
+    /// these servers are denied in every session this service creates.
+    pub hidden_mcp: Vec<String>,
 }

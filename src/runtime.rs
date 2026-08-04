@@ -94,7 +94,7 @@ impl OpenCodeRuntime for OpenCodeAgent {
             .sessions()
             .create(&CreateSessionRequest {
                 title: Some(request.title.clone()),
-                permission: Some(all_permissions()),
+                permission: Some(all_permissions(&self.config.hidden_mcp)),
                 ..Default::default()
             })
             .await?;
@@ -130,7 +130,7 @@ impl OpenCodeRuntime for OpenCodeAgent {
             .sessions()
             .create(&CreateSessionRequest {
                 title: Some(request.title.clone()),
-                permission: Some(all_permissions()),
+                permission: Some(all_permissions(&self.config.hidden_mcp)),
                 ..Default::default()
             })
             .await?;
@@ -451,15 +451,24 @@ fn parse_model(value: &str) -> ModelRef {
     }
 }
 
-fn all_permissions() -> Ruleset {
+fn all_permissions(hidden_mcp: &[String]) -> Ruleset {
     // Keep every OpenCode capability available, except the interactive
     // question tool: a headless knowledge service has no user-answer loop.
     // OpenCode evaluates the last matching rule, so the specific deny follows
     // the wildcard allow.
-    vec![
+    let mut rules = vec![
         permission("*", "*", PermissionAction::Allow),
         permission("question", "*", PermissionAction::Deny),
-    ]
+    ];
+    // Foreign MCP servers registered on the shared OpenCode Server for other
+    // callers (e.g. the host task runtime). OpenCode wildcard-matches the
+    // tool name (`<server>_<tool>`) and a pattern-`*` deny hides the tool
+    // from the model entirely, so Noema sessions never call a task runtime
+    // with a Noema job id — or re-enter the knowledge API recursively.
+    for server in hidden_mcp {
+        rules.push(permission(&format!("{server}_*"), "*", PermissionAction::Deny));
+    }
+    rules
 }
 
 fn permission(name: &str, pattern: &str, action: PermissionAction) -> PermissionRule {
@@ -476,12 +485,32 @@ mod tests {
 
     #[test]
     fn permissions_allow_everything_except_question() {
-        let rules = all_permissions();
+        let rules = all_permissions(&[]);
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0], permission("*", "*", PermissionAction::Allow));
         assert_eq!(
             rules[1],
             permission("question", "*", PermissionAction::Deny)
+        );
+    }
+
+    /// Foreign MCP servers are denied after the wildcard allow, so OpenCode's
+    /// last-match evaluation hides their tools from Noema sessions while the
+    /// rest of the toolset stays available.
+    #[test]
+    fn permissions_hide_foreign_mcp_servers() {
+        let rules = all_permissions(&[
+            "lexifact-agent-runtime".to_string(),
+            "noema-knowledge".to_string(),
+        ]);
+        assert_eq!(rules.len(), 4);
+        assert_eq!(
+            rules[2],
+            permission("lexifact-agent-runtime_*", "*", PermissionAction::Deny)
+        );
+        assert_eq!(
+            rules[3],
+            permission("noema-knowledge_*", "*", PermissionAction::Deny)
         );
     }
 

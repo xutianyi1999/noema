@@ -15,5 +15,6 @@ pub fn config(data_dir: PathBuf, auth_token: Option<&str>) -> Config {
         transcript: false,
         max_sessions: 4,
         auth_token: auth_token.map(str::to_string),
+        hidden_mcp: vec![],
     }
 }
