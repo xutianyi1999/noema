@@ -42,7 +42,6 @@ unicode-truncate = "2.0.1"
 unicode-width = "0.2"
 uuid = { version = "1", features = ["serde", "v4"] }
 walkdir = "2.5"
-yaml_serde = "0.10"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

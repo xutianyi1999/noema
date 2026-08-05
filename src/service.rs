@@ -13,12 +13,12 @@ use crate::{
     config::Config,
     error::AppError,
     models::{
-        CreateLibraryRequest, DocumentInput, HealthResponse, JobKind, JobState, JobStatus, Library,
-        QueryResponse, SubmitDocumentsResponse, SubmittedDocument,
+        CreateLibraryRequest, DeleteDocumentResponse, DocumentInput, HealthResponse, JobKind,
+        JobState, JobStatus, Library, QueryResponse, SubmitDocumentsResponse, SubmittedDocument,
     },
     references::{contained_file, safe_knowledge_path},
     runtime::{AgentRunRequest, OpenCodeAgent, OpenCodeRuntime},
-    storage::{Storage, StoredDocument, referenced_sources},
+    storage::{DocumentRecord, Storage, StoredDocument},
 };
 
 pub struct AppService<R: OpenCodeRuntime> {
@@ -268,6 +268,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 filename,
                 content: document.content,
                 title: document.title,
+                metadata: document.metadata,
             });
         }
         // Store loop. A mid-submission error (e.g. a name conflict against
@@ -282,22 +283,23 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 &document.filename,
                 document.title.as_deref(),
                 &document.content,
+                document.metadata.as_ref(),
             )?;
             stored_documents.push((document, stored));
         }
-        // One wiki walk for the whole submission (per-path walks would be
-        // O(documents × wiki)).
-        let referenced = referenced_sources(&self.storage.library_root(&library_id)?.join("wiki"))?;
+        // One lookup for the whole submission instead of one per path.
+        let compiled = self.storage.compiled_document_paths(&library_id)?;
         let mut entries: Vec<SubmittedDocument> = Vec::new();
         let mut to_ingest: Vec<StoredDocument> = Vec::new();
         let mut seen_paths: HashSet<String> = HashSet::new();
         for (document, stored) in stored_documents {
-            // A duplicate the wiki already compiles is a no-op skip. One no
-            // node references is a document a job left behind by failing
-            // before promotion: fall through and re-run ingestion on it —
-            // dedupe would otherwise lose it forever. Decided before the job
-            // row exists so no failure below can strand a forever-queued job.
-            let skip = stored.duplicate && referenced.contains(&stored.record.path);
+            // A duplicate a completed ingest already compiled is a no-op
+            // skip. One still uncompiled is a document a job left behind by
+            // failing before promotion: fall through and re-run ingestion on
+            // it — dedupe would otherwise lose it forever. Decided before
+            // the job row exists so no failure below can strand a
+            // forever-queued job.
+            let skip = stored.duplicate && compiled.contains(&stored.record.path);
             entries.push(SubmittedDocument {
                 filename: document.filename,
                 document_path: stored.record.path.clone(),
@@ -350,6 +352,52 @@ impl<R: OpenCodeRuntime> AppService<R> {
     pub fn job_status(&self, library: &str, job_id: &str) -> Result<JobStatus, AppError> {
         let library_id = self.storage.resolve_library(library)?.id;
         self.storage.get_job(&library_id, job_id)
+    }
+
+    /// Every document record in one library, oldest first, including opaque
+    /// metadata. `library` accepts an id or a unique name.
+    pub fn list_documents(&self, library: &str) -> Result<Vec<DocumentRecord>, AppError> {
+        let library_id = self.storage.resolve_library(library)?.id;
+        self.storage.list_documents(&library_id)
+    }
+
+    /// Delete one stored document and re-derive the library's knowledge. The
+    /// documents row and its `raw/` file are removed synchronously (the
+    /// durable delete); a maintenance job then runs an OpenCode session that
+    /// re-aligns the wiki nodes and the graphify graph with the deletion —
+    /// the mirror image of ingestion compiling an addition. `library` accepts
+    /// an id or a unique name; the returned job id is pollable via the job
+    /// status endpoints.
+    pub async fn delete_document(
+        &self,
+        library: &str,
+        filename: &str,
+    ) -> Result<DeleteDocumentResponse, AppError> {
+        let library_id = self.storage.resolve_library(library)?.id;
+        // Durable delete (row + raw file). Not gated by the ingest lock, the
+        // same as store_document: staging copies take the tree as they find
+        // it, and the maintenance job below serializes via the lock.
+        let record = self.storage.delete_document(&library_id, filename)?;
+        let job = self.storage.create_job(&library_id, JobKind::Maintain)?;
+
+        let service = self.clone();
+        let job_id = job.job_id.clone();
+        let task_library_id = library_id.clone();
+        let deleted_path = record.path.clone();
+        tokio::spawn(async move {
+            if let Err(error) = service
+                .process_maintain(&task_library_id, &job_id, &deleted_path)
+                .await
+            {
+                tracing::error!(library_id = %task_library_id, job_id = %job_id, error = %error, "maintenance after delete failed");
+            }
+        });
+
+        Ok(DeleteDocumentResponse {
+            library_id,
+            job_id: job.job_id,
+            filename: record.filename,
+        })
     }
 
     /// `library` accepts an exact id or a unique library name.
@@ -522,16 +570,15 @@ impl<R: OpenCodeRuntime> AppService<R> {
         // content resubmitted mid-run spawns a second job for it. Re-checked
         // here under the library lock so the late job skips instead of
         // redoing a whole ingest session over already-compiled documents.
-        let referenced =
-            match referenced_sources(&self.storage.library_root(library_id)?.join("wiki")) {
-                Ok(referenced) => referenced,
-                // Like every other failure below, record it on the job row: a
-                // bare `?` would leave the job stranded as `queued`.
-                Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
-            };
+        let compiled = match self.storage.compiled_document_paths(library_id) {
+            Ok(compiled) => compiled,
+            // Like every other failure below, record it on the job row: a
+            // bare `?` would leave the job stranded as `queued`.
+            Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
+        };
         let pending: Vec<StoredDocument> = stored
             .into_iter()
-            .filter(|stored| !referenced.contains(&stored.record.path))
+            .filter(|stored| !compiled.contains(&stored.record.path))
             .collect();
         if pending.is_empty() {
             if let Err(error) =
@@ -564,6 +611,11 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 return Err(self.record_job_failure(library_id, job_id, None, error));
             }
         };
+        // Everything this session is asked to compile: the submitted batch
+        // plus any uncompiled leftovers a failed predecessor left behind.
+        // Marked compiled once the promotion below is durable.
+        let compiled_paths: Vec<String> =
+            paths.iter().cloned().chain(extras.iter().cloned()).collect();
         let request = AgentRunRequest {
             library_id: library_id.into(),
             workdir: staging,
@@ -578,7 +630,8 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .storage
             .validate_staging(library_id, job_id, &baseline)
             .and_then(|_| self.storage.promote_staging(library_id, job_id))
-            .and_then(|_| self.storage.rebuild_index(library_id))
+            .and_then(|_| self.storage.rebuild_derived(library_id))
+            .and_then(|_| self.storage.mark_compiled(library_id, &compiled_paths))
         {
             return Err(self.record_job_failure(
                 library_id,
@@ -626,6 +679,85 @@ impl<R: OpenCodeRuntime> AppService<R> {
         Ok(())
     }
 
+    /// Re-derive the library's knowledge after a source document was deleted.
+    /// Mirrors [`process_ingest`]: serialize on the library lock, copy the
+    /// (already-shrunken) tree into a staging workspace, run an OpenCode
+    /// maintenance session that re-aligns the wiki nodes and updates the
+    /// graphify graph, then validate and promote. Deleting the last document
+    /// legitimately empties the wiki, so validation relaxes the non-empty
+    /// requirement.
+    async fn process_maintain(
+        &self,
+        library_id: &str,
+        job_id: &str,
+        deleted_path: &str,
+    ) -> Result<(), AppError> {
+        let _ingest_guard = self.ingest_lock(library_id).lock_owned().await;
+        let _session_permit = self
+            .sessions
+            .acquire()
+            .await
+            .map_err(|_| sessions_closed())?;
+        if let Err(error) =
+            self.storage
+                .update_job(library_id, job_id, JobState::Running, None, None)
+        {
+            return Err(self.record_job_failure(library_id, job_id, None, error));
+        }
+        let (staging, baseline) = match self.storage.prepare_staging(library_id, job_id) {
+            Ok(prepared) => prepared,
+            Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
+        };
+        let request = AgentRunRequest {
+            library_id: library_id.into(),
+            workdir: staging,
+            title: format!("Noema maintenance {job_id}"),
+            prompt: format_maintain_task(deleted_path, job_id),
+        };
+        let result = match self.runtime.run_new_session(request).await {
+            Ok(result) => result,
+            Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
+        };
+        if let Err(error) = self
+            .storage
+            .validate_staging_after_delete(library_id, job_id, &baseline)
+            .and_then(|_| self.storage.promote_staging(library_id, job_id))
+            .and_then(|_| self.storage.rebuild_derived(library_id))
+        {
+            return Err(self.record_job_failure(
+                library_id,
+                job_id,
+                Some(&result.session_id),
+                error,
+            ));
+        }
+        if let Err(error) = self.storage.update_job(
+            library_id,
+            job_id,
+            JobState::Completed,
+            Some(&result.session_id),
+            None,
+        ) {
+            self.cleanup_staging(library_id, job_id);
+            return Err(self.record_job_failure(
+                library_id,
+                job_id,
+                Some(&result.session_id),
+                error,
+            ));
+        }
+        self.cleanup_staging(library_id, job_id);
+        let storage = self.storage.clone();
+        let library_id = library_id.to_string();
+        tokio::spawn(async move {
+            tokio::time::sleep(STAGING_RECONCILE_DELAY).await;
+            if let Err(error) = storage.reconcile_staging(&library_id) {
+                tracing::warn!(library_id = %library_id, %error, "deferred staging reconcile failed");
+            }
+        });
+        Ok(())
+    }
+
     /// Drop one job's staging workspace; a failure only logs — the startup
     /// reconciliation sweep eventually removes whatever is left behind.
     fn cleanup_staging(&self, library_id: &str, job_id: &str) {
@@ -654,14 +786,14 @@ fn uncompiled_documents(
     staging: &Path,
     current: &[String],
 ) -> Result<Vec<String>, AppError> {
-    let referenced = referenced_sources(&staging.join("wiki"))?;
+    let compiled = storage.compiled_document_paths(library_id)?;
     Ok(storage
         .list_documents(library_id)?
         .into_iter()
         .map(|document| document.path)
         .filter(|path| {
             !current.contains(path)
-                && !referenced.contains(path)
+                && !compiled.contains(path)
                 // Submissions are not gated by the ingest lock, so a document
                 // submitted after this staging copy was prepared is already
                 // in the database but absent from staging raw/: its own
@@ -717,6 +849,16 @@ fn format_ingest_task(
     )
 }
 
+/// The maintenance task message (user role) following a document deletion:
+/// job-specific facts only. The maintenance discipline — re-aligning nodes,
+/// preserving shared nodes, using the upstream graphify Skill — lives in the
+/// kb-maintain skill and the `AGENTS.md` contract.
+fn format_maintain_task(deleted_path: &str, job_id: &str) -> String {
+    format!(
+        "维护任务 {job_id}。源文档 {deleted_path} 已被删除。先阅读 purpose.md 和 schema.md，然后调用 OpenCode 的 `skill` 工具加载 kb-maintain Skill，将 wiki/ 与该删除重新对齐：仅由该源支撑的节点予以删除，其他资料共同贡献的共享节点保留并更新其 sources 与 relations，清理失效的来源引用，矛盾移入 reviews/；节点落盘后同步更新 index.md。\n\n随后调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify . --update`，让它在当前 staging 根目录更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物；如果增量流程因节点减少被收缩保护拒绝，这属于有意的删除，改用 `/graphify . --force` 完整重建。不要替换成裸 `graphify update .`。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -732,10 +874,10 @@ mod tests {
             })
             .unwrap();
         storage
-            .store_document(&library.id, "a.md", None, "content a")
+            .store_document(&library.id, "a.md", None, "content a", None)
             .unwrap();
         storage
-            .store_document(&library.id, "b.md", None, "content b")
+            .store_document(&library.id, "b.md", None, "content b", None)
             .unwrap();
         // Staging copy taken before b.md landed: its DB row must not leak
         // into the extras list — the session would be told to compile a
@@ -769,7 +911,7 @@ mod tests {
             ("c.md", "content c"),
         ] {
             storage
-                .store_document(&library.id, name, None, content)
+                .store_document(&library.id, name, None, content, None)
                 .unwrap();
         }
         let staging = tempfile::tempdir().unwrap();

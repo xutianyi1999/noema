@@ -27,7 +27,6 @@ mod staging;
 
 pub(crate) use documents::knowledge_files;
 pub(crate) use fsutil::copy_path;
-pub(crate) use staging::{referenced_sources, validate_wiki_nodes};
 
 use crate::error::AppError;
 
@@ -45,6 +44,10 @@ pub struct DocumentRecord {
     pub path: String,
     pub sha256: String,
     pub created_at: DateTime<Utc>,
+    /// Opaque caller-defined JSON set at submission time; `None` for rows
+    /// stored before the metadata column existed (or submitted without it).
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]

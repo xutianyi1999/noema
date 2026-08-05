@@ -12,7 +12,7 @@ use axum::{
     http::{HeaderMap, StatusCode, header},
     middleware,
     response::Response,
-    routing::{get, post},
+    routing::{delete, get, post},
 };
 use bytes::Bytes;
 use futures_util::{Stream, TryStreamExt};
@@ -25,12 +25,13 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use crate::{
     error::AppError,
     models::{
-        CreateLibraryRequest, HealthResponse, JobStatus, Library, QueryRequest, QueryResponse,
-        SubmitDocumentsRequest, SubmitDocumentsResponse,
+        CreateLibraryRequest, DeleteDocumentResponse, HealthResponse, JobStatus, Library,
+        QueryRequest, QueryResponse, SubmitDocumentsRequest, SubmitDocumentsResponse,
     },
     runtime::OpenCodeRuntime,
     service::AppService,
     snapshot,
+    storage::DocumentRecord,
 };
 
 pub fn router<R: OpenCodeRuntime>(service: AppService<R>) -> Router {
@@ -50,7 +51,13 @@ pub fn router<R: OpenCodeRuntime>(service: AppService<R>) -> Router {
             "/v1/libraries/{library_id}/documents",
             // axum's default JSON body limit is 2 MiB — below the size of
             // real regulatory texts. Snapshots keep their own 512 MB cap.
-            post(submit_documents::<R>).layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
+            get(list_documents::<R>)
+                .post(submit_documents::<R>)
+                .layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
+        )
+        .route(
+            "/v1/libraries/{library_id}/documents/{filename}",
+            delete(delete_document::<R>),
         )
         .route(
             "/v1/libraries/{library_id}/jobs/{job_id}",
@@ -274,6 +281,27 @@ async fn submit_documents<R: OpenCodeRuntime>(
             .submit_documents(&library_id, request.documents)
             .await?,
     ))
+}
+
+/// List every document record in one library (oldest first), including the
+/// opaque metadata stored with each document.
+async fn list_documents<R: OpenCodeRuntime>(
+    State(service): State<AppService<R>>,
+    Path(library_id): Path<String>,
+) -> Result<Json<Vec<DocumentRecord>>, AppError> {
+    Ok(Json(service.list_documents(&library_id)?))
+}
+
+/// Delete one stored document. The documents row and raw file are removed
+/// synchronously and the response carries the maintenance job id that
+/// re-derives the wiki nodes and graphify graph via an OpenCode session. The
+/// selector is the stored filename; a missing document is the same uniform
+/// 404 as any other absent resource.
+async fn delete_document<R: OpenCodeRuntime>(
+    State(service): State<AppService<R>>,
+    Path((library_id, filename)): Path<(String, String)>,
+) -> Result<Json<DeleteDocumentResponse>, AppError> {
+    Ok(Json(service.delete_document(&library_id, &filename).await?))
 }
 
 async fn job_status<R: OpenCodeRuntime>(

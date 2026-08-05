@@ -195,6 +195,7 @@ async fn library_with_source(
                 filename: "source.md".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: title.map(str::to_string),
+                metadata: None,
             }],
         )
         .await
@@ -228,6 +229,7 @@ async fn library_ingestion_query_and_session_isolation_work() {
                 filename: "source.md".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: Some("来源文档".into()),
+                metadata: None,
             }],
         )
         .await
@@ -248,6 +250,7 @@ async fn library_ingestion_query_and_session_isolation_work() {
                 content: "# Second Context\n\nA second source for incremental graph updates."
                     .into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -266,6 +269,7 @@ async fn library_ingestion_query_and_session_isolation_work() {
                 filename: "other.txt".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -354,6 +358,7 @@ async fn libraries_are_isolated_and_invalid_documents_are_rejected() {
                 filename: "../escape.md".into(),
                 content: "should fail".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await;
@@ -369,6 +374,7 @@ async fn libraries_are_isolated_and_invalid_documents_are_rejected() {
                 filename: "note.md".into(),
                 content: "first version".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -380,6 +386,7 @@ async fn libraries_are_isolated_and_invalid_documents_are_rejected() {
                 filename: "note.md".into(),
                 content: "second, different version".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await;
@@ -407,6 +414,7 @@ async fn libraries_are_addressable_by_unique_name() {
                 filename: "source.md".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -470,6 +478,7 @@ async fn concurrent_submissions_to_one_library_are_serialized() {
                 filename: "one.md".into(),
                 content: "# One\n\nFirst source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -481,6 +490,7 @@ async fn concurrent_submissions_to_one_library_are_serialized() {
                 filename: "two.md".into(),
                 content: "# Two\n\nSecond source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -707,6 +717,7 @@ async fn a_submission_landing_mid_ingest_no_longer_fails_validation() {
                 filename: "source.md".into(),
                 content: "# Session Context\n\nTest source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -735,6 +746,7 @@ async fn a_job_that_failed_before_promotion_is_recompiled_by_the_next_ingest() {
                 filename: "doc1.md".into(),
                 content: "# One\n\nFirst source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -749,6 +761,7 @@ async fn a_job_that_failed_before_promotion_is_recompiled_by_the_next_ingest() {
                 filename: "doc2.md".into(),
                 content: "# Two\n\nSecond source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -794,6 +807,7 @@ async fn a_document_compiled_by_a_predecessor_job_is_not_ingested_twice() {
                 filename: "a.md".into(),
                 content: "# A\n\nFirst source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -810,6 +824,7 @@ async fn a_document_compiled_by_a_predecessor_job_is_not_ingested_twice() {
                 filename: "b.md".into(),
                 content: "# B\n\nSecond source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -827,6 +842,7 @@ async fn a_document_compiled_by_a_predecessor_job_is_not_ingested_twice() {
                 filename: "b.md".into(),
                 content: "# B\n\nSecond source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -897,16 +913,19 @@ async fn a_batch_of_documents_is_compiled_in_one_ingestion_job() {
                     filename: "a.md".into(),
                     content: "# A\n\nFirst source.".into(),
                     title: None,
+                    metadata: None,
                 },
                 DocumentInput {
                     filename: "b.md".into(),
                     content: "# B\n\nSecond source.".into(),
                     title: None,
+                    metadata: None,
                 },
                 DocumentInput {
                     filename: "c.md".into(),
                     content: "# C\n\nThird source.".into(),
                     title: None,
+                    metadata: None,
                 },
             ],
         )
@@ -960,11 +979,13 @@ async fn a_batch_of_already_compiled_documents_is_a_noop_skip() {
                 filename: "a.md".into(),
                 content: "# A\n\nFirst source.".into(),
                 title: None,
+                metadata: None,
             },
             DocumentInput {
                 filename: "b.md".into(),
                 content: "# B\n\nSecond source.".into(),
                 title: None,
+                metadata: None,
             },
         ]
     };
@@ -1020,6 +1041,7 @@ async fn a_batch_mixing_compiled_and_fresh_documents_skips_only_the_compiled() {
                 filename: "a.md".into(),
                 content: "# A\n\nFirst source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -1035,11 +1057,13 @@ async fn a_batch_mixing_compiled_and_fresh_documents_skips_only_the_compiled() {
                     filename: "a.md".into(),
                     content: "# A\n\nFirst source.".into(),
                     title: None,
+                    metadata: None,
                 },
                 DocumentInput {
                     filename: "b.md".into(),
                     content: "# B\n\nSecond source.".into(),
                     title: None,
+                    metadata: None,
                 },
             ],
         )
@@ -1103,11 +1127,13 @@ async fn a_batch_with_an_empty_document_is_rejected_naming_the_filename() {
                     filename: "ok.md".into(),
                     content: "# Ok\n\nFine.".into(),
                     title: None,
+                    metadata: None,
                 },
                 DocumentInput {
                     filename: "empty.md".into(),
                     content: String::new(),
                     title: None,
+                    metadata: None,
                 },
             ],
         )
@@ -1136,11 +1162,13 @@ async fn a_batch_with_the_same_name_but_different_content_is_rejected() {
                     filename: "a.md".into(),
                     content: "one version".into(),
                     title: None,
+                    metadata: None,
                 },
                 DocumentInput {
                     filename: "a.md".into(),
                     content: "another version".into(),
                     title: None,
+                    metadata: None,
                 },
             ],
         )
@@ -1163,11 +1191,13 @@ async fn a_batch_with_identical_duplicate_entries_collapses_to_one() {
             filename: "a.md".into(),
             content: "# A\n\nFirst source.".into(),
             title: None,
+            metadata: None,
         },
         DocumentInput {
             filename: "a.md".into(),
             content: "# A\n\nFirst source.".into(),
             title: None,
+            metadata: None,
         },
     ];
     let submitted = service.submit_documents(&library.id, batch).await.unwrap();
@@ -1202,11 +1232,13 @@ async fn a_batch_with_duplicate_content_across_names_reports_both_entries_and_on
                     filename: "a.md".into(),
                     content: "# Shared\n\nOne content.".into(),
                     title: None,
+                    metadata: None,
                 },
                 DocumentInput {
                     filename: "b.md".into(),
                     content: "# Shared\n\nOne content.".into(),
                     title: None,
+                    metadata: None,
                 },
             ],
         )
@@ -1264,11 +1296,13 @@ async fn a_failed_batch_is_recompiled_by_the_next_ingest_via_extras() {
                     filename: "doc1.md".into(),
                     content: "# One\n\nFirst source.".into(),
                     title: None,
+                    metadata: None,
                 },
                 DocumentInput {
                     filename: "doc2.md".into(),
                     content: "# Two\n\nSecond source.".into(),
                     title: None,
+                    metadata: None,
                 },
             ],
         )
@@ -1286,6 +1320,7 @@ async fn a_failed_batch_is_recompiled_by_the_next_ingest_via_extras() {
                 filename: "doc3.md".into(),
                 content: "# Three\n\nThird source.".into(),
                 title: None,
+                metadata: None,
             }],
         )
         .await
@@ -1384,6 +1419,7 @@ async fn an_uncompiled_duplicate_is_reingested_instead_of_skipped() {
         filename: "source.md".into(),
         content: "# Session Context\n\nTest source.".into(),
         title: None,
+        metadata: None,
     };
 
     let first = service

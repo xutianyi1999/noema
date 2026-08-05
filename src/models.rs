@@ -10,6 +10,9 @@ use serde::{Deserialize, Serialize};
 #[serde(rename_all = "lowercase")]
 pub enum JobKind {
     Ingest,
+    /// Re-derive the wiki nodes and graphify graph after a document was
+    /// deleted (the mirror image of an ingest compiling an addition).
+    Maintain,
 }
 
 /// Lifecycle state of a job (also reused for query runs, which only ever
@@ -73,7 +76,10 @@ macro_rules! string_enum {
     };
 }
 
-string_enum!(JobKind, "job kind", { Ingest => "ingest" });
+string_enum!(JobKind, "job kind", {
+    Ingest => "ingest",
+    Maintain => "maintain"
+});
 string_enum!(JobState, "job state", {
     Queued => "queued",
     Running => "running",
@@ -104,6 +110,11 @@ pub struct DocumentInput {
     pub content: String,
     #[serde(default)]
     pub title: Option<String>,
+    /// Arbitrary caller-defined JSON metadata stored alongside the document.
+    /// Noema treats it as an opaque blob — it never reads, validates or
+    /// indexes it; the submitting system owns the schema.
+    #[serde(default)]
+    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -144,6 +155,17 @@ pub struct QueryRequest {
     /// Continue a prior successful query in this library. When omitted, the
     /// service creates a new OpenCode session.
     pub session_id: Option<String>,
+}
+
+/// Outcome of a document deletion. The document row and its `raw/` file are
+/// removed synchronously; the returned maintenance job re-derives the wiki
+/// nodes and the graphify graph via an OpenCode session (poll it via the job
+/// status endpoints).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteDocumentResponse {
+    pub library_id: String,
+    pub job_id: String,
+    pub filename: String,
 }
 
 /// The JSON contract the query Agent must output inside its `<noema-answer>`
@@ -211,6 +233,17 @@ pub struct McpEnsureLibraryRequest {
 pub struct McpJobRequest {
     pub library_id: String,
     pub job_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpListDocumentsRequest {
+    pub library_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct McpDeleteDocumentRequest {
+    pub library_id: String,
+    pub filename: String,
 }
 
 /// One verified citation attached to a query response. The Agent declares

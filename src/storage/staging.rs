@@ -4,7 +4,7 @@
 //! library root.
 
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
 };
@@ -101,6 +101,28 @@ impl Storage {
         job_id: &str,
         baseline: &StagingBaseline,
     ) -> Result<(), AppError> {
+        self.validate_staging_inner(library_id, job_id, baseline, true)
+    }
+
+    /// Like [`validate_staging`] but permits an empty `wiki/`: deleting a
+    /// library's last source document legitimately leaves no knowledge nodes
+    /// to promote.
+    pub fn validate_staging_after_delete(
+        &self,
+        library_id: &str,
+        job_id: &str,
+        baseline: &StagingBaseline,
+    ) -> Result<(), AppError> {
+        self.validate_staging_inner(library_id, job_id, baseline, false)
+    }
+
+    fn validate_staging_inner(
+        &self,
+        library_id: &str,
+        job_id: &str,
+        baseline: &StagingBaseline,
+        require_wiki_nodes: bool,
+    ) -> Result<(), AppError> {
         let staging = self.library_root(library_id)?.join("staging").join(job_id);
         if !staging.is_dir() {
             return Err(AppError::Storage(format!(
@@ -164,9 +186,14 @@ impl Storage {
         // Without this an agent that deleted `wiki/` (or replaced it with a
         // regular file) would pass validation and either report a job
         // completed that compiled nothing or promote a file over the live
-        // wiki tree.
+        // wiki tree. Maintenance after a delete may legitimately empty the
+        // wiki (the caller relaxes `require_wiki_nodes`), but `wiki/` must
+        // still be a directory.
         let wiki = staging.join("wiki");
-        if !wiki.is_dir() || !contains_markdown(&wiki)? {
+        if !wiki.is_dir() {
+            return Err(AppError::Storage("staging has no wiki/ directory".into()));
+        }
+        if require_wiki_nodes && !contains_markdown(&wiki)? {
             return Err(AppError::Storage(
                 "staging has no wiki/ nodes: the ingest compiled no knowledge".into(),
             ));
@@ -188,7 +215,9 @@ impl Storage {
             }
         }
 
-        validate_wiki_nodes(&wiki)
+        // Node content is the agent's responsibility: noema checks only the
+        // shape of the promoted outputs above, never the knowledge itself.
+        Ok(())
     }
 
     pub fn cleanup_staging(&self, library_id: &str, job_id: &str) -> Result<(), AppError> {
@@ -294,146 +323,6 @@ fn contains_markdown(root: &Path) -> Result<bool, AppError> {
     Ok(false)
 }
 
-/// Every `raw/` path some wiki node claims in its `sources` frontmatter —
-/// the set of documents ingestion has already compiled. Used to name the
-/// documents a failed job left behind in `raw/` without nodes, and to tell
-/// a genuine no-op duplicate from one that must be re-ingested. A missing
-/// directory yields the empty set; files without frontmatter or with
-/// malformed `sources` entries contribute nothing; unparseable YAML is an
-/// error, as in [`validate_wiki_nodes`].
-pub(crate) fn referenced_sources(wiki_dir: &Path) -> Result<HashSet<String>, AppError> {
-    if !wiki_dir.exists() {
-        return Ok(HashSet::new());
-    }
-    let mut referenced = HashSet::new();
-    for entry in WalkDir::new(wiki_dir).follow_links(false) {
-        let entry = entry?;
-        if !entry.file_type().is_file() {
-            continue;
-        }
-        let Some(mapping) = frontmatter_mapping(entry.path())? else {
-            continue;
-        };
-        let Some(yaml_serde::Value::Sequence(items)) = mapping.get("sources") else {
-            continue;
-        };
-        for item in items {
-            // The contract shape is a `{path: ..., locator: ...}` mapping; a
-            // bare string is tolerated.
-            let path = match item {
-                yaml_serde::Value::Mapping(item) => item.get("path"),
-                plain => Some(plain),
-            };
-            if let Some(yaml_serde::Value::String(path)) = path {
-                referenced.insert(path.clone());
-            }
-        }
-    }
-    Ok(referenced)
-}
-
-/// The frontmatter keys every wiki node must declare — the node contract,
-/// documented in schema.md and enforced by the knowledge-compiler skill.
-const WIKI_NODE_KEYS: [&str; 9] = [
-    "node_id",
-    "canonical_name",
-    "kind",
-    "sources",
-    "relations",
-    "claim_type",
-    "confidence",
-    "created_at",
-    "updated_at",
-];
-
-/// The YAML frontmatter block of a node, if the file opens with a `---`
-/// line closed by a second `---` line.
-fn extract_frontmatter(content: &str) -> Option<String> {
-    let mut lines = content.lines();
-    if lines.next() != Some("---") {
-        return None;
-    }
-    let mut frontmatter = String::new();
-    for line in lines {
-        if line == "---" {
-            return Some(frontmatter);
-        }
-        frontmatter.push_str(line);
-        frontmatter.push('\n');
-    }
-    None
-}
-
-/// The YAML frontmatter of one node file as a mapping, or `None` when the
-/// file has no frontmatter block; unparseable YAML is an error.
-fn frontmatter_mapping(path: &Path) -> Result<Option<yaml_serde::Mapping>, AppError> {
-    let content = fs::read_to_string(path)?;
-    let Some(frontmatter) = extract_frontmatter(&content) else {
-        return Ok(None);
-    };
-    let mapping = yaml_serde::from_str(&frontmatter).map_err(|error| {
-        AppError::Storage(format!(
-            "wiki node has invalid YAML frontmatter: {}: {error}",
-            path.display()
-        ))
-    })?;
-    Ok(Some(mapping))
-}
-
-pub(crate) fn validate_wiki_nodes(root: &Path) -> Result<(), AppError> {
-    if !root.exists() {
-        return Ok(());
-    }
-    for entry in WalkDir::new(root).follow_links(false) {
-        let entry = entry?;
-        let path = entry.path();
-        if !entry.file_type().is_file()
-            || path
-                .extension()
-                .and_then(|value| value.to_str())
-                .is_none_or(|value| !value.eq_ignore_ascii_case("md"))
-        {
-            continue;
-        }
-        let Some(mapping) = frontmatter_mapping(path)? else {
-            return Err(AppError::Storage(format!(
-                "wiki node is missing YAML frontmatter: {}",
-                path.display()
-            )));
-        };
-        let missing: Vec<&str> = WIKI_NODE_KEYS
-            .iter()
-            .copied()
-            .filter(|key| !mapping.contains_key(yaml_serde::Value::String((*key).into())))
-            .collect();
-        if !missing.is_empty() {
-            return Err(AppError::Storage(format!(
-                "wiki node has incomplete YAML frontmatter: {}: missing {}",
-                path.display(),
-                missing.join(", ")
-            )));
-        }
-        // The contract allows exactly the nine node keys: extra keys fail
-        // validation instead of drifting into the promoted library.
-        let extra: Vec<String> = mapping
-            .keys()
-            .map(|key| match key {
-                yaml_serde::Value::String(key) => key.clone(),
-                other => format!("{other:?}"),
-            })
-            .filter(|key| !WIKI_NODE_KEYS.contains(&key.as_str()))
-            .collect();
-        if !extra.is_empty() {
-            return Err(AppError::Storage(format!(
-                "wiki node declares frontmatter keys outside the contract: {}: {}",
-                path.display(),
-                extra.join(", ")
-            )));
-        }
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -519,7 +408,7 @@ mod tests {
     fn validate_staging_compares_against_the_preparation_baseline_not_the_live_root() {
         let (_tmp, storage, library_id) = fixture();
         storage
-            .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
+            .store_document(&library_id, "source.md", None, "# Source\n\nBody.", None)
             .unwrap();
         let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
         let (staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
@@ -532,62 +421,44 @@ mod tests {
         fs::write(root.join("raw/late.md"), "# Late arrival").unwrap();
         fs::write(root.join("purpose.md"), "rewritten live").unwrap();
         // A successful ingest compiled at least one node.
-        fs::write(staging.join("wiki/n.md"), contract_node("")).unwrap();
+        fs::write(staging.join("wiki/n.md"), contract_node()).unwrap();
         storage
             .validate_staging(&library_id, &job.job_id, &baseline)
             .unwrap();
-    }
-
-    /// A node whose frontmatter carries exactly the nine contract keys.
-    fn contract_node(extra: &str) -> String {
-        format!(
-            "---\nnode_id: n\ncanonical_name: N\nkind: concept\nsources:\n  - path: raw/source.md\n    locator: 第一条\nrelations:\n  depends_on: []\n  related_to: []\n  opposite_to: []\nclaim_type: observed\nconfidence: 1.0\ncreated_at: 2026-08-01T00:00:00Z\nupdated_at: 2026-08-01T00:00:00Z\n{extra}---\n\n# N\n"
-        )
     }
 
     #[test]
-    fn validate_staging_enforces_exactly_the_nine_contract_keys() {
+    fn validate_staging_accepts_nodes_of_any_shape() {
+        // Knowledge structure is the agent's responsibility: noema checks
+        // only that the wiki has content, never how a node is written. A
+        // node with no frontmatter and a free-form body is a valid output.
         let (_tmp, storage, library_id) = fixture();
         storage
-            .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
+            .store_document(&library_id, "source.md", None, "# Source\n\nBody.", None)
             .unwrap();
         let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
         let (staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
-
-        // Exactly the contract keys pass.
-        fs::write(staging.join("wiki/n.md"), contract_node("")).unwrap();
+        fs::write(
+            staging.join("wiki/freeform.md"),
+            "# 自由节点\n\n任意正文，无 frontmatter。\n",
+        )
+        .unwrap();
         storage
             .validate_staging(&library_id, &job.job_id, &baseline)
             .unwrap();
+    }
 
-        // An extra key violates the node contract.
-        fs::write(
-            staging.join("wiki/n.md"),
-            contract_node("extra_key: not in the contract\n"),
-        )
-        .unwrap();
-        let error = storage
-            .validate_staging(&library_id, &job.job_id, &baseline)
-            .unwrap_err();
-        assert!(error.to_string().contains("extra_key"), "{error}");
-
-        // A missing key as well.
-        fs::write(
-            staging.join("wiki/n.md"),
-            contract_node("").replacen("confidence: 1.0\n", "", 1),
-        )
-        .unwrap();
-        let error = storage
-            .validate_staging(&library_id, &job.job_id, &baseline)
-            .unwrap_err();
-        assert!(error.to_string().contains("confidence"), "{error}");
+    /// A knowledge node: plain markdown. Noema validates only that `wiki/`
+    /// has content — a node's structure is the agent's responsibility.
+    fn contract_node() -> String {
+        "# N\n\nA test knowledge node.\n".to_string()
     }
 
     #[test]
     fn validate_staging_rejects_every_modification_inside_staging() {
         let (_tmp, storage, library_id) = fixture();
         storage
-            .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
+            .store_document(&library_id, "source.md", None, "# Source\n\nBody.", None)
             .unwrap();
         let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
         let (staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
@@ -622,7 +493,7 @@ mod tests {
 
         // Restored byte-for-byte: the digests match again once the ingest's
         // compiled node is in place.
-        fs::write(staging.join("wiki/n.md"), contract_node("")).unwrap();
+        fs::write(staging.join("wiki/n.md"), contract_node()).unwrap();
         storage
             .validate_staging(&library_id, &job.job_id, &baseline)
             .unwrap();
@@ -635,7 +506,7 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("wiki"), "{error}");
         fs::create_dir_all(staging.join("wiki")).unwrap();
-        fs::write(staging.join("wiki/n.md"), contract_node("")).unwrap();
+        fs::write(staging.join("wiki/n.md"), contract_node()).unwrap();
 
         // Replacing a promoted directory with a regular file as well.
         fs::remove_dir_all(staging.join("wiki")).unwrap();

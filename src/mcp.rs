@@ -11,8 +11,8 @@ use rmcp::{
 
 use crate::{
     models::{
-        CreateLibraryRequest, McpEnsureLibraryRequest, McpIngestRequest, McpJobRequest,
-        McpQueryRequest,
+        CreateLibraryRequest, McpDeleteDocumentRequest, McpEnsureLibraryRequest, McpIngestRequest,
+        McpJobRequest, McpListDocumentsRequest, McpQueryRequest,
     },
     runtime::OpenCodeRuntime,
     service::AppService,
@@ -36,7 +36,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
 #[tool_router]
 impl<R: OpenCodeRuntime> McpHandler<R> {
     #[tool(
-        description = "确保指定的隔离内容库已经存在；已存在时直接返回，不会重复创建。Agent 应在首次写入前调用它。"
+        description = "确保指定的内容库已经存在；已存在时直接返回，不会重复创建。Agent 应在首次写入前调用它。"
     )]
     async fn kb_ensure_library(
         &self,
@@ -54,7 +54,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
     }
 
     #[tool(
-        description = "向隔离的 Noema 内容库提交一篇或多篇 UTF-8 Markdown/TXT 文档。所有文档会合并到同一个摄入作业中编译。"
+        description = "向 Noema 内容库提交一篇或多篇 UTF-8 Markdown/TXT 文档。所有文档会合并到同一个摄入作业中编译。每篇文档可选携带 metadata（任意 JSON 对象），Noema 原样存取、不作解析，由调用方约定其结构。"
     )]
     async fn kb_ingest_documents(
         &self,
@@ -69,7 +69,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
     }
 
     #[tool(
-        description = "使用自然语言提示词查询一个隔离的 Noema 内容库。省略 session_id 时创建会话；传入同一内容库此前成功查询返回的 session_id 时继续该会话。"
+        description = "使用自然语言提示词查询一个 Noema 内容库。省略 session_id 时创建会话；传入同一内容库此前成功查询返回的 session_id 时继续该会话。"
     )]
     async fn kb_query(
         &self,
@@ -87,7 +87,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
         json_response(&response)
     }
 
-    #[tool(description = "获取一个隔离内容库中的摄入作业状态。")]
+    #[tool(description = "获取一个内容库中的摄入作业状态。")]
     async fn kb_job_status(
         &self,
         Parameters(request): Parameters<McpJobRequest>,
@@ -95,6 +95,33 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
         let response = self
             .service
             .job_status(&request.library_id, &request.job_id)
+            .map_err(|error| to_mcp_error(&error))?;
+        json_response(&response)
+    }
+
+    #[tool(description = "列出一个内容库中的全部文档记录（按入库时间升序），含每篇的 metadata。")]
+    async fn kb_list_documents(
+        &self,
+        Parameters(request): Parameters<McpListDocumentsRequest>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let response = self
+            .service
+            .list_documents(&request.library_id)
+            .map_err(|error| to_mcp_error(&error))?;
+        json_response(&response)
+    }
+
+    #[tool(
+        description = "从一个内容库中删除一篇文档：同步删除文档记录与 raw/ 源文件，并触发一个维护作业，由 OpenCode 会话重新对齐 wiki 节点、更新 graphify 图谱。返回维护作业 id（可用 kb_job_status 轮询）。filename 必须是该文档入库时的文件名。"
+    )]
+    async fn kb_delete_document(
+        &self,
+        Parameters(request): Parameters<McpDeleteDocumentRequest>,
+    ) -> Result<String, rmcp::ErrorData> {
+        let response = self
+            .service
+            .delete_document(&request.library_id, &request.filename)
+            .await
             .map_err(|error| to_mcp_error(&error))?;
         json_response(&response)
     }
@@ -112,7 +139,7 @@ impl<R: OpenCodeRuntime> ServerHandler for McpHandler<R> {
             .with_server_info(
                 Implementation::new("noema", env!("CARGO_PKG_VERSION"))
                     .with_title("Noema")
-                    .with_description("由 OpenCode 驱动的隔离文本知识库服务"),
+                    .with_description("由 OpenCode 驱动的文本知识库服务"),
             )
             .with_instructions(
                 "每个工具都必须显式传入 library_id；内容库彼此隔离。省略 session_id 时，kb_query 创建新的 OpenCode 会话；传入同一内容库此前成功查询的 session_id 时继续该会话。",

@@ -178,9 +178,10 @@ fn overlay_and_repair(
     had_opencode: bool,
 ) -> Result<(), AppError> {
     copy_path(scratch, root)?;
-    // Regenerate index.md, the content FTS and manifest.json from the copied
-    // tree and database so every derived artifact matches the snapshot.
-    storage.rebuild_index(&library.id)?;
+    // Regenerate the content FTS and manifest.json from the copied tree and
+    // database so the derived artifacts match the snapshot. The snapshot's
+    // agent-authored index.md is kept as-is.
+    storage.rebuild_derived(&library.id)?;
     // Snapshots ship their own .opencode project; only archives without one
     // need the installer to become queryable.
     if !had_opencode {
@@ -192,15 +193,11 @@ fn overlay_and_repair(
 }
 
 /// The content contract an imported library must already satisfy, checked on
-/// the unpacked scratch tree before any library row is created. Staging
-/// validation enforces the nine-key node contract at the end of every
-/// ingest — on the staging copy of the live wiki — so one imported node
-/// outside the contract would fail every later ingest with no way to heal.
-/// Knowledge files must additionally be UTF-8 text: the index rebuild reads
-/// them as strings.
+/// the unpacked scratch tree before any library row is created. Knowledge
+/// files must be UTF-8 text: the index rebuild reads them as strings. Node
+/// structure itself is the agent's concern, so noema does not police it on
+/// import either.
 fn validate_snapshot_content(scratch: &Path) -> Result<(), AppError> {
-    crate::storage::validate_wiki_nodes(&scratch.join("wiki"))
-        .map_err(|error| AppError::BadRequest(format!("snapshot rejected: {error}")))?;
     for (relative, path) in crate::storage::knowledge_files(scratch)? {
         if let Err(error) = fs::read_to_string(&path) {
             return Err(AppError::BadRequest(format!(
@@ -446,7 +443,7 @@ mod tests {
             .unwrap();
         let root = PathBuf::from(&library.root);
         storage
-            .store_document(&library.id, "regulation.md", None, "# 法规\n\n第一条。")
+            .store_document(&library.id, "regulation.md", None, "# 法规\n\n第一条。", None)
             .unwrap();
         fs::write(root.join("wiki/regulation.md"), CONTRACT_NODE).unwrap();
         fs::create_dir_all(root.join("graphify-out")).unwrap();
@@ -582,27 +579,6 @@ mod tests {
         archive
             .append_data(&mut header, path, payload)
             .expect("append entry");
-    }
-
-    #[test]
-    fn import_rejects_archives_whose_wiki_breaks_the_node_contract() {
-        // Without this check the import would succeed and every later ingest
-        // would fail its staging validation against the poisoned node.
-        let workspace = tempfile::tempdir().unwrap();
-        let archive_path = workspace.path().join("bad-wiki.tar.gz");
-        {
-            let file = fs::File::create(&archive_path).unwrap();
-            let encoder = GzEncoder::new(file, Compression::default());
-            let mut archive = Builder::new(encoder);
-            append_regular(&mut archive, "raw/a.md", "# 来源\n\n正文。".as_bytes());
-            append_regular(&mut archive, "wiki/bad.md", b"---\nbad: [unclosed\n---\n");
-            archive.into_inner().unwrap().finish().unwrap();
-        }
-        let data_dir = workspace.path().join("data");
-        let error = import_library(&archive_path, None, None, &data_dir).unwrap_err();
-        assert!(error.to_string().contains("frontmatter"), "{error}");
-        let storage = Storage::open(&data_dir).unwrap();
-        assert!(storage.list_libraries().unwrap().is_empty());
     }
 
     #[test]
