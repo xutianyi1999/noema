@@ -44,10 +44,6 @@ pub struct DocumentRecord {
     pub path: String,
     pub sha256: String,
     pub created_at: DateTime<Utc>,
-    /// Opaque caller-defined JSON set at submission time; `None` for rows
-    /// stored before the metadata column existed (or submitted without it).
-    #[serde(default)]
-    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone)]

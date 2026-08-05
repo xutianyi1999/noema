@@ -408,7 +408,7 @@ mod tests {
     fn validate_staging_compares_against_the_preparation_baseline_not_the_live_root() {
         let (_tmp, storage, library_id) = fixture();
         storage
-            .store_document(&library_id, "source.md", None, "# Source\n\nBody.", None)
+            .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
             .unwrap();
         let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
         let (staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
@@ -434,7 +434,7 @@ mod tests {
         // node with no frontmatter and a free-form body is a valid output.
         let (_tmp, storage, library_id) = fixture();
         storage
-            .store_document(&library_id, "source.md", None, "# Source\n\nBody.", None)
+            .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
             .unwrap();
         let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
         let (staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();
@@ -458,7 +458,7 @@ mod tests {
     fn validate_staging_rejects_every_modification_inside_staging() {
         let (_tmp, storage, library_id) = fixture();
         storage
-            .store_document(&library_id, "source.md", None, "# Source\n\nBody.", None)
+            .store_document(&library_id, "source.md", None, "# Source\n\nBody.")
             .unwrap();
         let job = storage.create_job(&library_id, JobKind::Ingest).unwrap();
         let (staging, baseline) = storage.prepare_staging(&library_id, &job.job_id).unwrap();

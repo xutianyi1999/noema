@@ -54,7 +54,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
     }
 
     #[tool(
-        description = "向 Noema 内容库提交一篇或多篇 UTF-8 Markdown/TXT 文档。所有文档会合并到同一个摄入作业中编译。每篇文档可选携带 metadata（任意 JSON 对象），Noema 原样存取、不作解析，由调用方约定其结构。"
+        description = "向 Noema 内容库提交一篇或多篇 UTF-8 Markdown/TXT 文档。所有文档会合并到同一个摄入作业中编译。"
     )]
     async fn kb_ingest_documents(
         &self,
@@ -99,7 +99,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
         json_response(&response)
     }
 
-    #[tool(description = "列出一个内容库中的全部文档记录（按入库时间升序），含每篇的 metadata。")]
+    #[tool(description = "列出一个内容库中的全部文档记录（按入库时间升序）。")]
     async fn kb_list_documents(
         &self,
         Parameters(request): Parameters<McpListDocumentsRequest>,

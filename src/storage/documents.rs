@@ -28,7 +28,6 @@ impl Storage {
         filename: &str,
         title: Option<&str>,
         content: &str,
-        metadata: Option<&serde_json::Value>,
     ) -> Result<StoredDocument, AppError> {
         let root = self.library_root(library_id)?;
         // Filenames are kept verbatim (NFC-normalized so visually identical
@@ -40,25 +39,10 @@ impl Storage {
         hasher.update(content.as_bytes());
         let sha256 = hex::encode(hasher.finalize());
         let now = Utc::now();
-        let metadata_json = metadata
-            .map(serde_json::to_string)
-            .transpose()
-            .map_err(AppError::from)?;
         let connection = open_library_db(&root.join("library.sqlite"))?;
 
-        if let Some(mut existing) = find_by_sha256(&connection, &sha256)? {
-            // Content already stored. Metadata, however, is mutable
-            // enrichment: a row stored without it gains the caller's on a
-            // resubmission that carries it (content identity is unchanged).
-            if existing.metadata.is_none()
-                && let (Some(metadata), Some(json)) = (metadata, metadata_json.as_deref())
-            {
-                connection.execute(
-                    "UPDATE documents SET metadata = ?1 WHERE id = ?2",
-                    params![json, existing.id],
-                )?;
-                existing.metadata = Some(metadata.clone());
-            }
+        if let Some(existing) = find_by_sha256(&connection, &sha256)? {
+            // Content already stored — report the duplicate as-is.
             return Ok(StoredDocument {
                 record: existing,
                 duplicate: true,
@@ -99,7 +83,6 @@ impl Storage {
             path: relative_path,
             sha256,
             created_at: now,
-            metadata: metadata.cloned(),
         };
         // Register the document BEFORE writing the raw/ file: the INSERT's
         // UNIQUE constraints (sha256, path) arbitrate concurrent uploads, so
@@ -107,7 +90,7 @@ impl Storage {
         // overwrite the winner's file on disk (which would leave the DB
         // checksum describing different content than raw/ holds).
         match connection.execute(
-            "INSERT INTO documents (id, filename, title, path, sha256, created_at, metadata) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO documents (id, filename, title, path, sha256, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 record.id,
                 record.filename,
@@ -115,7 +98,6 @@ impl Storage {
                 record.path,
                 record.sha256,
                 record.created_at.to_rfc3339(),
-                metadata_json,
             ],
         ) {
             Ok(_) => {}
@@ -185,7 +167,7 @@ impl Storage {
         let root = self.library_root(library_id)?;
         let connection = open_library_db(&root.join("library.sqlite"))?;
         let mut statement = connection.prepare(
-            "SELECT id, filename, title, path, sha256, created_at, metadata FROM documents ORDER BY created_at",
+            "SELECT id, filename, title, path, sha256, created_at FROM documents ORDER BY created_at",
         )?;
         Ok(statement
             .query_map([], document_from_row)?
@@ -208,7 +190,7 @@ impl Storage {
         let connection = open_library_db(&root.join("library.sqlite"))?;
         let record = connection
             .query_row(
-                "SELECT id, filename, title, path, sha256, created_at, metadata FROM documents WHERE filename = ?1",
+                "SELECT id, filename, title, path, sha256, created_at FROM documents WHERE filename = ?1",
                 params![filename],
                 document_from_row,
             )
@@ -295,7 +277,6 @@ pub(super) fn init_library_db(path: &Path) -> Result<(), AppError> {
             path TEXT NOT NULL UNIQUE,
             sha256 TEXT NOT NULL UNIQUE,
             created_at TEXT NOT NULL,
-            metadata TEXT,
             compiled INTEGER NOT NULL DEFAULT 0
         );
         CREATE VIRTUAL TABLE IF NOT EXISTS content_fts USING fts5(path, title, body);
@@ -404,7 +385,7 @@ fn find_by_sha256(
 ) -> Result<Option<DocumentRecord>, AppError> {
     Ok(connection
         .query_row(
-            "SELECT id, filename, title, path, sha256, created_at, metadata FROM documents WHERE sha256 = ?1",
+            "SELECT id, filename, title, path, sha256, created_at FROM documents WHERE sha256 = ?1",
             params![sha256],
             document_from_row,
         )
@@ -419,7 +400,6 @@ fn name_conflict(filename: &str) -> AppError {
 
 fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentRecord> {
     let created_at: String = row.get(5)?;
-    let metadata: Option<String> = row.get(6)?;
     Ok(DocumentRecord {
         id: row.get(0)?,
         filename: row.get(1)?,
@@ -427,9 +407,6 @@ fn document_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DocumentRecord
         path: row.get(3)?,
         sha256: row.get(4)?,
         created_at: parse_timestamp_or_now(&created_at),
-        // A corrupt metadata blob must not drop the whole row: metadata is
-        // enrichment, not identity.
-        metadata: metadata.and_then(|json| serde_json::from_str(&json).ok()),
     })
 }
 
@@ -486,7 +463,6 @@ mod tests {
                             "race.md",
                             None,
                             &format!("content {index}"),
-                            None,
                         )
                     })
                 })
@@ -520,7 +496,7 @@ mod tests {
     fn reconcile_drops_phantom_rows_and_unblocks_resubmission() {
         let (_tmp, storage, library_id) = fixture();
         storage
-            .store_document(&library_id, "phantom.md", None, "content", None)
+            .store_document(&library_id, "phantom.md", None, "content")
             .unwrap();
         // Simulate the crash window's aftermath: the row exists, the file
         // does not.
@@ -531,7 +507,7 @@ mod tests {
         // Without reconciliation dedupe would keep reporting a duplicate of
         // content whose file no longer exists.
         let stored = storage
-            .store_document(&library_id, "phantom.md", None, "content", None)
+            .store_document(&library_id, "phantom.md", None, "content")
             .unwrap();
         assert!(!stored.duplicate);
     }
@@ -545,7 +521,7 @@ mod tests {
                     let storage = storage.clone();
                     let library_id = library_id.clone();
                     scope.spawn(move || {
-                        storage.store_document(&library_id, filename, None, "identical", None)
+                        storage.store_document(&library_id, filename, None, "identical")
                     })
                 })
                 .map(|handle| handle.join().unwrap())
@@ -566,45 +542,13 @@ mod tests {
     }
 
     #[test]
-    fn metadata_round_trips_through_store_and_list() {
-        let (_tmp, storage, library_id) = fixture();
-        let metadata = serde_json::json!({"category": "法律", "topics": ["个人信息"]});
-        storage
-            .store_document(&library_id, "law.md", None, "content", Some(&metadata))
-            .unwrap();
-        let documents = storage.list_documents(&library_id).unwrap();
-        assert_eq!(documents.len(), 1);
-        assert_eq!(documents[0].metadata.as_ref(), Some(&metadata));
-    }
-
-    #[test]
-    fn resubmitting_identical_content_enriches_missing_metadata() {
-        let (_tmp, storage, library_id) = fixture();
-        let stored = storage
-            .store_document(&library_id, "doc.md", None, "same content", None)
-            .unwrap();
-        assert!(!stored.duplicate);
-        assert!(stored.record.metadata.is_none());
-        let metadata = serde_json::json!({"summary": "补上的摘要"});
-        let again = storage
-            .store_document(&library_id, "doc.md", None, "same content", Some(&metadata))
-            .unwrap();
-        assert!(again.duplicate);
-        assert_eq!(again.record.metadata.as_ref(), Some(&metadata));
-        // Persisted on the row, not just the returned record.
-        let documents = storage.list_documents(&library_id).unwrap();
-        assert_eq!(documents.len(), 1);
-        assert_eq!(documents[0].metadata.as_ref(), Some(&metadata));
-    }
-
-    #[test]
     fn compiled_flag_is_set_by_job_completion_and_drives_the_path_lookup() {
         let (_tmp, storage, library_id) = fixture();
         let a = storage
-            .store_document(&library_id, "a.md", None, "# A", None)
+            .store_document(&library_id, "a.md", None, "# A")
             .unwrap();
         let b = storage
-            .store_document(&library_id, "b.md", None, "# B", None)
+            .store_document(&library_id, "b.md", None, "# B")
             .unwrap();
         // Nothing is compiled before an ingest job finishes.
         assert!(
@@ -635,7 +579,7 @@ mod tests {
     fn rebuild_derived_leaves_the_agent_authored_index_untouched() {
         let (_tmp, storage, library_id) = fixture();
         storage
-            .store_document(&library_id, "a.md", None, "# A", None)
+            .store_document(&library_id, "a.md", None, "# A")
             .unwrap();
         // index.md belongs to the agent; stand in for its version.
         let root = storage.library_root(&library_id).unwrap();
@@ -653,10 +597,10 @@ mod tests {
     fn delete_document_removes_row_and_raw_file_and_returns_the_record() {
         let (_tmp, storage, library_id) = fixture();
         storage
-            .store_document(&library_id, "gone.md", None, "# 正文", None)
+            .store_document(&library_id, "gone.md", None, "# 正文")
             .unwrap();
         storage
-            .store_document(&library_id, "kept.md", None, "# 保留", None)
+            .store_document(&library_id, "kept.md", None, "# 保留")
             .unwrap();
         let root = storage.library_root(&library_id).unwrap();
 

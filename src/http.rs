@@ -283,8 +283,7 @@ async fn submit_documents<R: OpenCodeRuntime>(
     ))
 }
 
-/// List every document record in one library (oldest first), including the
-/// opaque metadata stored with each document.
+/// List every document record in one library (oldest first).
 async fn list_documents<R: OpenCodeRuntime>(
     State(service): State<AppService<R>>,
     Path(library_id): Path<String>,

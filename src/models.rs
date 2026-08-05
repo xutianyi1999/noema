@@ -110,11 +110,6 @@ pub struct DocumentInput {
     pub content: String,
     #[serde(default)]
     pub title: Option<String>,
-    /// Arbitrary caller-defined JSON metadata stored alongside the document.
-    /// Noema treats it as an opaque blob — it never reads, validates or
-    /// indexes it; the submitting system owns the schema.
-    #[serde(default)]
-    pub metadata: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

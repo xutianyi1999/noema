@@ -443,7 +443,7 @@ mod tests {
             .unwrap();
         let root = PathBuf::from(&library.root);
         storage
-            .store_document(&library.id, "regulation.md", None, "# 法规\n\n第一条。", None)
+            .store_document(&library.id, "regulation.md", None, "# 法规\n\n第一条。")
             .unwrap();
         fs::write(root.join("wiki/regulation.md"), CONTRACT_NODE).unwrap();
         fs::create_dir_all(root.join("graphify-out")).unwrap();

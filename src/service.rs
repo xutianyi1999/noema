@@ -268,7 +268,6 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 filename,
                 content: document.content,
                 title: document.title,
-                metadata: document.metadata,
             });
         }
         // Store loop. A mid-submission error (e.g. a name conflict against
@@ -283,7 +282,6 @@ impl<R: OpenCodeRuntime> AppService<R> {
                 &document.filename,
                 document.title.as_deref(),
                 &document.content,
-                document.metadata.as_ref(),
             )?;
             stored_documents.push((document, stored));
         }
@@ -354,8 +352,8 @@ impl<R: OpenCodeRuntime> AppService<R> {
         self.storage.get_job(&library_id, job_id)
     }
 
-    /// Every document record in one library, oldest first, including opaque
-    /// metadata. `library` accepts an id or a unique name.
+    /// Every document record in one library, oldest first. `library` accepts
+    /// an id or a unique name.
     pub fn list_documents(&self, library: &str) -> Result<Vec<DocumentRecord>, AppError> {
         let library_id = self.storage.resolve_library(library)?.id;
         self.storage.list_documents(&library_id)
@@ -874,10 +872,10 @@ mod tests {
             })
             .unwrap();
         storage
-            .store_document(&library.id, "a.md", None, "content a", None)
+            .store_document(&library.id, "a.md", None, "content a")
             .unwrap();
         storage
-            .store_document(&library.id, "b.md", None, "content b", None)
+            .store_document(&library.id, "b.md", None, "content b")
             .unwrap();
         // Staging copy taken before b.md landed: its DB row must not leak
         // into the extras list — the session would be told to compile a
@@ -911,7 +909,7 @@ mod tests {
             ("c.md", "content c"),
         ] {
             storage
-                .store_document(&library.id, name, None, content, None)
+                .store_document(&library.id, name, None, content)
                 .unwrap();
         }
         let staging = tempfile::tempdir().unwrap();
