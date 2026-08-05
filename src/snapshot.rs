@@ -48,9 +48,10 @@ struct SnapshotManifest {
 
 /// Export one content library (selected by id or, if unique, by name) as a
 /// snapshot archive. Only the library's own root directory is walked; the
-/// staging workspace, SQLite sidecar files, `.opencode/node_modules` and all
-/// symbolic links are excluded so the archive is a portable, self-contained
-/// copy with no references outside the library.
+/// staging workspace, Git metadata, SQLite sidecar files,
+/// `.opencode/node_modules` and all symbolic links are excluded so the
+/// archive is a portable, self-contained copy with no references outside the
+/// library.
 pub fn export_library(data_dir: &Path, selector: &str, output: &Path) -> Result<Library, AppError> {
     let storage = Storage::open(data_dir)?;
     let library = storage.resolve_library(selector)?;
@@ -178,6 +179,9 @@ fn overlay_and_repair(
     had_opencode: bool,
 ) -> Result<(), AppError> {
     copy_path(scratch, root)?;
+    // A library's Git repository is local OpenCode project identity, never
+    // portable content. Every import receives a new independent repository.
+    crate::bootstrap::ensure_git_repository(root)?;
     // Regenerate the content FTS and manifest.json from the copied tree and
     // database so the derived artifacts match the snapshot. The snapshot's
     // agent-authored index.md is kept as-is.
@@ -249,16 +253,17 @@ fn append_tree<W: Write>(
     Ok(())
 }
 
-/// Runtime state that never travels with a snapshot. `library.sqlite` itself
-/// IS exported (portable: it only stores library-relative paths); only its
-/// process-local sidecar files are excluded.
+/// Runtime state and the local OpenCode project identity that never travel
+/// with a snapshot. `library.sqlite` itself IS exported (portable: it only
+/// stores library-relative paths); only its process-local sidecar files are
+/// excluded.
 fn is_excluded(relative: &Path) -> bool {
     let mut components = relative.components();
     let Some(Component::Normal(first)) = components.next() else {
         return true;
     };
     let first = first.to_string_lossy();
-    if first == "staging" {
+    if first == ".git" || first == "staging" {
         return true;
     }
     if first != "library.sqlite" && first.starts_with("library.sqlite") {
@@ -273,6 +278,13 @@ fn is_excluded(relative: &Path) -> bool {
         return true;
     }
     false
+}
+
+fn is_git_metadata(relative: &Path) -> bool {
+    matches!(
+        relative.components().next(),
+        Some(Component::Normal(component)) if component == ".git"
+    )
 }
 
 /// Cumulative unpacked-size ceiling for one snapshot, independent of the
@@ -295,6 +307,12 @@ fn unpack_validated<R: Read>(
         let entry_type = entry.header().entry_type();
         let relative = entry.path()?.into_owned();
         validate_relative_path(&relative)?;
+        if is_git_metadata(&relative) {
+            return Err(AppError::BadRequest(format!(
+                "snapshot must not contain Git metadata: {}",
+                relative.display()
+            )));
+        }
         let target = destination.join(&relative);
         // Defence in depth: the joined path must stay inside the destination.
         if !target.starts_with(destination) {
@@ -402,6 +420,7 @@ mod tests {
     fn export_excludes_runtime_state_but_keeps_the_database() {
         assert!(is_excluded(Path::new("staging")));
         assert!(is_excluded(Path::new("staging/job-1/wiki/x.md")));
+        assert!(is_excluded(Path::new(".git/HEAD")));
         assert!(is_excluded(Path::new("library.sqlite-wal")));
         assert!(is_excluded(Path::new("library.sqlite-shm")));
         assert!(is_excluded(Path::new(
@@ -487,6 +506,7 @@ mod tests {
         // Runtime state and links never travel.
         assert!(!imported_root.join("staging/job-x").exists());
         assert!(!imported_root.join("raw/evil-link").exists());
+        assert!(imported_root.join(".git").is_dir());
         // The snapshot manifest is metadata, not library content.
         assert!(!imported_root.join(SNAPSHOT_MANIFEST).exists());
         // Noema skills were refreshed to this binary's contract.
@@ -527,6 +547,16 @@ mod tests {
         let error = unpack_validated(&mut archive, scratch.path(), MAX_UNPACKED_BYTES).unwrap_err();
         assert!(error.to_string().contains("escapes"), "{error}");
         assert!(!scratch.path().parent().unwrap().join("evil.md").exists());
+    }
+
+    #[test]
+    fn unpack_rejects_git_metadata() {
+        let scratch = tempfile::tempdir().unwrap();
+        let bytes = archive_bytes(&[(".git/HEAD", &b"ref: refs/heads/main\n"[..])]);
+        let mut archive = Archive::new(&bytes[..]);
+        let error = unpack_validated(&mut archive, scratch.path(), MAX_UNPACKED_BYTES).unwrap_err();
+        assert!(error.to_string().contains("Git metadata"), "{error}");
+        assert!(!scratch.path().join(".git").exists());
     }
 
     #[test]

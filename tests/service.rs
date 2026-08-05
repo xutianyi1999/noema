@@ -1,6 +1,7 @@
 use std::{
     fs,
     path::PathBuf,
+    process::Command,
     sync::{
         Arc, Mutex,
         atomic::{AtomicUsize, Ordering},
@@ -50,6 +51,12 @@ impl FakeRuntime {
             hook(&request);
         }
         let is_ingest = request.title.contains("ingestion");
+        let task_workdir = request
+            .title
+            .strip_prefix("Noema ingestion ")
+            .or_else(|| request.title.strip_prefix("Noema maintenance "))
+            .map(|job_id| request.workdir.join("staging").join(job_id))
+            .unwrap_or_else(|| request.workdir.clone());
         let session_id = requested_session_id.map(str::to_string).unwrap_or_else(|| {
             let number = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
             format!("fake-session-{number}")
@@ -74,7 +81,7 @@ impl FakeRuntime {
                 return Err(AppError::Runtime("injected ingestion failure".into()));
             }
         }
-        let mut sources = fs::read_dir(request.workdir.join("raw"))
+        let mut sources = fs::read_dir(task_workdir.join("raw"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -94,9 +101,9 @@ impl FakeRuntime {
             let node = format!(
                 "---\nnode_id: session-context\ncanonical_name: Session Context\nkind: concept\nsources:\n{node_sources}relations:\n  depends_on: []\n  related_to: []\n  opposite_to: []\nclaim_type: observed\nconfidence: 1.0\ncreated_at: 2026-08-01T00:00:00Z\nupdated_at: 2026-08-01T00:00:00Z\n---\n\n# Session Context\n\nA test knowledge node.\n\n## Evidence\n\n{evidence}"
             );
-            fs::write(request.workdir.join("wiki/session-context.md"), node).unwrap();
+            fs::write(task_workdir.join("wiki/session-context.md"), node).unwrap();
             fs::write(
-                request.workdir.join("graphify-out/graph.json"),
+                task_workdir.join("graphify-out/graph.json"),
                 r#"{"nodes":[{"id":"session-context"}],"edges":[]}"#,
             )
             .unwrap();
@@ -105,7 +112,7 @@ impl FakeRuntime {
         let answer = if is_ingest {
             "摄入完成".into()
         } else {
-            let content = fs::read_to_string(request.workdir.join("raw").join(&source)).unwrap();
+            let content = fs::read_to_string(task_workdir.join("raw").join(&source)).unwrap();
             let good = serde_json::to_string(content.lines().next().unwrap_or_default()).unwrap();
             if request.prompt.contains("bad-contract") {
                 format!("答案见 `raw/{source}`，这不是契约 JSON。")
@@ -322,8 +329,10 @@ async fn library_ingestion_query_and_session_isolation_work() {
         .map(|request| request.prompt.as_str())
         .collect::<Vec<_>>();
     assert_eq!(ingestion_prompts.len(), 2);
-    assert!(ingestion_prompts[0].contains("/graphify .` 完整首次建图流程"));
-    assert!(ingestion_prompts[1].contains("/graphify . --update"));
+    assert!(ingestion_prompts[0].contains("/graphify staging/"));
+    assert!(ingestion_prompts[0].contains("完整首次建图流程"));
+    assert!(ingestion_prompts[1].contains("/graphify staging/"));
+    assert!(ingestion_prompts[1].contains("--update"));
     assert!(requests.len() >= 5);
 }
 
@@ -506,8 +515,10 @@ async fn concurrent_submissions_to_one_library_are_serialized() {
         .collect();
     if second_status.status == JobState::Completed {
         assert_eq!(prompts.len(), 2, "{prompts:?}");
-        assert!(prompts[0].contains("/graphify .` 完整首次建图流程"));
-        assert!(prompts[1].contains("/graphify . --update"));
+        assert!(prompts[0].contains("/graphify staging/"));
+        assert!(prompts[0].contains("完整首次建图流程"));
+        assert!(prompts[1].contains("/graphify staging/"));
+        assert!(prompts[1].contains("--update"));
     } else {
         assert_eq!(second_status.status, JobState::Skipped, "{second_status:?}");
         assert_eq!(prompts.len(), 1, "{prompts:?}");
@@ -690,13 +701,7 @@ async fn a_submission_landing_mid_ingest_no_longer_fails_validation() {
         if !request.title.contains("ingestion") {
             return;
         }
-        let late = request
-            .workdir
-            .parent()
-            .unwrap()
-            .parent()
-            .unwrap()
-            .join("raw/late.md");
+        let late = request.workdir.join("raw/late.md");
         fs::write(late, "# Late arrival\n\nSubmitted mid-run.").unwrap();
     }));
 
@@ -714,6 +719,56 @@ async fn a_submission_landing_mid_ingest_no_longer_fails_validation() {
     let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
     assert_eq!(status.status, JobState::Completed, "{status:?}");
     assert!(root.join("raw/late.md").is_file());
+}
+
+#[tokio::test]
+async fn ingestion_session_is_anchored_at_the_library_root() {
+    let (_tempdir, service, runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "根目录会话库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let submitted = service
+        .submit_documents(
+            &library.id,
+            vec![DocumentInput {
+                filename: "source.md".into(),
+                content: "# Source\n\nContent.".into(),
+                title: None,
+            }],
+        )
+        .await
+        .unwrap();
+    let status = wait_for_completion(&service, &library.id, &submitted.job_id).await;
+    assert_eq!(status.status, JobState::Completed, "{status:?}");
+
+    let request = runtime
+        .requests
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|request| request.title.contains("ingestion"))
+        .cloned()
+        .expect("ingestion request recorded");
+    assert_eq!(request.workdir, PathBuf::from(&library.root));
+    let workspace = PathBuf::from(&library.root)
+        .join("staging")
+        .join(&submitted.job_id);
+    assert!(
+        request.prompt.contains("/graphify staging/"),
+        "{}",
+        request.prompt
+    );
+    for _ in 0..10 {
+        if !workspace.exists() {
+            break;
+        }
+        sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!workspace.exists(), "completed job workspace was not deleted");
 }
 
 #[tokio::test]
@@ -876,6 +931,34 @@ async fn startup_repairs_a_library_whose_bootstrap_was_interrupted() {
     )
     .unwrap();
     assert!(marker.is_file(), "startup re-ran the graphify installer");
+}
+
+#[tokio::test]
+async fn startup_migrates_an_existing_library_to_a_git_project() {
+    let (tempdir, service, _runtime) = service_fixture().await;
+    let library = service
+        .create_library(CreateLibraryRequest {
+            name: "Git 迁移库".into(),
+            description: None,
+        })
+        .await
+        .unwrap();
+    let root = PathBuf::from(&library.root);
+    fs::remove_dir_all(root.join(".git")).unwrap();
+
+    let _migrated = AppService::with_runtime(
+        common::config(tempdir.path().join("data"), None),
+        Arc::new(FakeRuntime::default()),
+    )
+    .unwrap();
+
+    assert!(root.join(".git").is_dir());
+    let head = Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(&root)
+        .output()
+        .unwrap();
+    assert!(head.status.success());
 }
 
 #[tokio::test]

@@ -22,6 +22,8 @@ use crate::{config::Config, error::AppError, transcript::Transcript};
 #[derive(Debug, Clone)]
 pub struct AgentRunRequest {
     pub library_id: String,
+    /// OpenCode session directory and the durable content-library project
+    /// root. Every Noema session for one library uses this same directory.
     pub workdir: PathBuf,
     pub prompt: String,
     pub title: String,
@@ -34,8 +36,9 @@ pub struct AgentRunResult {
     pub tool_events: Vec<serde_json::Value>,
 }
 
-/// Ingestion always creates a short-lived session. Queries may instead resume
-/// a successful session from the same library by passing its `session_id`.
+/// Ingestion and maintenance create one retained session per job. Queries may
+/// instead resume a successful session from the same library by passing its
+/// `session_id`.
 /// The trait is generic (static dispatch) rather than dyn-dispatched so it can
 /// use native async-trait support (`async fn` in traits is not dyn-compatible
 /// on stable Rust). The RPITIT signature pins the future as `Send` so services
@@ -104,7 +107,7 @@ impl OpenCodeRuntime for OpenCodeAgent {
             session.id,
             request,
             self.config.clone(),
-            SessionCleanup::Always,
+            SessionCleanup::Never,
         )
         .await
     }
@@ -150,11 +153,9 @@ impl OpenCodeRuntime for OpenCodeAgent {
 }
 
 enum SessionCleanup {
-    /// Ingestion sessions stay strictly ephemeral.
-    Always,
     /// A first query turn must make its session discoverable to retain it.
     OnFailureOrCancellation,
-    /// The caller supplied an already-discoverable session id.
+    /// A completed session remains in OpenCode's project history.
     Never,
 }
 
@@ -170,21 +171,15 @@ async fn run_session(
     let (result_tx, result_rx) = tokio::sync::oneshot::channel();
     tokio::spawn(async move {
         let result = drive_session(&client, &session_id, request, &config).await;
-        let delete_after_result = match cleanup {
-            SessionCleanup::Always => true,
-            SessionCleanup::OnFailureOrCancellation => result.is_err(),
-            SessionCleanup::Never => false,
-        };
+        let delete_after_result =
+            matches!(cleanup, SessionCleanup::OnFailureOrCancellation) && result.is_err();
         let receiver_dropped = result_tx.send(result).is_err();
         let delete = match cleanup {
-            SessionCleanup::Always => true,
             SessionCleanup::OnFailureOrCancellation => delete_after_result || receiver_dropped,
             SessionCleanup::Never => false,
         };
-        if delete {
-            if let Err(error) = client.sessions().delete(&session_id).await {
-                tracing::warn!(%session_id, %error, "failed to delete OpenCode session");
-            }
+        if delete && let Err(error) = client.sessions().delete(&session_id).await {
+            tracing::warn!(%session_id, %error, "failed to delete OpenCode session");
         }
     });
     result_rx

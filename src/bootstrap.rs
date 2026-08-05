@@ -7,7 +7,7 @@ use std::{
     fs,
     io::{self, Read},
     path::Path,
-    process::{Command, Stdio},
+    process::{Command, Output, Stdio},
     time::{Duration, Instant},
 };
 
@@ -43,11 +43,64 @@ const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 /// marks a library the installer has completed; startup re-runs the full
 /// bootstrap where it is missing.
 const GRAPHIFY_MARKER: &str = ".opencode/skills/graphify/SKILL.md";
+const GIT_INITIAL_COMMIT: &str = "Initialize Noema library";
+const GIT_USER_NAME_CONFIG: &str = "user.name=Noema";
+const GIT_USER_EMAIL_CONFIG: &str = "user.email=noema@localhost";
 
 /// Whether the upstream graphify installer has completed in this library
 /// project.
 pub(crate) fn graphify_installed(root: &Path) -> bool {
     root.join(GRAPHIFY_MARKER).is_file()
+}
+
+/// Ensure that one content library is one independent OpenCode project.
+///
+/// OpenCode derives a stable project identity from the repository's root
+/// commit. An empty initial commit is intentional: Git is a project-identity
+/// boundary here, not Noema's content-history store. Every OpenCode session
+/// uses the repository root; ingestion and maintenance write only to their
+/// `staging/<job_id>` task copy.
+pub(crate) fn ensure_git_repository(root: &Path) -> Result<(), AppError> {
+    run_git(root, &["init", "--initial-branch=main"])?;
+    let head = git(root, &["rev-parse", "--verify", "HEAD"])?;
+    if head.status.success() {
+        return Ok(());
+    }
+    run_git(
+        root,
+        &[
+            "-c",
+            GIT_USER_NAME_CONFIG,
+            "-c",
+            GIT_USER_EMAIL_CONFIG,
+            "commit",
+            "--allow-empty",
+            "--no-gpg-sign",
+            "-m",
+            GIT_INITIAL_COMMIT,
+        ],
+    )?;
+    Ok(())
+}
+
+fn git(root: &Path, args: &[&str]) -> Result<Output, AppError> {
+    Command::new("git")
+        .args(args)
+        .current_dir(root)
+        .output()
+        .map_err(|error| AppError::Runtime(format!("unable to run git: {error}")))
+}
+
+fn run_git(root: &Path, args: &[&str]) -> Result<(), AppError> {
+    let output = git(root, args)?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+    Err(AppError::Runtime(format!(
+        "git {} failed: {stderr}",
+        args.join(" ")
+    )))
 }
 /// Installer diagnostics beyond this are noise; keep a bounded head for the
 /// error message without buffering a chatty release wholesale.
@@ -132,8 +185,8 @@ const CONTRACT_END: &str = "<!-- /noema-contract -->";
 /// project's `AGENTS.md`.
 const GRAPHIFY_SECTION_HEADING: &str = "## graphify";
 
-/// Idempotently install the generated Noema contract (ingest discipline +
-/// query contract with the schema and example) into the project's
+/// Idempotently install the generated Noema contract (ingest and maintenance
+/// discipline plus the query contract with its schema and example) into the project's
 /// `AGENTS.md`. OpenCode injects `AGENTS.md` into the system prompt of every
 /// session, so the contract reaches the Agent as system-level instruction
 /// and the per-query / per-ingest user messages carry no policy text. The
@@ -184,7 +237,7 @@ pub(crate) fn write_agents_contract(root: &Path) -> Result<(), AppError> {
 /// That block tells every session to run `graphify query` first on content
 /// questions and a bare `graphify update .` after modifications — a
 /// code-repo stance that contradicts Noema's summaries-first query contract
-/// and the skill-driven `/graphify . --update` ingest flow. The Noema
+/// and the skill-driven scoped graphify ingest flow. The Noema
 /// contract plus the upstream Skill (loaded on demand, per the contract)
 /// already carry the library's whole graphify stance, so the installer's
 /// voice is removed on every contract refresh; only a re-run installer
@@ -214,8 +267,10 @@ fn strip_graphify_section(content: &str) -> String {
     kept
 }
 
-/// Full bootstrap for a brand-new library project: installer, then skills.
+/// Full bootstrap for a brand-new library project: Git identity, installer,
+/// then skills.
 pub(crate) fn bootstrap(root: &Path) -> Result<(), AppError> {
+    ensure_git_repository(root)?;
     install_graphify(root)?;
     write_skills(root)
 }
@@ -318,5 +373,19 @@ mod tests {
         assert_eq!(contents.matches(CONTRACT_BEGIN).count(), 1, "{contents}");
         assert_eq!(contents.matches(CONTRACT_END).count(), 1, "{contents}");
         assert!(!contents.contains("half-written"), "{contents}");
+    }
+
+    #[test]
+    fn git_repository_has_an_initial_commit_and_is_idempotent() {
+        let tmp = tempfile::tempdir().unwrap();
+        ensure_git_repository(tmp.path()).unwrap();
+        ensure_git_repository(tmp.path()).unwrap();
+
+        assert!(tmp.path().join(".git").is_dir());
+        let head = git(tmp.path(), &["rev-parse", "--verify", "HEAD"]).unwrap();
+        assert!(head.status.success());
+        let root = git(tmp.path(), &["rev-list", "--max-parents=0", "HEAD"]).unwrap();
+        assert!(root.status.success());
+        assert!(!root.stdout.is_empty());
     }
 }

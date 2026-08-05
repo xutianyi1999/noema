@@ -233,12 +233,9 @@ impl Storage {
     /// job row is gone. Failed workspaces stay for inspection; in-flight
     /// ones are left alone.
     ///
-    /// OpenCode persists session state under the session's project
-    /// directory asynchronously, so it can resurrect a cleaned staging
-    /// directory later as an empty skeleton of session tombstones. Running
-    /// this at startup and again after each completed ingest makes staging
-    /// hygiene a convergent invariant instead of a race with that
-    /// write-back.
+    /// OpenCode sessions are anchored at the library root, never inside a
+    /// job workspace, so deleting completed staging directories cannot erase
+    /// or resurrect their session history.
     pub fn reconcile_staging(&self, library_id: &str) -> Result<(), AppError> {
         let staging = self.library_root(library_id)?.join("staging");
         if !staging.is_dir() {

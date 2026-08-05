@@ -11,6 +11,7 @@ Noema 是由 OpenCode 驱动的文本知识库服务：提交 `.md`/`.txt` 文�
 | 依赖 | 要求 | 说明 |
 | --- | --- | --- |
 | Rust | stable（edition 2024，≥ 1.85） | 用于 `cargo install` 编译安装 |
+| `git` | 可执行文件在 PATH 上 | Noema 为每个内容库初始化独立 Git 项目，供 OpenCode 区分项目 |
 | `opencode` | 可执行文件在 PATH 上 | noema 启动时自行拉起并管理 OpenCode Server 子进程（`opencode serve`，127.0.0.1 自动选空闲端口），Ctrl-C 时一并停止 |
 | OpenCode 模型凭据 | 已通过 `opencode` 配置 | 凭据由 OpenCode 自身管理，noema 不接触任何 API key |
 | `graphify` | 可执行文件在 PATH 上 | 创建内容库与导入缺 `.opencode/` 的快照时，noema 运行其安装器（`graphify install --platform opencode --project`）；摄入过程中由 Agent 以 skill 调用 |
@@ -191,12 +192,13 @@ data/                                  数据根目录（NOEMA_DATA_DIR）
 ├── control.sqlite                     控制面：内容库注册、摄入任务、查询历史
 ├── jobs/                              快照导入临时目录（导入结束必定清理）
 └── libraries/{库名}/                   一个内容库（目录名即库名，唯一）—— 与其他库完全隔离
+    ├── .git/                           内容库的 OpenCode 项目身份（不进入快照）
     ├── purpose.md                     内容库定位：范围、关键问题、术语、更新政策
     ├── schema.md                      知识节点契约的人类可读声明
     ├── index.md                       全库知识索引（派生，提交后重建）
     ├── manifest.json                  原文清单（派生）
     ├── .graphifyignore                graphify 输入边界：只含 raw/ 与 wiki/
-    ├── AGENTS.md                      Noema 服务契约（摄入纪律 + 查询契约；graphify 安装器的常驻段落被剥离）
+    ├── AGENTS.md                      Noema 服务契约（摄入/维护纪律 + 查询契约；graphify 安装器的常驻段落被剥离）
     ├── library.sqlite                 库内数据库：原文去重、节点注册、全文检索
     ├── .opencode/                     OpenCode 项目：四个 Noema Skill、graphify 插件与配置
     ├── raw/                           原文：.md/.txt、原文件名存储、SHA-256 去重（同名异内容拒绝）、入库后只读
@@ -215,9 +217,10 @@ data/                                  数据根目录（NOEMA_DATA_DIR）
 | `reviews/` | 未解决的冲突与低置信度结论 | Agent（经 staging 提交） | 与正式知识分离，留待人工或后续任务处理 |
 | `graphify-out/` | 知识图谱、报告与增量缓存 | graphify（经 staging 提交） | 输入被限定为 `raw/` + `wiki/`；只服务图谱查询 |
 | `index.md` · `manifest.json` · `library.sqlite` | 派生索引与去重记录 | Noema 自动重建 | 不手写；永远由原文、知识节点和库内数据库再生 |
-| `staging/{job_id}/` | 摄入隔离工作区 | Noema 创建与清理 | 成功则提交允许的知识产物并清理；失败则保留备查。终态残留另由调和收敛：服务启动时清扫一遍，任务完成后延迟复查一次 |
+| `staging/{job_id}/` | 摄入/维护隔离工作区 | Noema 创建与清理 | OpenCode session 始终在库根创建，Agent 按任务提示只在此副本中读写；成功则提交允许的知识产物并立即清理，失败则保留备查。服务启动时还会清扫此前已终态但残留的作业目录 |
 | `purpose.md` · `schema.md` · `.graphifyignore` | 内容库契约与边界 | 建库时种入 | 摄入校验要求逐字节未变 |
 | `.opencode/` · `AGENTS.md` | Agent 能力与行为说明 | Noema（契约）与 graphify 安装器（插件与 Skill） | 建库与快照导入时写入/刷新，服务启动时按库收敛；AGENTS.md 中 graphify 安装器的常驻段落由 Noema 剥离，只留服务契约；不属于知识提交物 |
+| `.git/` | OpenCode 项目身份 | Noema 初始化 | 每个内容库根目录独立仓库，不随快照导出 |
 
 ### 摄入业务流
 
@@ -226,7 +229,7 @@ flowchart TB
     S1["提交文档"] --> S2{"内容是否已入库？<br/>（SHA-256 去重）"}
     S2 -->|"是"| S4["任务记为 skipped"]
     S2 -->|"否（同名异内容直接 409）"| S5["新原文以原文件名写入 raw/ 并登记<br/>库根输入整套复制进隔离的 staging 工作区"]
-    S5 --> S6["OpenCode Agent 在 staging 内工作：<br/>按节点契约编译知识节点 ·<br/>首次完整建图，此后增量更新图谱"]
+    S5 --> S6["OpenCode session 在内容库根目录运行：<br/>Agent 只在 staging 工作区编译知识节点 ·<br/>首次完整建图，此后增量更新图谱"]
     S6 --> S7{"服务端提交校验<br/>工作区边界干净 · 受保护文件逐字节未变 ·<br/>节点契约完整 · 无禁入文件"}
     S7 -->|"通过"| S8["仅允许的知识产物提交回库根"]
     S8 --> S9["重建库内索引与全文检索"]
@@ -294,9 +297,9 @@ flowchart LR
 
 ## 内容库与 Skill
 
-创建内容库时，Noema 在该项目中运行上游 graphify 安装器，并写入中文的 `kb-ingest`、`kb-query`、`kb-maintain` 和独立设计的 `knowledge-compiler` Skill（LLM-WIKI 只作设计参考，不原样复制）。
+创建内容库时，Noema 在内容库根目录初始化独立 Git 项目，使 OpenCode 为每个库建立独立项目身份。随后 Noema 在该目录运行上游 graphify 安装器，并写入中文的 `kb-ingest`、`kb-query`、`kb-maintain` 和独立设计的 `knowledge-compiler` Skill（LLM-WIKI 只作设计参考，不原样复制）。所有 OpenCode session 的工作目录都是内容库根目录；摄入和维护任务只在提示指定的 `staging/{job_id}/` 副本中读写，任务完成后该目录删除，因此作业 session 仍可稳定归属并回看于内容库项目。
 
-graphify 生命周期：空库只安装插件和 Skill；首篇文档摄入时执行完整 `/graphify .`；已有图谱后，新文档摄入执行 `/graphify . --update` 增量更新。
+graphify 生命周期：空库只安装插件和 Skill；首篇文档摄入时在任务副本执行 `/graphify staging/{job_id}`；已有图谱后执行 `/graphify staging/{job_id} --update`。不得对内容库根执行 `/graphify .`。
 
 ## HTTP API
 
@@ -343,7 +346,7 @@ Streamable HTTP 端点 `POST /mcp`，工具：`kb_ingest_documents`（一篇或�
 
 ## 快照格式
 
-快照是单个内容库的完整副本（gzip tar）：`raw/` 原文、`wiki/` 知识节点、`reviews/`、`graphify-out/` 图谱产物、`.opencode/` Skill 与插件、`library.sqlite` 去重与索引记录，外加清单 `noema-snapshot.json`（格式、版本、库名、来源 id）。归档**不含** `staging/`、运行时状态（`node_modules`、会话记录、SQLite sidecar）和任何符号链接。
+快照是单个内容库的完整副本（gzip tar）：`raw/` 原文、`wiki/` 知识节点、`reviews/`、`graphify-out/` 图谱产物、`.opencode/` Skill 与插件、`library.sqlite` 去重与索引记录，外加清单 `noema-snapshot.json`（格式、版本、库名、来源 id）。归档**不含** `.git/`、`staging/`、运行时状态（`node_modules`、会话记录、SQLite sidecar）和任何符号链接；导入后会为新库重新创建独立 Git 项目身份。
 
 导入语义：
 

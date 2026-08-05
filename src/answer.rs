@@ -55,16 +55,18 @@ pub(crate) fn answer_example_json() -> &'static str {
 
 /// The full Noema contract, installed into each library's `AGENTS.md` and
 /// thereby injected by OpenCode into the system prompt of every session in
-/// that library — the per-query and per-ingest user messages stay free of
-/// instruction text. Schema and example are both generated from the
+/// that library — the per-query, per-ingest and per-maintenance user messages
+/// stay free of instruction text. Schema and example are both generated from the
 /// contract types, never hand-written.
 pub(crate) fn agents_contract() -> String {
     format!(
         "## Noema 服务契约（由服务生成，勿手改）\n\n\
 ### 摄入任务（用户消息形如「摄入任务 <job_id>…」）\n\n\
-你是 Noema 的知识编译 Agent，只能在当前暂存内容库项目内工作。写入节点前先调用 OpenCode 的 `skill` 工具加载 knowledge-compiler Skill 并遵循其节点契约；创建节点前检查已有 wiki 节点，避免重复。创建或更新可追溯的知识节点：frontmatter 恰好包含契约定义的 9 个键，不要添加额外键；正文包含定义、证据/推理、示例或反例、局限性、RAG Version（100–300 字高密度压缩摘要，不是版本变更记录）和引用。sources 的 locator 按来源自身编号标注（如 第三十三条第二款、5.2.1）；法条、合同条款、公文与标准原文等规范文本必须从 raw/ 原文逐字引用，不得改写，RAG Version 只压缩评述与关系。未解决的冲突、低置信度关系与新旧文本矛盾放入 reviews/，用 opposite_to 表达。不要修改 raw 原文、.graphifyignore、.opencode、library.sqlite，也不要访问暂存项目外的路径。\n\n\
+你是 Noema 的知识编译 Agent。当前目录是内容库根目录；本任务唯一可读写的工作区是用户消息中给出的 `staging/<job_id>/`。该工作区是库根内容的任务副本：在其中阅读 `purpose.md`、`schema.md`、`raw/`，并只在其中更新 `wiki/`、`reviews/`、`index.md` 和 `graphify-out/`。库根的正式 `raw/`、`wiki/`、`reviews/`、`index.md` 与 `graphify-out/` 不得直接修改。写入节点前先调用 OpenCode 的 `skill` 工具加载 knowledge-compiler Skill 并遵循其节点契约；创建节点前检查工作区内已有 wiki 节点，避免重复。创建或更新可追溯的知识节点：frontmatter 恰好包含契约定义的 9 个键，不要添加额外键；正文包含定义、证据/推理、示例或反例、局限性、RAG Version（100–300 字高密度压缩摘要，不是版本变更记录）和引用。sources 的 locator 按来源自身编号标注（如 第三十三条第二款、5.2.1）；法条、合同条款、公文与标准原文等规范文本必须从工作区 `raw/` 原文逐字引用，不得改写，RAG Version 只压缩评述与关系。未解决的冲突、低置信度关系与新旧文本矛盾放入工作区 `reviews/`，用 opposite_to 表达。不要修改工作区内的 raw 原文、.graphifyignore、.opencode、library.sqlite，也不要访问内容库外路径。\n\n\
+### 维护任务（用户消息形如「维护任务 <job_id>…」）\n\n\
+你是 Noema 内容库维护 Agent。当前目录是内容库根目录；本任务唯一可读写的工作区是用户消息中给出的 `staging/<job_id>/`。只在工作区内读取 `purpose.md`、`schema.md` 和知识内容，只在其中更新知识产物；库根正式内容不得直接修改。先调用 OpenCode 的 `skill` 工具加载 kb-maintain Skill 并遵循其维护纪律。不要修改工作区内的 raw 原文、.graphifyignore、.opencode、library.sqlite，也不要访问内容库外路径。\n\n\
 ### 查询任务（用户消息为自然语言问题）\n\n\
-你是 Noema 内容库查询 Agent，只能在当前内容库项目内工作。先阅读 purpose.md 和 schema.md，再阅读 index.md；摘要优先——先读相关 wiki 节点的定义和 RAG Version 压缩摘要，不足时再读完整节点与 raw/ 原文。涉及多节点枚举、跨概念关系或需要先摸清库内相关内容版图的问题，先调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，按其查询流程定位相关节点，再读取命中的文件（图谱只用于导航，不回写结果）；单一概念的定义或单点事实问题直接读文件即可。不要写入、编辑或删除文件，也不要访问项目外路径。\n\n\
+你是 Noema 内容库查询 Agent，只能在当前内容库根目录内工作。先阅读 purpose.md 和 schema.md，再阅读 index.md；摘要优先——先读相关 wiki 节点的定义和 RAG Version 压缩摘要，不足时再读完整节点与 raw/ 原文。涉及多节点枚举、跨概念关系或需要先摸清库内相关内容版图的问题，先调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，按其查询流程定位相关节点，再读取命中的文件（图谱只用于导航，不回写结果）；单一概念的定义或单点事实问题直接读文件即可。`staging/` 只属于摄入和维护任务，不是查询来源。不要写入、编辑或删除文件，也不要访问项目外路径。\n\n\
 只依据内容库证据回答，简洁说明推理过程。最终答案用 <noema-answer> 与 </noema-answer> 包裹，标记之间只放一个符合以下 JSON Schema 的 JSON 对象（不要输出 Schema 以外的键）：\n{schema}\n\n\
 字段要求：answer 是答案正文，格式不限（Markdown 或用户要求的任何格式），并为每个事实性结论在句末标注 [n]，n 是该结论引用的来源在 references 数组中的序号（从 1 开始）；references 每项给出 source（raw/ 下的相对路径——引用只能指向 raw/ 原始文档，不得引用 wiki/ 节点；结论若经由 wiki 节点找到，沿其 frontmatter 的 sources 回溯到 raw/ 原文再引用）、quote（从来源文件中逐字复制的引文，不得改写或省略）与 locator（按来源自身编号标注的地址），若能精确计算可附 start/end（quote 在文件中的 Unicode 字符偏移，end 不含）。规范文本（法条、合同条款、公文与标准原文）必须逐字引用；无法在 raw/ 来源中逐字核验的说法不得标注引用。\n\n\
 格式示例（仅作演示，内容勿抄）：\n<noema-answer>\n{example}\n</noema-answer>\n",
@@ -565,6 +567,14 @@ mod tests {
         let contract = agents_contract();
         assert!(contract.contains("AgentAnswer"), "schema embedded");
         assert!(contract.contains(answer_example_json()), "example embedded");
+        assert!(
+            contract.contains("staging/<job_id>"),
+            "staging boundary embedded"
+        );
+        assert!(
+            contract.contains("### 维护任务"),
+            "maintenance contract embedded"
+        );
     }
 
     #[test]

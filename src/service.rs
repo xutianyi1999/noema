@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, Weak},
-    time::Duration,
 };
 
 use tokio::sync::Semaphore;
@@ -54,12 +53,6 @@ impl<R: OpenCodeRuntime> Clone for AppService<R> {
         }
     }
 }
-
-/// How long after an ingest completes before staging is reconciled again:
-/// OpenCode takes minutes to write session tombstones back into a deleted
-/// project directory (observed ~4 min). Whatever this late pass misses, the
-/// startup sweep covers.
-const STAGING_RECONCILE_DELAY: Duration = Duration::from_secs(600);
 
 impl AppService<OpenCodeAgent> {
     pub fn new(config: Config) -> Result<Self, AppError> {
@@ -148,9 +141,8 @@ impl<R: OpenCodeRuntime> AppService<R> {
 
     /// Startup sweep, per library: drop leftover staging workspaces whose
     /// jobs no longer need them (see [`Storage::reconcile_staging`]), then
-    /// refresh the Noema skills and the generated `AGENTS.md` contract to
-    /// this binary's versions — which is also what converges libraries
-    /// created by older binaries onto the current system-prompt contract.
+    /// initialize the per-library Git project, then refresh the Noema skills
+    /// and generated `AGENTS.md` contract to this binary's versions.
     /// A library whose creation died mid-installer has no graphify artifacts
     /// yet; for it the full bootstrap is re-run so startup converges every
     /// library to a working state. Per-library failures only log and never
@@ -170,7 +162,8 @@ impl<R: OpenCodeRuntime> AppService<R> {
                     }
                     let root = Path::new(&library.root);
                     let refreshed = if crate::bootstrap::graphify_installed(root) {
-                        crate::bootstrap::write_skills(root)
+                        crate::bootstrap::ensure_git_repository(root)
+                            .and_then(|()| crate::bootstrap::write_skills(root))
                     } else {
                         crate::bootstrap::bootstrap(root)
                     };
@@ -594,6 +587,10 @@ impl<R: OpenCodeRuntime> AppService<R> {
         {
             return Err(self.record_job_failure(library_id, job_id, None, error));
         }
+        let root = match self.storage.library_root(library_id) {
+            Ok(root) => root,
+            Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
+        };
         let (staging, baseline) = match self.storage.prepare_staging(library_id, job_id) {
             Ok(prepared) => prepared,
             Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
@@ -616,7 +613,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             paths.iter().cloned().chain(extras.iter().cloned()).collect();
         let request = AgentRunRequest {
             library_id: library_id.into(),
-            workdir: staging,
+            workdir: root,
             title: format!("Noema ingestion {job_id}"),
             prompt: format_ingest_task(&paths, job_id, incremental, &extras),
         };
@@ -661,19 +658,6 @@ impl<R: OpenCodeRuntime> AppService<R> {
         // failure must not strand an already-promoted job as `running` —
         // reconciliation removes leftover workspaces of completed jobs.
         self.cleanup_staging(library_id, job_id);
-        // OpenCode writes this session's tombstone back into the staging
-        // project directory minutes after the cleanup above, resurrecting
-        // an empty skeleton; re-reconcile past that write-back window so a
-        // long-running server stays clean (the startup sweep covers the
-        // rest).
-        let storage = self.storage.clone();
-        let library_id = library_id.to_string();
-        tokio::spawn(async move {
-            tokio::time::sleep(STAGING_RECONCILE_DELAY).await;
-            if let Err(error) = storage.reconcile_staging(&library_id) {
-                tracing::warn!(library_id = %library_id, %error, "deferred staging reconcile failed");
-            }
-        });
         Ok(())
     }
 
@@ -702,13 +686,17 @@ impl<R: OpenCodeRuntime> AppService<R> {
         {
             return Err(self.record_job_failure(library_id, job_id, None, error));
         }
-        let (staging, baseline) = match self.storage.prepare_staging(library_id, job_id) {
+        let root = match self.storage.library_root(library_id) {
+            Ok(root) => root,
+            Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
+        };
+        let (_, baseline) = match self.storage.prepare_staging(library_id, job_id) {
             Ok(prepared) => prepared,
             Err(error) => return Err(self.record_job_failure(library_id, job_id, None, error)),
         };
         let request = AgentRunRequest {
             library_id: library_id.into(),
-            workdir: staging,
+            workdir: root,
             title: format!("Noema maintenance {job_id}"),
             prompt: format_maintain_task(deleted_path, job_id),
         };
@@ -745,14 +733,6 @@ impl<R: OpenCodeRuntime> AppService<R> {
             ));
         }
         self.cleanup_staging(library_id, job_id);
-        let storage = self.storage.clone();
-        let library_id = library_id.to_string();
-        tokio::spawn(async move {
-            tokio::time::sleep(STAGING_RECONCILE_DELAY).await;
-            if let Err(error) = storage.reconcile_staging(&library_id) {
-                tracing::warn!(library_id = %library_id, %error, "deferred staging reconcile failed");
-            }
-        });
         Ok(())
     }
 
@@ -808,7 +788,8 @@ fn sessions_closed() -> AppError {
     AppError::Runtime("session semaphore closed".into())
 }
 
-/// The ingest task message (user role): job-specific facts only. All policy
+/// The ingest task message (user role): task-specific directory and source
+/// facts only. All policy
 /// — the node contract, citation discipline, library boundaries — lives in
 /// the library's generated `AGENTS.md` contract and reaches the Agent
 /// through OpenCode's system prompt.
@@ -818,19 +799,33 @@ fn format_ingest_task(
     incremental: bool,
     extras: &[String],
 ) -> String {
+    let workspace = format!("staging/{job_id}");
     let graphify_step = if incremental {
-        "当前 staging 已有 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify . --update`。这是上游 Skill 的文档/文本增量流程；不要替换成裸 `graphify update .`，后者主要只更新代码 AST。"
+        format!(
+            "任务工作区 `{workspace}` 已有 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify {workspace} --update`。这是上游 Skill 的文档/文本增量流程；绝不能执行 `/graphify .`，也不要替换成裸 `graphify update .`，后者主要只更新代码 AST。"
+        )
     } else {
-        "当前 staging 尚无 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify .` 完整首次建图流程。"
+        format!(
+            "任务工作区 `{workspace}` 尚无 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify {workspace}` 完整首次建图流程；绝不能执行 `/graphify .`。"
+        )
     };
     let extras_step = if extras.is_empty() {
         String::new()
     } else {
+        let extras = extras
+            .iter()
+            .map(|path| format!("{workspace}/{path}"))
+            .collect::<Vec<_>>()
+            .join("、");
         format!(
             "此外，以下源文档已入库但尚无任何 wiki 节点引用（此前的摄入在落盘前失败）：{}。请将它们与本源文档一视同仁地编译为 wiki 节点并登记 index.md。\n\n",
-            extras.join("、")
+            extras
         )
     };
+    let source_paths = source_paths
+        .iter()
+        .map(|path| format!("{workspace}/{path}"))
+        .collect::<Vec<_>>();
     let reading_step = if source_paths.len() == 1 {
         format!(
             "再阅读源文档 {}；节点落盘后同步更新 index.md。",
@@ -843,7 +838,7 @@ fn format_ingest_task(
         )
     };
     format!(
-        "摄入任务 {job_id}。先阅读 purpose.md 和 schema.md，{reading_step}项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT。\n\n{extras_step}{graphify_step} 让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
+        "摄入任务 {job_id}。当前 OpenCode 工作目录是内容库根目录；本作业唯一可读写的工作区是 `{workspace}`。先阅读 `{workspace}/purpose.md` 和 `{workspace}/schema.md`，{reading_step}工作区的 `.graphifyignore` 已将 graphify 输入限定为其 `raw/` 与 `wiki/` 下的 Markdown/TXT。\n\n{extras_step}{graphify_step} 让它只在 `{workspace}` 内生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
     )
 }
 
@@ -852,8 +847,10 @@ fn format_ingest_task(
 /// preserving shared nodes, using the upstream graphify Skill — lives in the
 /// kb-maintain skill and the `AGENTS.md` contract.
 fn format_maintain_task(deleted_path: &str, job_id: &str) -> String {
+    let workspace = format!("staging/{job_id}");
+    let deleted_path = format!("{workspace}/{deleted_path}");
     format!(
-        "维护任务 {job_id}。源文档 {deleted_path} 已被删除。先阅读 purpose.md 和 schema.md，然后调用 OpenCode 的 `skill` 工具加载 kb-maintain Skill，将 wiki/ 与该删除重新对齐：仅由该源支撑的节点予以删除，其他资料共同贡献的共享节点保留并更新其 sources 与 relations，清理失效的来源引用，矛盾移入 reviews/；节点落盘后同步更新 index.md。\n\n随后调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify . --update`，让它在当前 staging 根目录更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物；如果增量流程因节点减少被收缩保护拒绝，这属于有意的删除，改用 `/graphify . --force` 完整重建。不要替换成裸 `graphify update .`。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
+        "维护任务 {job_id}。当前 OpenCode 工作目录是内容库根目录；本作业唯一可读写的工作区是 `{workspace}`。源文档 {deleted_path} 已在该工作区中删除。先阅读 `{workspace}/purpose.md` 和 `{workspace}/schema.md`，然后调用 OpenCode 的 `skill` 工具加载 kb-maintain Skill，只在 `{workspace}/wiki/` 中与该删除重新对齐：仅由该源支撑的节点予以删除，其他资料共同贡献的共享节点保留并更新其 sources 与 relations，清理失效的来源引用，矛盾移入 `{workspace}/reviews/`；节点落盘后同步更新 `{workspace}/index.md`。\n\n随后调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify {workspace} --update`，让它只在 `{workspace}` 内更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物；如果增量流程因节点减少被收缩保护拒绝，这属于有意的删除，改用 `/graphify {workspace} --force` 完整重建。不要执行 `/graphify .` 或裸 `graphify update .`。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
     )
 }
 
@@ -931,15 +928,16 @@ mod tests {
         assert_eq!(extras, vec!["raw/c.md".to_string()], "{extras:?}");
     }
 
-    /// The single-document prompt is the long-deployed contract; the batch
-    /// refactor must not drift a single byte of it.
     #[test]
-    fn format_ingest_task_single_path_is_byte_stable() {
+    fn format_ingest_task_anchors_graphify_and_files_to_the_job_workspace() {
         let prompt = format_ingest_task(&["raw/a.md".to_string()], "job-1", false, &[]);
-        assert_eq!(
-            prompt,
-            "摄入任务 job-1。先阅读 purpose.md 和 schema.md，再阅读源文档 raw/a.md；节点落盘后同步更新 index.md。项目根目录已经提供 `.graphifyignore`，上游 graphify 因此只检测 `raw/` 和 `wiki/` 下的 Markdown/TXT。\n\n当前 staging 尚无 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify .` 完整首次建图流程。 让它在当前 staging 根目录生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
+        assert!(
+            prompt.contains("当前 OpenCode 工作目录是内容库根目录"),
+            "{prompt}"
         );
+        assert!(prompt.contains("staging/job-1/raw/a.md"), "{prompt}");
+        assert!(prompt.contains("/graphify staging/job-1`"), "{prompt}");
+        assert!(prompt.contains("绝不能执行 `/graphify .`"), "{prompt}");
     }
 
     #[test]
@@ -951,10 +949,28 @@ mod tests {
             &[],
         );
         assert!(
-            prompt.contains("再依次阅读以下源文档：raw/a.md、raw/b.md"),
+            prompt.contains("再依次阅读以下源文档：staging/job-2/raw/a.md、staging/job-2/raw/b.md"),
             "{prompt}"
         );
         assert!(prompt.contains("合并为一个节点"), "{prompt}");
-        assert!(prompt.contains("/graphify . --update"), "{prompt}");
+        assert!(
+            prompt.contains("/graphify staging/job-2 --update"),
+            "{prompt}"
+        );
+    }
+
+    #[test]
+    fn format_maintain_task_anchors_graphify_to_the_job_workspace() {
+        let prompt = format_maintain_task("raw/a.md", "job-3");
+        assert!(prompt.contains("staging/job-3/raw/a.md"), "{prompt}");
+        assert!(
+            prompt.contains("/graphify staging/job-3 --update"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("/graphify staging/job-3 --force"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("不要执行 `/graphify .`"), "{prompt}");
     }
 }
