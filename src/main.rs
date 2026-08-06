@@ -8,7 +8,7 @@
 use std::{net::SocketAddr, path::PathBuf, process::ExitCode};
 
 use clap::Parser;
-use noema::{http, AppError, AppService, Config};
+use noema::{AppError, AppService, Config, http};
 use opencode_rs::server::{ManagedServer, ServerOptions};
 
 /// OpenCode 驱动的文本知识库服务：HTTP JSON API + Streamable HTTP MCP。

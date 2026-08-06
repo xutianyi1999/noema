@@ -461,7 +461,11 @@ fn all_permissions(hidden_mcp: &[String]) -> Ruleset {
     // from the model entirely, so Noema sessions never call a task runtime
     // with a Noema job id — or re-enter the knowledge API recursively.
     for server in hidden_mcp {
-        rules.push(permission(&format!("{server}_*"), "*", PermissionAction::Deny));
+        rules.push(permission(
+            &format!("{server}_*"),
+            "*",
+            PermissionAction::Deny,
+        ));
     }
     rules
 }

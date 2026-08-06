@@ -768,7 +768,10 @@ async fn ingestion_session_is_anchored_at_the_library_root() {
         }
         sleep(Duration::from_millis(10)).await;
     }
-    assert!(!workspace.exists(), "completed job workspace was not deleted");
+    assert!(
+        !workspace.exists(),
+        "completed job workspace was not deleted"
+    );
 }
 
 #[tokio::test]

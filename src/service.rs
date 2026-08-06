@@ -609,8 +609,11 @@ impl<R: OpenCodeRuntime> AppService<R> {
         // Everything this session is asked to compile: the submitted batch
         // plus any uncompiled leftovers a failed predecessor left behind.
         // Marked compiled once the promotion below is durable.
-        let compiled_paths: Vec<String> =
-            paths.iter().cloned().chain(extras.iter().cloned()).collect();
+        let compiled_paths: Vec<String> = paths
+            .iter()
+            .cloned()
+            .chain(extras.iter().cloned())
+            .collect();
         let request = AgentRunRequest {
             library_id: library_id.into(),
             workdir: root,

@@ -567,12 +567,12 @@ mod tests {
         assert!(!compiled.contains(&b.record.path));
         // Idempotent, and tolerant of a path whose row is already gone.
         storage
-            .mark_compiled(
-                &library_id,
-                &[a.record.path.clone(), "raw/ghost.md".into()],
-            )
+            .mark_compiled(&library_id, &[a.record.path.clone(), "raw/ghost.md".into()])
             .unwrap();
-        assert_eq!(storage.compiled_document_paths(&library_id).unwrap().len(), 1);
+        assert_eq!(
+            storage.compiled_document_paths(&library_id).unwrap().len(),
+            1
+        );
     }
 
     #[test]
