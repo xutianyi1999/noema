@@ -61,6 +61,10 @@ struct Cli {
     /// 避免 Agent 拿 Noema 作业 id 去调用外部任务运行时。
     #[arg(long, env = "NOEMA_HIDDEN_MCP", value_delimiter = ',')]
     hidden_mcp: Vec<String>,
+    /// 已安装在共享 OpenCode Server 上、但必须对 Noema 自身会话隐藏的 Skill
+    /// 名称（逗号分隔）。
+    #[arg(long, env = "NOEMA_HIDDEN_SKILLS", value_delimiter = ',')]
+    hidden_skills: Vec<String>,
 }
 
 fn main() -> ExitCode {
@@ -134,6 +138,12 @@ async fn serve(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         auth_token: cli.auth_token,
         hidden_mcp: cli
             .hidden_mcp
+            .into_iter()
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .collect(),
+        hidden_skills: cli
+            .hidden_skills
             .into_iter()
             .map(|name| name.trim().to_owned())
             .filter(|name| !name.is_empty())

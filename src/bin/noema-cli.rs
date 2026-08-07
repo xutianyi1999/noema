@@ -35,6 +35,9 @@ struct Cli {
     /// 服务鉴权令牌（服务以 --auth-token 启用鉴权时必须；每个请求携带 Authorization: Bearer <token>）
     #[arg(long, global = true, env = "NOEMA_AUTH_TOKEN")]
     auth_token: Option<String>,
+    /// 为自动化 Skill 输出机器可解析的 JSON（摄入和作业状态命令）。
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -132,6 +135,7 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
     }
     let client = builder.build()?;
     let base = cli.server.trim_end_matches('/').to_string();
+    let json_output = cli.json;
     match cli.command {
         Command::Status => cmd_status(&client, &base).await,
         Command::Create { name, description } => {
@@ -157,8 +161,20 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
             library,
             files,
             title,
-        } => cmd_submit(&client, &base, library, files, title.as_deref()).await,
-        Command::Job { library, job_id } => cmd_job(&client, &base, library, job_id).await,
+        } => {
+            cmd_submit(
+                &client,
+                &base,
+                library,
+                files,
+                title.as_deref(),
+                json_output,
+            )
+            .await
+        }
+        Command::Job { library, job_id } => {
+            cmd_job(&client, &base, library, job_id, json_output).await
+        }
         Command::Query {
             library,
             prompt,
@@ -314,6 +330,7 @@ async fn cmd_submit(
     library: String,
     files: Vec<PathBuf>,
     title: Option<&str>,
+    json_output: bool,
 ) -> Result<(), BoxError> {
     if files.len() > 1 && title.is_some() {
         return Err("--title 只支持单个文件提交".into());
@@ -342,6 +359,11 @@ async fn cmd_submit(
     )
     .await?;
     let value = response.json::<Value>().await?;
+    if json_output {
+        serde_json::to_writer(stdout(), &value)?;
+        let _ = writeln!(stdout());
+        return Ok(());
+    }
     let entries = value["documents"].as_array().cloned().unwrap_or_default();
     if let [entry] = entries.as_slice() {
         let path = string_field(entry, "document_path");
@@ -386,6 +408,7 @@ async fn cmd_job(
     base: &str,
     library: String,
     job_id: String,
+    json_output: bool,
 ) -> Result<(), BoxError> {
     let response = send(client.get(format!(
         "{base}/v1/libraries/{}/jobs/{}",
@@ -394,6 +417,11 @@ async fn cmd_job(
     )))
     .await?;
     let value = response.json::<Value>().await?;
+    if json_output {
+        serde_json::to_writer(stdout(), &value)?;
+        let _ = writeln!(stdout());
+        return Ok(());
+    }
     let status = string_field(&value, "status");
     let status_cell = match status.as_str() {
         "completed" => colored(Color::Green, status),

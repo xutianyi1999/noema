@@ -72,6 +72,8 @@ noema [--bind 127.0.0.1:8787] [--data-dir data] [--model <MODEL>] \
 | `--max-sessions` | `NOEMA_MAX_SESSIONS` | `4` | 全局并发 Agent session 上限（摄入 + 查询），超出的排队等待 |
 | `--auth-token` | `NOEMA_AUTH_TOKEN` | 无（API 开放） | HTTP API 的 Bearer 令牌（见下） |
 | `--transcript` | `NOEMA_TRANSCRIPT` | `false` | 实时打印会话中间过程（见下） |
+| `--hidden-mcp` | `NOEMA_HIDDEN_MCP` | 无 | 在 Noema 自身会话中隐藏的共享 OpenCode MCP 服务（逗号分隔） |
+| `--hidden-skills` | `NOEMA_HIDDEN_SKILLS` | 无 | 在 Noema 自身会话中隐藏的共享 OpenCode Skill（逗号分隔） |
 
 日志走 `RUST_LOG`（缺省 `noema=info`）。
 
@@ -280,7 +282,7 @@ stateDiagram-v2
 
 同一内容库的摄入作业串行执行：后到的作业等前一个完成后再开始，等待期间保持 `queued`（轮询 job 状态可见排队），因此每次摄入都在上一次提交的图谱之上增量更新，并行提交不会相互覆盖。不同内容库之间完全并行；查询不受摄入排队影响，只与摄入共享全局 `--max-sessions` 上限。
 
-提交接口只有一个（`POST /v1/libraries/{library_id}/documents`、`kb_ingest_documents`、`noema-cli submit`），一次可交一篇或多篇文档，整次提交合并为**一个**摄入作业：一个 staging 工作区、一次 Agent 会话，跨文档描述同一概念的内容合并为一个节点（`sources` 列出全部来源）。同一次提交内同名同内容折叠为一条，同名异内容返回 409；内容重复（SHA-256）且已编译的条目在响应中标 `skipped`，其余条目照常入库。由于提交按整树原子校验与提交，任一部分导致校验失败时整次提交拒绝——已入库文档留在 `raw/`，由下一次摄入补编译，重试即恢复。一个会话的时长受 `--opencode-timeout-secs` 约束，过大的一次提交应分次进行。
+提交 HTTP 接口是 `POST /v1/libraries/{library_id}/documents`；自动化 Agent 必须通过已安装的 noema-cli Skill 调用 `noema-cli submit`，不得把文件正文放进 MCP 调用。一次可交一篇或多篇文档，整次提交合并为**一个**摄入作业：一个 staging 工作区、一次 Agent 会话，跨文档描述同一概念的内容合并为一个节点（`sources` 列出全部来源）。同一次提交内同名同内容折叠为一条，同名异内容返回 409；内容重复（SHA-256）且已编译的条目在响应中标 `skipped`，其余条目照常入库。由于提交按整树原子校验与提交，任一部分导致校验失败时整次提交拒绝——已入库文档留在 `raw/`，由下一次摄入补编译，重试即恢复。一个会话的时长受 `--opencode-timeout-secs` 约束，过大的一次提交应分次进行。
 
 ### 隔离与快照复用
 
@@ -342,7 +344,7 @@ curl -X POST http://127.0.0.1:8787/v1/libraries/产品知识库/query \
 
 ## MCP
 
-Streamable HTTP 端点 `POST /mcp`，工具：`kb_ingest_documents`（一篇或多篇，合并为一次摄入任务）、`kb_query`、`kb_job_status`、`kb_health`。除健康检查外都显式接收 `library_id`。`kb_query` 的可选 `session_id` 省略时创建会话，传入同一内容库此前成功查询响应的值可继续对话。Noema 不提供 stdio MCP 入口，也不把自定义知识库工具注入 OpenCode——OpenCode 直接使用内容库工作区与已安装 Skill。
+Streamable HTTP 端点 `POST /mcp`，工具：`kb_ensure_library`、`kb_query`、`kb_job_status`、`kb_list_documents`、`kb_delete_document`、`kb_health`。MCP 不提供文件内容上传工具：摄入统一由 noema-cli Skill 调用 `noema-cli submit` 完成；删除是独立的显式管理操作，会返回可轮询的维护作业。除健康检查外都显式接收 `library_id`。`kb_query` 的可选 `session_id` 省略时创建会话，传入同一内容库此前成功查询响应的值可继续对话。Noema 不提供 stdio MCP 入口，也不把自定义知识库工具注入 OpenCode——OpenCode 直接使用内容库工作区与已安装 Skill。
 
 ## 快照格式
 

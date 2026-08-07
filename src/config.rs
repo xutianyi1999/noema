@@ -21,4 +21,8 @@ pub struct Config {
     /// task-runtime tool tends to call it with the Noema job id. Tools of
     /// these servers are denied in every session this service creates.
     pub hidden_mcp: Vec<String>,
+    /// Skills installed on the shared OpenCode Server that must remain
+    /// invisible inside Noema's own sessions. This prevents a knowledge-base
+    /// session from invoking an administrative CLI against itself.
+    pub hidden_skills: Vec<String>,
 }

@@ -53,7 +53,7 @@ pub fn router<R: OpenCodeRuntime>(service: AppService<R>) -> Router {
             // real regulatory texts. Snapshots keep their own 512 MB cap.
             get(list_documents::<R>)
                 .post(submit_documents::<R>)
-                .layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
+                .layer(DefaultBodyLimit::max(MAX_DOCUMENT_JSON_BODY)),
         )
         .route(
             "/v1/libraries/{library_id}/documents/{filename}",
@@ -65,7 +65,7 @@ pub fn router<R: OpenCodeRuntime>(service: AppService<R>) -> Router {
         )
         .route(
             "/v1/libraries/{library_id}/query",
-            post(query::<R>).layer(DefaultBodyLimit::max(MAX_JSON_BODY)),
+            post(query::<R>).layer(DefaultBodyLimit::max(MAX_QUERY_JSON_BODY)),
         )
         .route(
             "/v1/libraries/{library_id}/files/{*path}",
@@ -218,10 +218,13 @@ struct ImportQuery {
 /// [`crate::snapshot`] (gzip bombs compress small).
 const MAX_IMPORT_UPLOAD: u64 = 512 * 1024 * 1024;
 
-/// Upper bound for one JSON body (document submission, query prompt).
 /// Documents are plain text, but multi-megabyte regulations are routine;
-/// axum's 2 MiB default rejected them.
-const MAX_JSON_BODY: usize = 64 * 1024 * 1024;
+/// axum's 2 MiB default rejected them. This ceiling aligns with the agent
+/// artifact boundary and keeps a JSON upload from exhausting the sandbox.
+const MAX_DOCUMENT_JSON_BODY: usize = 64 * 1024 * 1024;
+/// Query prompts go directly to an LLM session. They are instructions rather
+/// than files and must stay small enough to keep the model context bounded.
+const MAX_QUERY_JSON_BODY: usize = 256 * 1024;
 
 /// Import a snapshot archive (request body) as a brand-new, fully isolated
 /// library. Same semantics as `noema-cli import`: always a fresh library,

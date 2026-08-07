@@ -212,12 +212,6 @@ pub struct McpQueryRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct McpIngestRequest {
-    pub library_id: String,
-    pub documents: Vec<DocumentInput>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct McpEnsureLibraryRequest {
     pub name: String,
     #[serde(default)]

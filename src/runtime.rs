@@ -97,7 +97,10 @@ impl OpenCodeRuntime for OpenCodeAgent {
             .sessions()
             .create(&CreateSessionRequest {
                 title: Some(request.title.clone()),
-                permission: Some(all_permissions(&self.config.hidden_mcp)),
+                permission: Some(all_permissions(
+                    &self.config.hidden_mcp,
+                    &self.config.hidden_skills,
+                )),
                 ..Default::default()
             })
             .await?;
@@ -133,7 +136,10 @@ impl OpenCodeRuntime for OpenCodeAgent {
             .sessions()
             .create(&CreateSessionRequest {
                 title: Some(request.title.clone()),
-                permission: Some(all_permissions(&self.config.hidden_mcp)),
+                permission: Some(all_permissions(
+                    &self.config.hidden_mcp,
+                    &self.config.hidden_skills,
+                )),
                 ..Default::default()
             })
             .await?;
@@ -446,7 +452,7 @@ fn parse_model(value: &str) -> ModelRef {
     }
 }
 
-fn all_permissions(hidden_mcp: &[String]) -> Ruleset {
+fn all_permissions(hidden_mcp: &[String], hidden_skills: &[String]) -> Ruleset {
     // Keep every OpenCode capability available, except the interactive
     // question tool: a headless knowledge service has no user-answer loop.
     // OpenCode evaluates the last matching rule, so the specific deny follows
@@ -467,6 +473,12 @@ fn all_permissions(hidden_mcp: &[String]) -> Ruleset {
             PermissionAction::Deny,
         ));
     }
+    // Skill permissions use the fixed `skill` key and match their pattern
+    // against the skill name. The rule is session-scoped, so the Lexifact
+    // task Agent still has access to noema-cli in its separate sessions.
+    for skill in hidden_skills {
+        rules.push(permission("skill", skill, PermissionAction::Deny));
+    }
     rules
 }
 
@@ -484,7 +496,7 @@ mod tests {
 
     #[test]
     fn permissions_allow_everything_except_question() {
-        let rules = all_permissions(&[]);
+        let rules = all_permissions(&[], &[]);
         assert_eq!(rules.len(), 2);
         assert_eq!(rules[0], permission("*", "*", PermissionAction::Allow));
         assert_eq!(
@@ -493,16 +505,19 @@ mod tests {
         );
     }
 
-    /// Foreign MCP servers are denied after the wildcard allow, so OpenCode's
-    /// last-match evaluation hides their tools from Noema sessions while the
-    /// rest of the toolset stays available.
+    /// Foreign MCP servers and installed skills are denied after the wildcard
+    /// allow, so OpenCode hides them from Noema sessions while the rest of
+    /// the toolset stays available.
     #[test]
-    fn permissions_hide_foreign_mcp_servers() {
-        let rules = all_permissions(&[
-            "lexifact-agent-runtime".to_string(),
-            "noema-knowledge".to_string(),
-        ]);
-        assert_eq!(rules.len(), 4);
+    fn permissions_hide_configured_mcp_servers_and_skills() {
+        let rules = all_permissions(
+            &[
+                "lexifact-agent-runtime".to_string(),
+                "noema-knowledge".to_string(),
+            ],
+            &["noema-cli".to_string()],
+        );
+        assert_eq!(rules.len(), 5);
         assert_eq!(
             rules[2],
             permission("lexifact-agent-runtime_*", "*", PermissionAction::Deny)
@@ -510,6 +525,10 @@ mod tests {
         assert_eq!(
             rules[3],
             permission("noema-knowledge_*", "*", PermissionAction::Deny)
+        );
+        assert_eq!(
+            rules[4],
+            permission("skill", "noema-cli", PermissionAction::Deny)
         );
     }
 
