@@ -218,10 +218,9 @@ struct ImportQuery {
 /// [`crate::snapshot`] (gzip bombs compress small).
 const MAX_IMPORT_UPLOAD: u64 = 512 * 1024 * 1024;
 
-/// Documents are plain text, but multi-megabyte regulations are routine;
-/// axum's 2 MiB default rejected them. This ceiling aligns with the agent
-/// artifact boundary and keeps a JSON upload from exhausting the sandbox.
-const MAX_DOCUMENT_JSON_BODY: usize = 64 * 1024 * 1024;
+/// Documents are plain text, but a regulatory batch can contain several
+/// large files. Keep the CLI and HTTP boundary aligned on one GiB.
+pub const MAX_DOCUMENT_JSON_BODY: usize = 1024 * 1024 * 1024;
 /// Query prompts go directly to an LLM session. They are instructions rather
 /// than files and must stay small enough to keep the model context bounded.
 const MAX_QUERY_JSON_BODY: usize = 256 * 1024;

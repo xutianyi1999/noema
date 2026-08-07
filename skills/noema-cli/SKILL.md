@@ -53,12 +53,12 @@ noema-cli --json job <library> <job_id>
 只有 `completed` 或 `skipped` 是成功终态；`failed` 必须报告错误并让调用任务失败。
 轮询间隔至少 2 秒，并使用与任务时限一致的总超时。
 
-对于法规导入任务：下载输入 artifact 后校验其 `sizeBytes` 和 `sha256`，再用适用的
-文档提取 Skill 生成 `converted/<noemaFilename>`。计算转换后 Markdown 的 SHA-256 和大小；
-把所有成功文件放进同一次 `submit`。作业成功后发布 `batch/report.json`，并通过
+对于法规导入任务：下载输入 artifact 后校验其 `sizeBytes`，再用适用的文档提取 Skill
+生成 `converted/<noemaFilename>`。在调用 `submit` 前必须完成全部文件的下载、转换和
+非空 UTF-8 校验；任一文件失败就结束整个任务，不得提交任何文件或提交子集。全部成功后
+才将全量文件放进同一次 `submit`。作业成功后发布 `batch/report.json`，并通过
 `lexifact-agent-runtime` 上报相同的 `jobId`、`jobStatus`、`fileStatuses` 和
-`documentMetadata`。报告中的每个文件必须有 `noemaFilename`、`status`、`sizeBytes` 和
-转换后 Markdown 的 `sha256`。
+`documentMetadata`。报告中的每个文件必须有 `noemaFilename`、`status` 和 `sizeBytes`。
 
 ## 查询
 

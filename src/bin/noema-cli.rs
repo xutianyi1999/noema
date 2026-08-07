@@ -11,13 +11,20 @@
 //! a terminal (NO_COLOR / FORCE_COLOR / CLICOLOR honoured); tables come
 //! from comfy-table, which applies its own styling only on a terminal.
 
-use std::{io::Write as _, path::PathBuf, process::ExitCode};
+use std::{
+    io::{self, BufWriter, Write},
+    path::PathBuf,
+    process::ExitCode,
+};
 
 use clap::{Parser, Subcommand};
 use comfy_table::{Attribute, Cell, Color, Table, presets::UTF8_FULL};
+use noema::models::DocumentInput;
 use noema::style::{BOLD, DIM, GREEN, RED, YELLOW, paint, stderr, stdout};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
+use serde::Serialize;
 use serde_json::{Value, json};
+use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 
 /// Noema 命令行客户端：经 HTTP API 管理内容库（可与服务不在同一台机器）。需要先启动 noema 服务。
@@ -105,7 +112,81 @@ enum Command {
     },
 }
 
-type BoxError = Box<dyn std::error::Error>;
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+struct CountingWriter {
+    bytes: u64,
+}
+
+impl io::Write for CountingWriter {
+    fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+        self.bytes = self
+            .bytes
+            .checked_add(buffer.len() as u64)
+            .ok_or_else(|| io::Error::other("JSON request is too large"))?;
+        Ok(buffer.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+fn serialized_json_size<T: Serialize>(value: &T) -> Result<u64, BoxError> {
+    let mut writer = CountingWriter { bytes: 0 };
+    serde_json::to_writer(&mut writer, value)?;
+    Ok(writer.bytes)
+}
+
+fn build_submit_body(files: &[PathBuf], title: Option<&str>) -> Result<NamedTempFile, BoxError> {
+    let body = NamedTempFile::new()?;
+    let mut writer = BufWriter::new(body.reopen()?);
+    let mut bytes = br#"{"documents":["#.len() as u64;
+    writer.write_all(br#"{"documents":["#)?;
+
+    for (index, file) in files.iter().enumerate() {
+        let metadata = std::fs::metadata(file)
+            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+        if !metadata.is_file() {
+            return Err(format!("{} is not a regular file", file.display()).into());
+        }
+        let filename = file
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| format!("invalid file name: {}", file.display()))?
+            .to_string();
+        let content = std::fs::read_to_string(file)
+            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
+        let document = DocumentInput {
+            filename,
+            content,
+            title: title.map(ToOwned::to_owned),
+        };
+        let separator = u64::from(index > 0);
+        let document_bytes = serialized_json_size(&document)?;
+        let final_bytes = bytes
+            .checked_add(separator)
+            .and_then(|value| value.checked_add(document_bytes))
+            .and_then(|value| value.checked_add(br#"]}"#.len() as u64))
+            .ok_or_else(|| "JSON request is too large".to_string())?;
+        if final_bytes > noema::http::MAX_DOCUMENT_JSON_BODY as u64 {
+            return Err(format!(
+                "documents exceed the {}-byte submission limit",
+                noema::http::MAX_DOCUMENT_JSON_BODY
+            )
+            .into());
+        }
+        if index > 0 {
+            writer.write_all(b",")?;
+        }
+        serde_json::to_writer(&mut writer, &document)?;
+        bytes = final_bytes - br#"]}"#.len() as u64;
+    }
+
+    writer.write_all(br#"]}"#)?;
+    writer.flush()?;
+    Ok(body)
+}
 
 #[tokio::main]
 async fn main() -> ExitCode {
@@ -335,18 +416,20 @@ async fn cmd_submit(
     if files.len() > 1 && title.is_some() {
         return Err("--title 只支持单个文件提交".into());
     }
-    let mut documents = Vec::with_capacity(files.len());
-    for file in &files {
-        let filename = file
-            .file_name()
-            .and_then(|value| value.to_str())
-            .ok_or_else(|| format!("invalid file name: {}", file.display()))?
-            .to_string();
-        let content = tokio::fs::read_to_string(file)
-            .await
-            .map_err(|error| format!("cannot read {}: {error}", file.display()))?;
-        documents.push(json!({ "filename": filename, "content": content, "title": title }));
-    }
+    let files_for_body = files.clone();
+    let title_for_body = title.map(ToOwned::to_owned);
+    // Validate and serialize every file before opening the HTTP request. The
+    // temporary request body keeps one whole batch out of the CLI heap and
+    // ensures a local file failure cannot submit a partial batch.
+    let body = tokio::task::spawn_blocking(move || {
+        build_submit_body(&files_for_body, title_for_body.as_deref())
+    })
+    .await
+    .map_err(|error| format!("failed preparing submission: {error}"))??;
+    let body_size = body.as_file().metadata()?.len();
+    let file = tokio::fs::File::open(body.path())
+        .await
+        .map_err(|error| format!("cannot read prepared submission: {error}"))?;
     // One submission route for one file or many; every response entry names
     // its stored path and whether the ingest job covers it.
     let response = send(
@@ -355,7 +438,11 @@ async fn cmd_submit(
                 "{base}/v1/libraries/{}/documents",
                 encode(&library)
             ))
-            .json(&json!({ "documents": documents })),
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .header(reqwest::header::CONTENT_LENGTH, body_size)
+            .body(reqwest::Body::wrap_stream(
+                tokio_util::io::ReaderStream::new(file),
+            )),
     )
     .await?;
     let value = response.json::<Value>().await?;
@@ -368,7 +455,7 @@ async fn cmd_submit(
     if let [entry] = entries.as_slice() {
         let path = string_field(entry, "document_path");
         let headline = if entry["skipped"].as_bool().unwrap_or(false) {
-            paint(YELLOW, "● 内容重复（SHA-256）——已登记，未触发摄入")
+            paint(YELLOW, "● 内容重复——已登记，未触发摄入")
         } else {
             paint(GREEN, "✔ 已提交，摄入任务已创建")
         };
@@ -385,7 +472,7 @@ async fn cmd_submit(
         for entry in &entries {
             let path = string_field(entry, "document_path");
             let line = if entry["skipped"].as_bool().unwrap_or(false) {
-                paint(YELLOW, "● 内容重复（SHA-256）——已登记，未触发摄入")
+                paint(YELLOW, "● 内容重复——已登记，未触发摄入")
             } else {
                 paint(GREEN, "✔ 已提交")
             };
@@ -520,6 +607,31 @@ async fn send(request: reqwest::RequestBuilder) -> Result<reqwest::Response, Box
         })
         .unwrap_or(body);
     Err(format!("server returned {status}: {message}").into())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, io::Read};
+
+    use super::build_submit_body;
+
+    #[test]
+    fn submit_body_contains_every_file_in_one_json_request() {
+        let workspace = tempfile::tempdir().unwrap();
+        let first = workspace.path().join("first.md");
+        let second = workspace.path().join("second.md");
+        fs::write(&first, "# First\n\nAlpha").unwrap();
+        fs::write(&second, "# Second\n\nBeta").unwrap();
+
+        let body = build_submit_body(&[first, second], None).unwrap();
+        let mut json = String::new();
+        body.reopen().unwrap().read_to_string(&mut json).unwrap();
+        let request: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let documents = request["documents"].as_array().unwrap();
+        assert_eq!(documents.len(), 2);
+        assert_eq!(documents[0]["filename"], "first.md");
+        assert_eq!(documents[1]["filename"], "second.md");
+    }
 }
 
 /// Percent-encode one URL path segment (library ids/names, job ids).
