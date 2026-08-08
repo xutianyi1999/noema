@@ -39,8 +39,6 @@ noema-cli --json job <library> <job_id>
 
 记录 `submit` 返回的 `library_id`、`job_id` 和逐文件状态，并轮询作业至终态。`completed` 与 `skipped` 表示成功；`failed` 使调用任务失败。单文件提交时可附加 `--title <title>`。
 
-法规导入任务中，任务上下文定义输入文件、目标文件名和 `resultContract`。完成全部文件的下载、转换和非空校验后，再用一次 `submit` 提交全量文件。作业成功后，按 `resultContract.schema` 构造结果，通过 `report_task_metadata` 上报 `{ "regulationImportResult": <结果对象> }`，并将同一对象发布到 `resultContract.reportArtifactPath`。
-
 ## 查询
 
 ```bash
