@@ -48,6 +48,8 @@ noema-cli submit 产品知识库 ./design.md    # 触发异步摄入，返回 jo
 noema-cli submit 产品知识库 ./a.md ./b.md ./c.md   # 多个文档合并为一次摄入任务
 noema-cli job 产品知识库 <job_id>          # 轮询到 completed
 noema-cli query 产品知识库 "Session Context 是怎么设计的？"
+# 自动化场景：原样输出 QueryResponse（answer / references / session_id）
+noema-cli --json query 产品知识库 "返回 JSON"
 # 用上次返回的 session_id 继续同一段对话
 noema-cli query 产品知识库 --session-id <session_id> "它的来源是什么？"
 ```
@@ -116,7 +118,7 @@ noema --transcript=false        # 显式关闭（覆盖环境变量时）
 | `noema-cli download <lib> <filename> [-o <文件>]` | 下载指定文档的完整 `raw/` 原文到本地（默认使用原文件名） |
 | `noema-cli submit <lib> <file.md\|file.txt>... [--title <标题>]` | 提交本地文档，触发异步摄入；多个文件合并为一次摄入任务（`--title` 仅单文件可用） |
 | `noema-cli job <lib> <job_id>` | 查询摄入任务状态 |
-| `noema-cli query <lib> "<自然语言问题>" [--session-id <会话>]` | 自然语言查询；省略 `--session-id` 创建会话，传入同一内容库此前成功查询返回的 id 可继续对话 |
+| `noema-cli [--json] query <lib> "<自然语言问题>" [--session-id <会话>]` | 自然语言查询；`--json` 原样输出 QueryResponse，省略 `--session-id` 创建会话，传入同一内容库此前成功查询返回的 id 可继续对话 |
 | `noema-cli export <lib> [-o <文件>]` | 导出快照到本地 `.tar.gz` |
 | `noema-cli import <归档> [--name <名称>] [--description <描述>]` | 导入快照为全新内容库 |
 

@@ -42,7 +42,7 @@ struct Cli {
     /// 服务鉴权令牌（服务以 --auth-token 启用鉴权时必须；每个请求携带 Authorization: Bearer <token>）
     #[arg(long, global = true, env = "NOEMA_AUTH_TOKEN")]
     auth_token: Option<String>,
-    /// 为自动化 Skill 输出机器可解析的 JSON（文档列表、摄入和作业状态命令）。
+    /// 为自动化 Skill 输出机器可解析的 JSON（文档列表、摄入、作业状态和查询命令）。
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -291,7 +291,17 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
             library,
             prompt,
             session_id,
-        } => cmd_query(&client, &base, library, prompt, session_id.as_deref()).await,
+        } => {
+            cmd_query(
+                &client,
+                &base,
+                library,
+                prompt,
+                session_id.as_deref(),
+                json_output,
+            )
+            .await
+        }
     }
 }
 
@@ -640,6 +650,7 @@ async fn cmd_query(
     library: String,
     prompt: String,
     session_id: Option<&str>,
+    json_output: bool,
 ) -> Result<(), BoxError> {
     let mut body = json!({ "prompt": prompt });
     if let Some(session_id) = session_id {
@@ -652,6 +663,11 @@ async fn cmd_query(
     )
     .await?;
     let value = response.json::<Value>().await?;
+    if json_output {
+        serde_json::to_writer(stdout(), &value)?;
+        let _ = writeln!(stdout());
+        return Ok(());
+    }
     // The answer is Markdown: termimad renders it for the terminal (styled
     // on a tty, plain structured text when piped).
     termimad::print_text(&string_field(&value, "answer"));

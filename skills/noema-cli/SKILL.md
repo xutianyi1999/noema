@@ -5,7 +5,7 @@ description: 使用 noema-cli 管理 Noema 内容库、文档、作业、快照�
 
 # Noema CLI
 
-默认服务地址为 `http://127.0.0.1:8787`。使用 `NOEMA_AUTH_TOKEN` 鉴权；需要其他服务时传 `--server <URL>` 或设置 `NOEMA_SERVER`。`--json` 为文档、提交和作业命令提供机器可读输出。
+默认服务地址为 `http://127.0.0.1:8787`。使用 `NOEMA_AUTH_TOKEN` 鉴权；需要其他服务时传 `--server <URL>` 或设置 `NOEMA_SERVER`。`--json` 为文档、提交、作业和查询命令提供机器可读输出。
 
 ## 内容库与文档
 
@@ -43,6 +43,7 @@ noema-cli --json job <library> <job_id>
 
 ```bash
 noema-cli query <library> "<prompt>" [--session-id <session_id>]
+noema-cli --json query <library> "<prompt>" [--session-id <session_id>]
 ```
 
-首次查询返回 session id；后续查询可传同一 `--session-id` 继续会话。
+默认输出用于阅读；`--json` 原样输出查询响应，其中 `answer` 是回答文本，`references` 是来源，`session_id` 可用于续问。需要回答本身为 JSON 时，先用 `jq -er '.answer | fromjson'` 提取并校验，不要解析默认输出中的来源和会话行。

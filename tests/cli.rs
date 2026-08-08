@@ -8,9 +8,11 @@
 
 use std::{
     fs,
+    io::{Read, Write},
     net::TcpStream,
     path::Path,
     process::{Child, Command, Stdio},
+    thread,
     time::{Duration, Instant},
 };
 
@@ -97,6 +99,42 @@ fn run(command: &mut Command) -> (bool, String, String) {
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+fn spawn_query_response_server() -> (String, thread::JoinHandle<()>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = [0; 4096];
+        let count = stream.read(&mut request).unwrap();
+        let request = std::str::from_utf8(&request[..count]).unwrap();
+        assert!(request.starts_with("POST /v1/libraries/%E6%B3%95%E8%A7%84%E5%BA%93/query "));
+
+        let body = r#"{"query_id":"query-1","library_id":"法规库","session_id":"session-1","answer":"{\"candidateItems\":[]}","references":[],"tool_events":[]}"#;
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            body.len(),
+            body
+        )
+        .unwrap();
+    });
+    (format!("http://127.0.0.1:{port}"), handle)
+}
+
+#[test]
+fn cli_query_json_preserves_the_full_query_response() {
+    let (base, server) = spawn_query_response_server();
+    let (ok, stdout, stderr) =
+        run(client(&base).args(["--json", "query", "法规库", "生成检查项候选"]));
+    server.join().unwrap();
+
+    assert!(ok, "{stderr}");
+    let response: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(response["query_id"], "query-1");
+    assert_eq!(response["answer"], r#"{"candidateItems":[]}"#);
+    assert!(response["references"].as_array().unwrap().is_empty());
 }
 
 /// Read one value out of the CLI's `key  value` output blocks, e.g. the
