@@ -112,6 +112,8 @@ noema --transcript=false        # 显式关闭（覆盖环境变量时）
 | `noema-cli status` | 健康检查，显示数据目录、OpenCode 地址与模型 |
 | `noema-cli create <名称> [--description <描述>]` | 创建内容库（名称唯一；重名返回 409） |
 | `noema-cli list` | 列出所有内容库（id / 名称 / 路径） |
+| `noema-cli documents <lib>` | 列出内容库中已存储文档的元数据（文件名 / 标题 / 路径 / 入库时间；配合 `--json` 输出 JSON） |
+| `noema-cli download <lib> <filename> [-o <文件>]` | 下载指定文档的完整 `raw/` 原文到本地（默认使用原文件名） |
 | `noema-cli submit <lib> <file.md\|file.txt>... [--title <标题>]` | 提交本地文档，触发异步摄入；多个文件合并为一次摄入任务（`--title` 仅单文件可用） |
 | `noema-cli job <lib> <job_id>` | 查询摄入任务状态 |
 | `noema-cli query <lib> "<自然语言问题>" [--session-id <会话>]` | 自然语言查询；省略 `--session-id` 创建会话，传入同一内容库此前成功查询返回的 id 可继续对话 |
@@ -312,6 +314,7 @@ graphify 生命周期：空库只安装插件和 Skill；首篇文档摄入时�
 | `POST /v1/libraries` | 创建内容库（`{"name","description"}`；重名 409） |
 | `POST /v1/libraries/import` | 导入快照（请求体为 gzip tar；`?name=&description=` 可选） |
 | `GET /v1/libraries/{library_id}/export` | 导出快照（返回 gzip tar） |
+| `GET /v1/libraries/{library_id}/documents` | 列出文档元数据（按入库时间升序） |
 | `POST /v1/libraries/{library_id}/documents` | 提交文档（`{"documents":[{"filename","content","title"}]}`，一篇或多篇；同名异内容 409） |
 | `GET /v1/libraries/{library_id}/jobs/{job_id}` | 摄入任务状态 |
 | `POST /v1/libraries/{library_id}/query` | 自然语言查询（`{"prompt","session_id"?}`；省略 `session_id` 创建会话，传入该库此前成功查询返回的 id 可复用会话） |

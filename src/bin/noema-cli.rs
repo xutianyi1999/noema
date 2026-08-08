@@ -13,7 +13,7 @@
 
 use std::{
     io::{self, BufWriter, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::ExitCode,
 };
 
@@ -22,7 +22,7 @@ use comfy_table::{Attribute, Cell, Color, Table, presets::UTF8_FULL};
 use noema::models::DocumentInput;
 use noema::style::{BOLD, DIM, GREEN, RED, YELLOW, paint, stderr, stdout};
 use percent_encoding::{NON_ALPHANUMERIC, utf8_percent_encode};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
@@ -42,7 +42,7 @@ struct Cli {
     /// 服务鉴权令牌（服务以 --auth-token 启用鉴权时必须；每个请求携带 Authorization: Bearer <token>）
     #[arg(long, global = true, env = "NOEMA_AUTH_TOKEN")]
     auth_token: Option<String>,
-    /// 为自动化 Skill 输出机器可解析的 JSON（摄入和作业状态命令）。
+    /// 为自动化 Skill 输出机器可解析的 JSON（文档列表、摄入和作业状态命令）。
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -63,6 +63,11 @@ enum Command {
     },
     /// 列出所有内容库
     List,
+    /// 列出一个内容库中所有已存储文档的元数据
+    Documents {
+        /// 内容库 id，或唯一的内容库名称
+        library: String,
+    },
     /// 导出内容库：服务端生成快照，下载到本地文件
     Export {
         /// 内容库 id，或唯一的内容库名称
@@ -93,6 +98,16 @@ enum Command {
         #[arg(long)]
         title: Option<String>,
     },
+    /// 下载一个已存储文档的完整原文
+    Download {
+        /// 内容库 id，或唯一的内容库名称
+        library: String,
+        /// 文档入库时的文件名（由 `documents` 列出）
+        filename: String,
+        /// 本地输出路径（默认当前目录下的原文件名）
+        #[arg(short, long, value_name = "FILE")]
+        output: Option<PathBuf>,
+    },
     /// 查询摄入任务状态
     Job {
         /// 内容库 id，或唯一的内容库名称
@@ -113,6 +128,16 @@ enum Command {
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug, Deserialize, Serialize)]
+struct DocumentListItem {
+    id: String,
+    filename: String,
+    title: String,
+    path: String,
+    sha256: String,
+    created_at: String,
+}
 
 struct CountingWriter {
     bytes: u64,
@@ -223,6 +248,7 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
             cmd_create(&client, &base, name, description.as_deref()).await
         }
         Command::List => cmd_list(&client, &base).await,
+        Command::Documents { library } => cmd_documents(&client, &base, library, json_output).await,
         Command::Export { library, output } => cmd_export(&client, &base, library, output).await,
         Command::Import {
             archive,
@@ -253,6 +279,11 @@ async fn run(cli: Cli) -> Result<(), BoxError> {
             )
             .await
         }
+        Command::Download {
+            library,
+            filename,
+            output,
+        } => cmd_download(&client, &base, library, filename, output).await,
         Command::Job { library, job_id } => {
             cmd_job(&client, &base, library, job_id, json_output).await
         }
@@ -323,6 +354,47 @@ async fn cmd_list(client: &reqwest::Client, base: &str) -> Result<(), BoxError> 
     Ok(())
 }
 
+async fn cmd_documents(
+    client: &reqwest::Client,
+    base: &str,
+    library: String,
+    json_output: bool,
+) -> Result<(), BoxError> {
+    let response = send(client.get(format!(
+        "{base}/v1/libraries/{}/documents",
+        encode(&library)
+    )))
+    .await?;
+    let documents = response.json::<Vec<DocumentListItem>>().await?;
+    if json_output {
+        serde_json::to_writer(stdout(), &documents)?;
+        let _ = writeln!(stdout());
+        return Ok(());
+    }
+    if documents.is_empty() {
+        let _ = writeln!(stdout(), "{}  内容库={library}", paint(DIM, "（暂无文档）"));
+        return Ok(());
+    }
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        Cell::new("文件名").add_attribute(Attribute::Bold),
+        Cell::new("标题").add_attribute(Attribute::Bold),
+        Cell::new("路径").add_attribute(Attribute::Bold),
+        Cell::new("入库时间").add_attribute(Attribute::Bold),
+    ]);
+    for document in documents {
+        table.add_row([
+            document.filename,
+            document.title,
+            document.path,
+            document.created_at,
+        ]);
+    }
+    let _ = writeln!(stdout(), "{table}");
+    Ok(())
+}
+
 async fn cmd_export(
     client: &reqwest::Client,
     base: &str,
@@ -330,14 +402,48 @@ async fn cmd_export(
     output: Option<PathBuf>,
 ) -> Result<(), BoxError> {
     let url = format!("{base}/v1/libraries/{}/export", encode(&library));
-    let mut response = send(client.get(url)).await?;
+    let response = send(client.get(url)).await?;
     let output = output
         .unwrap_or_else(|| PathBuf::from(format!("{}.tar.gz", library.replace(['/', '\\'], "-"))));
-    // Download into a sibling `.part` file and rename it into place only
-    // once the whole archive has arrived: a download that fails mid-stream
-    // must not leave a truncated archive at the destination nor destroy
-    // whatever was there before.
-    let mut part = output.clone().into_os_string();
+    let bytes = download_to_file(response, &output).await?;
+    let _ = writeln!(
+        stdout(),
+        "{} {library} → {}（{bytes} 字节）",
+        paint(GREEN, "✔ 已导出"),
+        output.display()
+    );
+    Ok(())
+}
+
+async fn cmd_download(
+    client: &reqwest::Client,
+    base: &str,
+    library: String,
+    filename: String,
+    output: Option<PathBuf>,
+) -> Result<(), BoxError> {
+    let response = send(client.get(format!(
+        "{base}/v1/libraries/{}/files/raw/{}",
+        encode(&library),
+        encode(&filename)
+    )))
+    .await?;
+    let output = output.unwrap_or_else(|| PathBuf::from(&filename));
+    let bytes = download_to_file(response, &output).await?;
+    let _ = writeln!(
+        stdout(),
+        "{} {filename} → {}（{bytes} 字节）",
+        paint(GREEN, "✔ 已下载"),
+        output.display()
+    );
+    Ok(())
+}
+
+/// Download into a sibling `.part` file and rename it into place only once
+/// the complete response has arrived, so an interrupted transfer cannot
+/// leave a truncated result or destroy an existing local file.
+async fn download_to_file(mut response: reqwest::Response, output: &Path) -> Result<u64, BoxError> {
+    let mut part = output.as_os_str().to_os_string();
     part.push(".part");
     let part = PathBuf::from(part);
     let mut file = tokio::fs::File::create(&part).await?;
@@ -348,14 +454,8 @@ async fn cmd_export(
         let _ = tokio::fs::remove_file(&part).await;
         return Err(error);
     }
-    tokio::fs::rename(&part, &output).await?;
-    let _ = writeln!(
-        stdout(),
-        "{} {library} → {}（{bytes} 字节）",
-        paint(GREEN, "✔ 已导出"),
-        output.display()
-    );
-    Ok(())
+    tokio::fs::rename(&part, output).await?;
+    Ok(bytes)
 }
 
 async fn copy_chunks(

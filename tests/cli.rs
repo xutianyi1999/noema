@@ -137,6 +137,38 @@ fn cli_drives_the_http_api_through_an_export_import_round_trip() {
     assert!(ok);
     assert!(stdout.contains(&library_id), "{stdout}");
 
+    // Seed a stored source directly so this CLI integration test remains
+    // offline: submission would intentionally start a real Agent session.
+    const SOURCE: &str = "# Source\n\n完整的原文内容。\n";
+    fs::write(root.join("raw/source.md"), SOURCE).unwrap();
+    let connection = rusqlite::Connection::open(root.join("library.sqlite")).unwrap();
+    connection
+        .execute(
+            "INSERT INTO documents (id, filename, title, path, sha256, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "source-document",
+                "source.md",
+                "Source",
+                "raw/source.md",
+                "test-source-sha256",
+                "2026-08-08T00:00:00Z",
+            ],
+        )
+        .unwrap();
+
+    let (ok, stdout, stderr) = run(client(&server.base).args(["--json", "documents", "法规库"]));
+    assert!(ok, "{stderr}");
+    let documents: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(documents[0]["filename"], "source.md");
+
+    let downloaded = workspace.path().join("downloaded.md");
+    let (ok, _, stderr) = run(client(&server.base)
+        .args(["download", "法规库", "source.md", "--output"])
+        .arg(&downloaded));
+    assert!(ok, "{stderr}");
+    assert_eq!(fs::read_to_string(downloaded).unwrap(), SOURCE);
+
     // Export by unique name; the snapshot is downloaded to a local file.
     let archive = workspace.path().join("snap.tar.gz");
     let (ok, _, stderr) = run(client(&server.base)

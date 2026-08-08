@@ -1,6 +1,6 @@
 ---
 name: noema-cli
-description: 使用 noema-cli 管理和操作 Noema 内容库：检查服务、创建和列出内容库、导入导出快照、从本地 Markdown/TXT 文件摄入、轮询摄入作业，以及查询内容库。处理法规或任务 workspace 中的文件并写入 Noema 时必须使用此 Skill；文件正文不能通过 MCP 工具或命令行参数传递。
+description: 使用 noema-cli 管理和操作 Noema 内容库：检查服务、创建和列出内容库、列出和下载原文文档、导入导出快照、从本地 Markdown/TXT 文件摄入、轮询摄入作业，以及查询内容库。处理法规或任务 workspace 中的文件并写入 Noema 时必须使用此 Skill；文件正文不能通过 MCP 工具或命令行参数传递。
 ---
 
 # Noema CLI
@@ -8,7 +8,7 @@ description: 使用 noema-cli 管理和操作 Noema 内容库：检查服务、�
 使用 `noema-cli` 操作 Noema HTTP 服务。默认服务地址是
 `http://127.0.0.1:8787`；受鉴权保护的服务从 `NOEMA_AUTH_TOKEN` 读取令牌。
 需要连接其他服务时传 `--server <URL>`，也可由 `NOEMA_SERVER` 配置。不要把令牌
-写入命令历史。`--json` 仅为 `submit` 和 `job` 提供机器可解析输出。
+写入命令历史。`--json` 为 `documents`、`submit` 和 `job` 提供机器可解析输出。
 
 ## 基本操作
 
@@ -20,6 +20,16 @@ noema-cli list
 
 `create` 只用于新内容库。若调用方需要“存在则复用”，先用 `list` 明确确认，
 不要把 `create` 的冲突当作可忽略错误。
+
+## 原文文档
+
+```bash
+noema-cli --json documents <library>
+noema-cli download <library> <filename> --output <local-file.md>
+```
+
+`documents` 列出已入库的文档元数据；使用其返回的 `filename` 作为 `download`
+参数。`download` 读取并完整保存该文档的 `raw/` 原文，不创建摄入或维护作业。
 
 ## 快照
 
