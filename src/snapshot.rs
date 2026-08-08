@@ -110,13 +110,46 @@ pub fn import_library(
     name: Option<&str>,
     description: Option<&str>,
     data_dir: &Path,
+    replace: bool,
 ) -> Result<Library, AppError> {
     let storage = Storage::open(data_dir)?;
     // The scratch tree is removed by TempDir's Drop on every exit path.
     let scratch = tempfile::Builder::new()
         .prefix("import-")
         .tempdir_in(data_dir.join("jobs"))?;
-    import_inner(&storage, archive_path, name, description, scratch.path())
+    if replace {
+        replace_library(&storage, archive_path, name, description, scratch.path())
+    } else {
+        import_inner(&storage, archive_path, name, description, scratch.path())
+    }
+}
+
+fn replace_library(
+    storage: &Storage,
+    archive_path: &Path,
+    name: Option<&str>,
+    description: Option<&str>,
+    scratch: &Path,
+) -> Result<Library, AppError> {
+    let target_name = name.ok_or_else(|| {
+        AppError::BadRequest("snapshot replacement requires a target library name".into())
+    })?;
+    let target = storage.resolve_library(target_name)?;
+    let temporary_name = format!("replace-{}", uuid::Uuid::new_v4().simple());
+    let replacement = import_inner(
+        storage,
+        archive_path,
+        Some(&temporary_name),
+        description,
+        scratch,
+    )?;
+    match storage.replace_library_contents(&target.id, &replacement.id) {
+        Ok(library) => Ok(library),
+        Err(error) => {
+            let _ = storage.discard_library(&replacement.id);
+            Err(error)
+        }
+    }
 }
 
 fn import_inner(
@@ -481,7 +514,8 @@ mod tests {
         let archive = source_dir.path().join("snap.tar.gz");
         export_library(source_dir.path(), &library.id, &archive).unwrap();
 
-        let imported = import_library(&archive, Some("副本"), None, target_dir.path()).unwrap();
+        let imported =
+            import_library(&archive, Some("副本"), None, target_dir.path(), false).unwrap();
         assert_ne!(imported.id, library.id);
         assert!(
             imported
@@ -513,6 +547,52 @@ mod tests {
         let skill =
             fs::read_to_string(imported_root.join(".opencode/skills/kb-query/SKILL.md")).unwrap();
         assert!(skill.contains("noema-answer"));
+    }
+
+    #[test]
+    fn replace_import_keeps_the_target_identity_after_the_snapshot_is_ready() {
+        let workspace = tempfile::tempdir().unwrap();
+        let storage = Storage::open(workspace.path()).unwrap();
+        let target = storage
+            .create_library(&CreateLibraryRequest {
+                name: "法规库".into(),
+                description: Some("待替换".into()),
+            })
+            .unwrap();
+        fs::write(Path::new(&target.root).join("raw/old.md"), "旧内容").unwrap();
+
+        let source = storage
+            .create_library(&CreateLibraryRequest {
+                name: "备份源".into(),
+                description: Some("备份内容".into()),
+            })
+            .unwrap();
+        fs::write(
+            Path::new(&source.root).join("raw/restored.md"),
+            "恢复后的内容",
+        )
+        .unwrap();
+        let archive = workspace.path().join("backup.tar.gz");
+        export_library(workspace.path(), &source.id, &archive).unwrap();
+
+        let replaced =
+            import_library(&archive, Some(&target.name), None, workspace.path(), true).unwrap();
+        assert_eq!(replaced.id, target.id);
+        assert_eq!(replaced.name, target.name);
+        assert_eq!(replaced.description.as_deref(), Some("备份内容"));
+        let root = PathBuf::from(&replaced.root);
+        assert_eq!(
+            fs::read_to_string(root.join("raw/restored.md")).unwrap(),
+            "恢复后的内容"
+        );
+        assert!(!root.join("raw/old.md").exists());
+        assert!(
+            storage
+                .list_libraries()
+                .unwrap()
+                .iter()
+                .all(|library| !library.id.starts_with("replace-"))
+        );
     }
 
     /// The `tar` crate's own builder refuses `..` paths, but archives from
@@ -592,7 +672,7 @@ mod tests {
             archive.into_inner().unwrap().finish().unwrap();
         }
         let data_dir = workspace.path().join("data");
-        let error = import_library(&archive_path, None, None, &data_dir).unwrap_err();
+        let error = import_library(&archive_path, None, None, &data_dir, false).unwrap_err();
         assert!(error.to_string().contains("not allowed"), "{error}");
         // A rejected import leaves no library row behind.
         let storage = Storage::open(&data_dir).unwrap();
@@ -623,7 +703,7 @@ mod tests {
             archive.into_inner().unwrap().finish().unwrap();
         }
         let data_dir = workspace.path().join("data");
-        let error = import_library(&archive_path, None, None, &data_dir).unwrap_err();
+        let error = import_library(&archive_path, None, None, &data_dir, false).unwrap_err();
         assert!(error.to_string().contains("UTF-8"), "{error}");
         let storage = Storage::open(&data_dir).unwrap();
         assert!(storage.list_libraries().unwrap().is_empty());
@@ -652,7 +732,7 @@ mod tests {
             archive.into_inner().unwrap().finish().unwrap();
         }
         let data_dir = workspace.path().join("data");
-        let imported = import_library(&archive_path, None, None, &data_dir).unwrap();
+        let imported = import_library(&archive_path, None, None, &data_dir, false).unwrap();
         let imported_root = PathBuf::from(&imported.root);
         assert!(!imported_root.join(SNAPSHOT_MANIFEST).exists());
         assert!(imported_root.join("raw/a.md").is_file());

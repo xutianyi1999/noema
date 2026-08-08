@@ -30,7 +30,6 @@ use crate::{
     },
     runtime::OpenCodeRuntime,
     service::AppService,
-    snapshot,
     storage::DocumentRecord,
 };
 
@@ -170,14 +169,7 @@ async fn export_library<R: OpenCodeRuntime>(
     State(service): State<AppService<R>>,
     Path(library_id): Path<String>,
 ) -> Result<Response, AppError> {
-    let data_dir = service.data_dir().to_path_buf();
-    let (library, temp) = tokio::task::spawn_blocking(move || {
-        let temp = tempfile::NamedTempFile::new()?;
-        let library = snapshot::export_library(&data_dir, &library_id, temp.path())?;
-        Ok::<_, AppError>((library, temp))
-    })
-    .await
-    .map_err(|error| AppError::Storage(format!("export task aborted: {error}")))??;
+    let (library, temp) = service.export_snapshot(&library_id).await?;
     let (archive, temp_path) = temp.into_parts();
     let length = archive.metadata()?.len();
     let body = SnapshotBody {
@@ -210,6 +202,8 @@ async fn export_library<R: OpenCodeRuntime>(
 struct ImportQuery {
     name: Option<String>,
     description: Option<String>,
+    #[serde(default)]
+    replace: bool,
 }
 
 /// Upper bound for one snapshot upload. Snapshots are libraries of plain
@@ -225,9 +219,9 @@ pub const MAX_DOCUMENT_JSON_BODY: usize = 1024 * 1024 * 1024;
 /// than files and must stay small enough to keep the model context bounded.
 const MAX_QUERY_JSON_BODY: usize = 256 * 1024;
 
-/// Import a snapshot archive (request body) as a brand-new, fully isolated
-/// library. Same semantics as `noema-cli import`: always a fresh library,
-/// full rollback on failure, hostile archives rejected.
+/// Import a snapshot archive (request body). By default this creates a fresh
+/// library like `noema-cli import`; `replace=true` replaces the named idle
+/// library only after the archive has been fully validated and repaired.
 async fn import_library<R: OpenCodeRuntime>(
     State(service): State<AppService<R>>,
     Query(query): Query<ImportQuery>,
@@ -256,18 +250,23 @@ async fn import_library<R: OpenCodeRuntime>(
         )));
     }
 
-    let data_dir = service.data_dir().to_path_buf();
-    let imported = tokio::task::spawn_blocking(move || {
-        snapshot::import_library(
-            temp.path(),
-            query.name.as_deref(),
-            query.description.as_deref(),
-            &data_dir,
+    let replaces_existing = query.replace;
+    let imported = service
+        .import_snapshot(
+            temp.path().to_path_buf(),
+            query.name,
+            query.description,
+            replaces_existing,
         )
-    })
-    .await
-    .map_err(|error| AppError::Storage(format!("import task aborted: {error}")))??;
-    Ok((StatusCode::CREATED, Json(imported)))
+        .await?;
+    Ok((
+        if replaces_existing {
+            StatusCode::OK
+        } else {
+            StatusCode::CREATED
+        },
+        Json(imported),
+    ))
 }
 
 /// The one submission route, for one document or many: every document in

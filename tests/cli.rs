@@ -179,7 +179,7 @@ fn cli_drives_the_http_api_through_an_export_import_round_trip() {
     let bytes = fs::read(&archive).unwrap();
     assert_eq!(&bytes[..2], &[0x1f, 0x8b], "export must be gzip");
 
-    // Import travels back over HTTP and always creates a fresh library.
+    // Import travels back over HTTP and creates a fresh library by default.
     let (ok, stdout, stderr) = run(client(&server.base)
         .arg("import")
         .arg(&archive)

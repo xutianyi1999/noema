@@ -620,6 +620,69 @@ async fn knowledge_files_are_served_with_safety_checks() {
 }
 
 #[tokio::test]
+async fn snapshot_http_replace_preserves_the_target_library_identity() {
+    let (_tempdir, service, _runtime) = service_fixture().await;
+    let target = service
+        .create_library(CreateLibraryRequest {
+            name: "target".into(),
+            description: Some("old".into()),
+        })
+        .await
+        .unwrap();
+    fs::write(PathBuf::from(&target.root).join("raw/old.md"), "old source").unwrap();
+    let source = service
+        .create_library(CreateLibraryRequest {
+            name: "source".into(),
+            description: Some("restored".into()),
+        })
+        .await
+        .unwrap();
+    fs::write(
+        PathBuf::from(&source.root).join("raw/restored.md"),
+        "restored source",
+    )
+    .unwrap();
+
+    let app = http_api::router(service.clone());
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/v1/libraries/source/export")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let archive = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/libraries/import?name=target&replace=true")
+                .header(header::CONTENT_TYPE, "application/gzip")
+                .body(Body::from(archive))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+    let replaced: Library = serde_json::from_slice(&body).unwrap();
+    assert_eq!(replaced.id, target.id);
+    assert_eq!(replaced.name, target.name);
+    assert_eq!(replaced.description.as_deref(), Some("restored"));
+    let root = PathBuf::from(&replaced.root);
+    assert_eq!(
+        fs::read_to_string(root.join("raw/restored.md")).unwrap(),
+        "restored source"
+    );
+    assert!(!root.join("raw/old.md").exists());
+}
+
+#[tokio::test]
 async fn http_and_streamable_http_mcp_are_mounted() {
     let (_tempdir, service, _runtime) = service_fixture().await;
     let app = http_api::router(service);

@@ -319,6 +319,135 @@ impl Storage {
         transaction.commit()?;
         Ok(())
     }
+
+    /// Replaces one idle library's content tree with a fully prepared
+    /// temporary library while preserving the target's id and name. The
+    /// replacement must already have passed snapshot validation and repair.
+    pub fn replace_library_contents(
+        &self,
+        target_id: &str,
+        replacement_id: &str,
+    ) -> Result<Library, AppError> {
+        validate_library_id(target_id)?;
+        validate_library_id(replacement_id)?;
+        if target_id == replacement_id {
+            return Err(AppError::BadRequest(
+                "replacement library must differ from the target".into(),
+            ));
+        }
+
+        let mut connection = self.db()?;
+        let target = connection
+            .query_row(
+                "SELECT id, name, description, root, created_at FROM libraries WHERE id = ?1",
+                params![target_id],
+                library_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| AppError::LibraryNotFound(target_id.into()))?;
+        let replacement = connection
+            .query_row(
+                "SELECT id, name, description, root, created_at FROM libraries WHERE id = ?1",
+                params![replacement_id],
+                library_from_row,
+            )
+            .optional()?
+            .ok_or_else(|| AppError::LibraryNotFound(replacement_id.into()))?;
+
+        let has_active_job = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM jobs WHERE library_id = ?1 AND status IN (?2, ?3))",
+            params![target_id, JobState::Queued, JobState::Running],
+            |row| row.get::<_, bool>(0),
+        )?;
+        let has_active_query = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM query_runs WHERE library_id = ?1 AND status = ?2)",
+            params![target_id, JobState::Running],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if has_active_job || has_active_query {
+            return Err(AppError::Conflict(format!(
+                "library {target_id} has an active job or query"
+            )));
+        }
+
+        let target_root =
+            canonicalize_library_path(&self.root.join("libraries").join(&target.id), &target.id)?;
+        if target_root != canonicalize_library_path(Path::new(&target.root), &target.id)? {
+            return Err(AppError::Storage(format!(
+                "library root is outside its registered content-library path: {target_id}"
+            )));
+        }
+        let replacement_root = canonicalize_library_path(
+            &self.root.join("libraries").join(&replacement.id),
+            &replacement.id,
+        )?;
+        if replacement_root
+            != canonicalize_library_path(Path::new(&replacement.root), &replacement.id)?
+        {
+            return Err(AppError::Storage(format!(
+                "library root is outside its registered content-library path: {replacement_id}"
+            )));
+        }
+
+        let backup = self
+            .root
+            .join("jobs")
+            .join(format!("replace-backup-{}", Uuid::new_v4().simple()));
+        fs::rename(&target_root, &backup)?;
+        if let Err(error) = fs::rename(&replacement_root, &target_root) {
+            let restore = fs::rename(&backup, &target_root);
+            return match restore {
+                Ok(()) => Err(error.into()),
+                Err(restore_error) => Err(AppError::Storage(format!(
+                    "replacement failed: {error}; restoring original library failed: {restore_error}"
+                ))),
+            };
+        }
+
+        let description = replacement.description.clone();
+        let cleanup = (|| -> Result<(), AppError> {
+            let transaction = connection.transaction()?;
+            transaction.execute("DELETE FROM jobs WHERE library_id = ?1", params![target_id])?;
+            transaction.execute(
+                "DELETE FROM query_runs WHERE library_id = ?1",
+                params![target_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM jobs WHERE library_id = ?1",
+                params![replacement_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM query_runs WHERE library_id = ?1",
+                params![replacement_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM libraries WHERE id = ?1",
+                params![replacement_id],
+            )?;
+            transaction.execute(
+                "UPDATE libraries SET description = ?1 WHERE id = ?2",
+                params![description, target_id],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        if let Err(error) = cleanup {
+            let restore_replacement = fs::rename(&target_root, &replacement_root);
+            let restore_target = fs::rename(&backup, &target_root);
+            return match (restore_replacement, restore_target) {
+                (Ok(()), Ok(())) => Err(error),
+                (replacement_error, target_error) => Err(AppError::Storage(format!(
+                    "replacement database update failed: {error}; rollback failed: replacement={replacement_error:?}, target={target_error:?}"
+                ))),
+            };
+        }
+        let _ = fs::remove_dir_all(backup);
+
+        Ok(Library {
+            description,
+            ..target
+        })
+    }
 }
 
 fn library_name_conflict(name: &str) -> AppError {

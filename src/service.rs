@@ -4,7 +4,7 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use tokio::sync::Semaphore;
+use tokio::sync::{RwLock, Semaphore};
 use unicode_normalization::UnicodeNormalization;
 
 use crate::{
@@ -28,6 +28,9 @@ pub struct AppService<R: OpenCodeRuntime> {
     /// graph wholesale, so same-library ingests must not overlap. Queued
     /// jobs wait on their library's lock and stay `queued` meanwhile.
     ingest_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Shared for every library operation; snapshot replacement takes the
+    /// write side so it cannot interleave with ingestion or queries.
+    library_locks: Arc<Mutex<HashMap<String, Arc<RwLock<()>>>>>,
     /// A reused OpenCode session has one event stream, so turns on that
     /// session must not overlap. Weak entries disappear once no turn holds
     /// the lock, avoiding a permanently growing map of client session ids.
@@ -48,6 +51,7 @@ impl<R: OpenCodeRuntime> Clone for AppService<R> {
             config: self.config.clone(),
             runtime: self.runtime.clone(),
             ingest_locks: self.ingest_locks.clone(),
+            library_locks: self.library_locks.clone(),
             query_session_locks: self.query_session_locks.clone(),
             sessions: self.sessions.clone(),
         }
@@ -80,6 +84,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             config,
             runtime,
             ingest_locks: Arc::new(Mutex::new(HashMap::new())),
+            library_locks: Arc::new(Mutex::new(HashMap::new())),
             query_session_locks: Arc::new(Mutex::new(HashMap::new())),
             sessions,
         };
@@ -119,6 +124,15 @@ impl<R: OpenCodeRuntime> AppService<R> {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .entry(library_id.to_string())
             .or_default()
+            .clone()
+    }
+
+    fn library_lock(&self, library_id: &str) -> Arc<RwLock<()>> {
+        self.library_locks
+            .lock()
+            .expect("library lock map poisoned")
+            .entry(library_id.to_owned())
+            .or_insert_with(|| Arc::new(RwLock::new(())))
             .clone()
     }
 
@@ -239,6 +253,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             }
         }
         let library_id = self.storage.resolve_library(library)?.id;
+        let _library_guard = self.library_lock(&library_id).read_owned().await;
         // Normalization within one submission: the NFC-normalized filename
         // is the identity (same as store_document). A repeated name with
         // identical content collapses to one entry; different content is a
@@ -339,6 +354,71 @@ impl<R: OpenCodeRuntime> AppService<R> {
         })
     }
 
+    /// Imports a snapshot archive through the same service boundary as every
+    /// other library operation. A replacement takes the exclusive library
+    /// lock, so no ingest, maintenance run or query can observe a half-swapped
+    /// tree. Normal imports remain independent new-library creation.
+    pub async fn import_snapshot(
+        &self,
+        archive: PathBuf,
+        name: Option<String>,
+        description: Option<String>,
+        replace: bool,
+    ) -> Result<Library, AppError> {
+        if !replace {
+            let data_dir = self.storage.root().to_path_buf();
+            return tokio::task::spawn_blocking(move || {
+                crate::snapshot::import_library(
+                    &archive,
+                    name.as_deref(),
+                    description.as_deref(),
+                    &data_dir,
+                    false,
+                )
+            })
+            .await
+            .map_err(|error| AppError::Storage(format!("import task aborted: {error}")))?;
+        }
+
+        let target_name = name.as_deref().ok_or_else(|| {
+            AppError::BadRequest("snapshot replacement requires a target library name".into())
+        })?;
+        let target_id = self.storage.resolve_library(target_name)?.id;
+        let _library_guard = self.library_lock(&target_id).write_owned().await;
+        let data_dir = self.storage.root().to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::snapshot::import_library(
+                &archive,
+                Some(&target_id),
+                description.as_deref(),
+                &data_dir,
+                true,
+            )
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("import task aborted: {error}")))?
+    }
+
+    /// Exports a stable archive while holding the library's shared lock, so
+    /// snapshot replacement cannot move its tree during the copy.
+    pub async fn export_snapshot(
+        &self,
+        library: &str,
+    ) -> Result<(Library, tempfile::NamedTempFile), AppError> {
+        let library = self.storage.resolve_library(library)?;
+        let _library_guard = self.library_lock(&library.id).read_owned().await;
+        let data_dir = self.storage.root().to_path_buf();
+        let library_id = library.id.clone();
+        let temp = tokio::task::spawn_blocking(move || {
+            let temp = tempfile::NamedTempFile::new()?;
+            crate::snapshot::export_library(&data_dir, &library_id, temp.path())?;
+            Ok::<_, AppError>(temp)
+        })
+        .await
+        .map_err(|error| AppError::Storage(format!("export task aborted: {error}")))??;
+        Ok((library, temp))
+    }
+
     /// `library` accepts an exact id or a unique library name.
     pub fn job_status(&self, library: &str, job_id: &str) -> Result<JobStatus, AppError> {
         let library_id = self.storage.resolve_library(library)?.id;
@@ -365,6 +445,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
         filename: &str,
     ) -> Result<DeleteDocumentResponse, AppError> {
         let library_id = self.storage.resolve_library(library)?.id;
+        let _library_guard = self.library_lock(&library_id).read_owned().await;
         // Durable delete (row + raw file). Not gated by the ingest lock, the
         // same as store_document: staging copies take the tree as they find
         // it, and the maintenance job below serializes via the lock.
@@ -403,6 +484,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
             return Err(AppError::BadRequest("prompt cannot be empty".into()));
         }
         let library_id = self.storage.resolve_library(library)?.id;
+        let _library_guard = self.library_lock(&library_id).read_owned().await;
         let root = self.storage.library_root(&library_id)?;
         let session_id = match session_id {
             Some(session_id) => {
@@ -547,6 +629,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
         // staging only then, the incremental check below sees the
         // predecessor's graph and takes the --update path. Ingests on
         // different libraries never contend here.
+        let _library_guard = self.library_lock(library_id).read_owned().await;
         let _ingest_guard = self.ingest_lock(library_id).lock_owned().await;
         // Global admission control: bound how many OpenCode sessions run
         // at once across all libraries.
@@ -677,6 +760,7 @@ impl<R: OpenCodeRuntime> AppService<R> {
         job_id: &str,
         deleted_path: &str,
     ) -> Result<(), AppError> {
+        let _library_guard = self.library_lock(library_id).read_owned().await;
         let _ingest_guard = self.ingest_lock(library_id).lock_owned().await;
         let _session_permit = self
             .sessions
