@@ -330,7 +330,7 @@ async fn library_ingestion_query_and_session_isolation_work() {
         .collect::<Vec<_>>();
     assert_eq!(ingestion_prompts.len(), 2);
     assert!(ingestion_prompts[0].contains("/graphify staging/"));
-    assert!(ingestion_prompts[0].contains("完整首次建图流程"));
+    assert!(!ingestion_prompts[0].contains("--update"));
     assert!(ingestion_prompts[1].contains("/graphify staging/"));
     assert!(ingestion_prompts[1].contains("--update"));
     assert!(requests.len() >= 5);
@@ -516,7 +516,7 @@ async fn concurrent_submissions_to_one_library_are_serialized() {
     if second_status.status == JobState::Completed {
         assert_eq!(prompts.len(), 2, "{prompts:?}");
         assert!(prompts[0].contains("/graphify staging/"));
-        assert!(prompts[0].contains("完整首次建图流程"));
+        assert!(!prompts[0].contains("--update"));
         assert!(prompts[1].contains("/graphify staging/"));
         assert!(prompts[1].contains("--update"));
     } else {
@@ -1017,11 +1017,11 @@ async fn a_batch_of_documents_is_compiled_in_one_ingestion_job() {
         .map(|request| request.prompt.clone())
         .collect();
     assert_eq!(prompts.len(), 1, "{prompts:?}");
-    assert!(prompts[0].contains("依次阅读以下源文档"), "{}", prompts[0]);
+    assert!(prompts[0].contains("阅读以下源文档"), "{}", prompts[0]);
     for path in ["raw/a.md", "raw/b.md", "raw/c.md"] {
         assert!(prompts[0].contains(path), "{}", prompts[0]);
     }
-    assert!(prompts[0].contains("合并为一个节点"), "{}", prompts[0]);
+    assert!(prompts[0].contains("合并来源"), "{}", prompts[0]);
 
     let root = service.storage.library_root(&library.id).unwrap();
     let node = fs::read_to_string(root.join("wiki/session-context.md")).unwrap();

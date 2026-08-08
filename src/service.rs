@@ -804,13 +804,9 @@ fn format_ingest_task(
 ) -> String {
     let workspace = format!("staging/{job_id}");
     let graphify_step = if incremental {
-        format!(
-            "任务工作区 `{workspace}` 已有 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify {workspace} --update`。这是上游 Skill 的文档/文本增量流程；绝不能执行 `/graphify .`，也不要替换成裸 `graphify update .`，后者主要只更新代码 AST。"
-        )
+        format!("运行 `/graphify {workspace} --update`。")
     } else {
-        format!(
-            "任务工作区 `{workspace}` 尚无 graphify-out/graph.json，因此必须调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify {workspace}` 完整首次建图流程；绝不能执行 `/graphify .`。"
-        )
+        format!("运行 `/graphify {workspace}`。")
     };
     let extras_step = if extras.is_empty() {
         String::new()
@@ -820,28 +816,22 @@ fn format_ingest_task(
             .map(|path| format!("{workspace}/{path}"))
             .collect::<Vec<_>>()
             .join("、");
-        format!(
-            "此外，以下源文档已入库但尚无任何 wiki 节点引用（此前的摄入在落盘前失败）：{}。请将它们与本源文档一视同仁地编译为 wiki 节点并登记 index.md。\n\n",
-            extras
-        )
+        format!("同时编译此前未完成的源文档：{extras}。\n\n")
     };
     let source_paths = source_paths
         .iter()
         .map(|path| format!("{workspace}/{path}"))
         .collect::<Vec<_>>();
     let reading_step = if source_paths.len() == 1 {
-        format!(
-            "再阅读源文档 {}；节点落盘后同步更新 index.md。",
-            source_paths[0]
-        )
+        format!("阅读源文档 {}。", source_paths[0])
     } else {
         format!(
-            "再依次阅读以下源文档：{}；多个文档中描述同一概念的内容合并为一个节点，并在该节点的 sources 中列出全部来源。节点落盘后同步更新 index.md。",
+            "阅读以下源文档：{}。多个文档描述同一概念时合并来源。",
             source_paths.join("、")
         )
     };
     format!(
-        "摄入任务 {job_id}。当前 OpenCode 工作目录是内容库根目录；本作业唯一可读写的工作区是 `{workspace}`。先阅读 `{workspace}/purpose.md` 和 `{workspace}/schema.md`，{reading_step}工作区的 `.graphifyignore` 已将 graphify 输入限定为其 `raw/` 与 `wiki/` 下的 Markdown/TXT。\n\n{extras_step}{graphify_step} 让它只在 `{workspace}` 内生成或更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
+        "## 摄入任务 {job_id}\n\n工作区：`{workspace}`。阅读 `{workspace}/purpose.md`、`{workspace}/schema.md`，然后{reading_step}\n\n{extras_step}{graphify_step}\n"
     )
 }
 
@@ -853,7 +843,7 @@ fn format_maintain_task(deleted_path: &str, job_id: &str) -> String {
     let workspace = format!("staging/{job_id}");
     let deleted_path = format!("{workspace}/{deleted_path}");
     format!(
-        "维护任务 {job_id}。当前 OpenCode 工作目录是内容库根目录；本作业唯一可读写的工作区是 `{workspace}`。源文档 {deleted_path} 已在该工作区中删除。先阅读 `{workspace}/purpose.md` 和 `{workspace}/schema.md`，然后调用 OpenCode 的 `skill` 工具加载 kb-maintain Skill，只在 `{workspace}/wiki/` 中与该删除重新对齐：仅由该源支撑的节点予以删除，其他资料共同贡献的共享节点保留并更新其 sources 与 relations，清理失效的来源引用，矛盾移入 `{workspace}/reviews/`；节点落盘后同步更新 `{workspace}/index.md`。\n\n随后调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，并严格执行 `/graphify {workspace} --update`，让它只在 `{workspace}` 内更新标准的 `graphify-out/graph.json`、`GRAPH_REPORT.md` 和 HTML 等产物；如果增量流程因节点减少被收缩保护拒绝，这属于有意的删除，改用 `/graphify {workspace} --force` 完整重建。不要执行 `/graphify .` 或裸 `graphify update .`。语义抽取使用当前 OpenCode Agent 能力；不要改用需要外部 API key 的 headless `graphify extract`。\n"
+        "## 维护任务 {job_id}\n\n工作区：`{workspace}`。已删除 `{deleted_path}`。阅读 `{workspace}/purpose.md` 和 `{workspace}/schema.md` 后按 `kb-maintain` Skill 对齐知识产物。\n\n运行 `/graphify {workspace} --update`；若删除导致增量更新被收缩保护拒绝，运行 `/graphify {workspace} --force`。\n"
     )
 }
 
@@ -934,13 +924,8 @@ mod tests {
     #[test]
     fn format_ingest_task_anchors_graphify_and_files_to_the_job_workspace() {
         let prompt = format_ingest_task(&["raw/a.md".to_string()], "job-1", false, &[]);
-        assert!(
-            prompt.contains("当前 OpenCode 工作目录是内容库根目录"),
-            "{prompt}"
-        );
         assert!(prompt.contains("staging/job-1/raw/a.md"), "{prompt}");
         assert!(prompt.contains("/graphify staging/job-1`"), "{prompt}");
-        assert!(prompt.contains("绝不能执行 `/graphify .`"), "{prompt}");
     }
 
     #[test]
@@ -952,10 +937,10 @@ mod tests {
             &[],
         );
         assert!(
-            prompt.contains("再依次阅读以下源文档：staging/job-2/raw/a.md、staging/job-2/raw/b.md"),
+            prompt.contains("阅读以下源文档：staging/job-2/raw/a.md、staging/job-2/raw/b.md"),
             "{prompt}"
         );
-        assert!(prompt.contains("合并为一个节点"), "{prompt}");
+        assert!(prompt.contains("合并来源"), "{prompt}");
         assert!(
             prompt.contains("/graphify staging/job-2 --update"),
             "{prompt}"
@@ -974,6 +959,5 @@ mod tests {
             prompt.contains("/graphify staging/job-3 --force"),
             "{prompt}"
         );
-        assert!(prompt.contains("不要执行 `/graphify .`"), "{prompt}");
     }
 }

@@ -44,57 +44,27 @@ pub(crate) fn answer_schema_json() -> &'static str {
     SCHEMA_JSON.get_or_init(|| serde_json::to_string(contract_schema()).expect("schema serializes"))
 }
 
-/// A worked contract example, serialized from an [`AgentAnswer`] value
-/// rather than written as JSON by hand: the compiler enforces its shape
-/// against the contract types, so it cannot drift from the schema. Shared
-/// by the generated `AGENTS.md` contract and the kb-query skill.
-pub(crate) fn answer_example_json() -> &'static str {
-    static EXAMPLE: OnceLock<String> = OnceLock::new();
-    EXAMPLE.get_or_init(|| serde_json::to_string(&answer_example()).expect("example serializes"))
-}
-
 /// The full Noema contract, installed into each library's `AGENTS.md` and
 /// thereby injected by OpenCode into the system prompt of every session in
-/// that library — the per-query, per-ingest and per-maintenance user messages
-/// stay free of instruction text. Schema and example are both generated from the
-/// contract types, never hand-written.
+/// that library. It defines session boundaries and the query output contract;
+/// task skills contain the detailed workflows.
 pub(crate) fn agents_contract() -> String {
     format!(
-        "## Noema 服务契约（由服务生成，勿手改）\n\n\
-### 摄入任务（用户消息形如「摄入任务 <job_id>…」）\n\n\
-你是 Noema 的知识编译 Agent。当前目录是内容库根目录；本任务唯一可读写的工作区是用户消息中给出的 `staging/<job_id>/`。该工作区是库根内容的任务副本：在其中阅读 `purpose.md`、`schema.md`、`raw/`，并只在其中更新 `wiki/`、`reviews/`、`index.md` 和 `graphify-out/`。库根的正式 `raw/`、`wiki/`、`reviews/`、`index.md` 与 `graphify-out/` 不得直接修改。写入节点前先调用 OpenCode 的 `skill` 工具加载 knowledge-compiler Skill 并遵循其节点契约；创建节点前检查工作区内已有 wiki 节点，避免重复。创建或更新可追溯的知识节点：frontmatter 恰好包含契约定义的 9 个键，不要添加额外键；正文包含定义、证据/推理、示例或反例、局限性、RAG Version（100–300 字高密度压缩摘要，不是版本变更记录）和引用。sources 的 locator 按来源自身编号标注（如 第三十三条第二款、5.2.1）；法条、合同条款、公文与标准原文等规范文本必须从工作区 `raw/` 原文逐字引用，不得改写，RAG Version 只压缩评述与关系。未解决的冲突、低置信度关系与新旧文本矛盾放入工作区 `reviews/`，用 opposite_to 表达。不要修改工作区内的 raw 原文、.graphifyignore、.opencode、library.sqlite，也不要访问内容库外路径。\n\n\
-### 维护任务（用户消息形如「维护任务 <job_id>…」）\n\n\
-你是 Noema 内容库维护 Agent。当前目录是内容库根目录；本任务唯一可读写的工作区是用户消息中给出的 `staging/<job_id>/`。只在工作区内读取 `purpose.md`、`schema.md` 和知识内容，只在其中更新知识产物；库根正式内容不得直接修改。先调用 OpenCode 的 `skill` 工具加载 kb-maintain Skill 并遵循其维护纪律。不要修改工作区内的 raw 原文、.graphifyignore、.opencode、library.sqlite，也不要访问内容库外路径。\n\n\
-### 查询任务（用户消息为自然语言问题）\n\n\
-你是 Noema 内容库查询 Agent，只能在当前内容库根目录内工作。先阅读 purpose.md 和 schema.md，再阅读 index.md；摘要优先——先读相关 wiki 节点的定义和 RAG Version 压缩摘要，不足时再读完整节点与 raw/ 原文。涉及多节点枚举、跨概念关系或需要先摸清库内相关内容版图的问题，先调用 OpenCode 的 `skill` 工具加载上游 graphify Skill，按其查询流程定位相关节点，再读取命中的文件（图谱只用于导航，不回写结果）；单一概念的定义或单点事实问题直接读文件即可。`staging/` 只属于摄入和维护任务，不是查询来源。不要写入、编辑或删除文件，也不要访问项目外路径。\n\n\
-只依据内容库证据回答，简洁说明推理过程。最终答案用 <noema-answer> 与 </noema-answer> 包裹，标记之间只放一个符合以下 JSON Schema 的 JSON 对象（不要输出 Schema 以外的键）：\n{schema}\n\n\
-字段要求：answer 是答案正文，格式不限（Markdown 或用户要求的任何格式），并为每个事实性结论在句末标注 [n]，n 是该结论引用的来源在 references 数组中的序号（从 1 开始）；references 每项给出 source（raw/ 下的相对路径——引用只能指向 raw/ 原始文档，不得引用 wiki/ 节点；结论若经由 wiki 节点找到，沿其 frontmatter 的 sources 回溯到 raw/ 原文再引用）、quote（从来源文件中逐字复制的引文，不得改写或省略）与 locator（按来源自身编号标注的地址），若能精确计算可附 start/end（quote 在文件中的 Unicode 字符偏移，end 不含）。规范文本（法条、合同条款、公文与标准原文）必须逐字引用；无法在 raw/ 来源中逐字核验的说法不得标注引用。\n\n\
-格式示例（仅作演示，内容勿抄）：\n<noema-answer>\n{example}\n</noema-answer>\n",
-        schema = answer_schema_json(),
-        example = answer_example_json()
-    )
-}
+        r#"## Noema
 
-fn answer_example() -> AgentAnswer {
-    AgentAnswer {
-        answer: "连带责任保证以当事人在保证合同中明确约定为前提[1]。未约定或约定不明的，按一般保证处理[2]。".into(),
-        references: vec![
-            AgentReference {
-                source: "raw/担保法.md".into(),
-                quote: "当事人在保证合同中约定保证人与债务人对债务承担连带责任的，为连带责任保证。".into(),
-                locator: Some("第十八条".into()),
-                start: None,
-                end: None,
-            },
-            AgentReference {
-                source: "raw/担保制度司法解释.md".into(),
-                quote: "当事人在保证合同中约定了保证人在债务人不能履行债务时始承担保证责任的，视为一般保证。".into(),
-                locator: Some("第二十五条".into()),
-                start: Some(2044),
-                end: Some(2086),
-            },
-        ],
-    }
+### 摄入与维护
+
+当前目录是内容库根目录。摄入或维护任务只能修改用户消息给出的 `staging/<job_id>/`；库根内容和工作区外路径不可修改。摄入任务先加载 `kb-ingest` Skill，维护任务先加载 `kb-maintain` Skill。
+
+### 查询
+
+查询只读取当前内容库，先加载 `kb-query` Skill。最终答案只依据库内证据；每个事实性结论以 `[n]` 标记对应的 `references` 条目。引用必须指向 `raw/` 原文，并逐字给出 `quote`。
+
+最终答案用 `<noema-answer>` 与 `</noema-answer>` 包裹；标记之间只放一个符合以下 JSON Schema 的 JSON 对象：
+{schema}
+"#,
+        schema = answer_schema_json()
+    )
 }
 
 fn contract_validator() -> &'static jsonschema::Validator {
@@ -550,31 +520,19 @@ mod tests {
     }
 
     #[test]
-    fn the_generated_example_round_trips_through_the_contract() {
-        // The example shown to the Agent must itself satisfy the contract —
-        // both come from the same Rust types, and this keeps it that way.
-        let parsed = parse_agent_answer(&format!(
-            "<noema-answer>\n{}\n</noema-answer>",
-            answer_example_json()
-        ))
-        .unwrap();
-        assert_eq!(parsed.references.len(), 2);
-        assert_eq!(parsed.references[1].end, Some(2086));
-    }
-
-    #[test]
-    fn the_agents_contract_embeds_the_generated_schema_and_example() {
+    fn the_agents_contract_embeds_the_generated_schema_and_task_skills() {
         let contract = agents_contract();
         assert!(contract.contains("AgentAnswer"), "schema embedded");
-        assert!(contract.contains(answer_example_json()), "example embedded");
         assert!(
             contract.contains("staging/<job_id>"),
             "staging boundary embedded"
         );
+        assert!(contract.contains("kb-ingest"), "ingest skill embedded");
         assert!(
-            contract.contains("### 维护任务"),
-            "maintenance contract embedded"
+            contract.contains("kb-maintain"),
+            "maintenance skill embedded"
         );
+        assert!(contract.contains("kb-query"), "query skill embedded");
     }
 
     #[test]

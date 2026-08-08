@@ -35,9 +35,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
 
 #[tool_router]
 impl<R: OpenCodeRuntime> McpHandler<R> {
-    #[tool(
-        description = "确保指定的内容库已经存在；已存在时直接返回，不会重复创建。该工具不接受文件内容，文档摄入必须使用 noema-cli Skill 和 noema-cli。"
-    )]
+    #[tool(description = "创建指定内容库；已存在时返回现有内容库。")]
     async fn kb_ensure_library(
         &self,
         Parameters(request): Parameters<McpEnsureLibraryRequest>,
@@ -53,9 +51,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
         json_response(&response)
     }
 
-    #[tool(
-        description = "使用自然语言提示词查询一个 Noema 内容库。省略 session_id 时创建会话；传入同一内容库此前成功查询返回的 session_id 时继续该会话。"
-    )]
+    #[tool(description = "使用自然语言查询内容库；可传入 session_id 继续已有会话。")]
     async fn kb_query(
         &self,
         Parameters(request): Parameters<McpQueryRequest>,
@@ -72,9 +68,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
         json_response(&response)
     }
 
-    #[tool(
-        description = "获取一个内容库中的摄入或维护作业状态；文件摄入本身必须由 noema-cli Skill 调用 noema-cli 完成。"
-    )]
+    #[tool(description = "获取内容库摄入或维护作业的状态。")]
     async fn kb_job_status(
         &self,
         Parameters(request): Parameters<McpJobRequest>,
@@ -86,7 +80,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
         json_response(&response)
     }
 
-    #[tool(description = "列出一个内容库中的文档元数据（不返回文件正文，按入库时间升序）。")]
+    #[tool(description = "列出内容库中的文档元数据。")]
     async fn kb_list_documents(
         &self,
         Parameters(request): Parameters<McpListDocumentsRequest>,
@@ -98,9 +92,7 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
         json_response(&response)
     }
 
-    #[tool(
-        description = "从一个内容库中删除一篇文档：同步删除文档记录与 raw/ 源文件，并触发维护作业重新对齐 wiki 节点和图谱。返回维护作业 id，可用 kb_job_status 轮询。filename 必须是该文档入库时的文件名。"
-    )]
+    #[tool(description = "删除一篇文档并创建维护作业。")]
     async fn kb_delete_document(
         &self,
         Parameters(request): Parameters<McpDeleteDocumentRequest>,
@@ -122,15 +114,11 @@ impl<R: OpenCodeRuntime> McpHandler<R> {
 #[tool_handler(router = self.tool_router)]
 impl<R: OpenCodeRuntime> ServerHandler for McpHandler<R> {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(
-                Implementation::new("noema", env!("CARGO_PKG_VERSION"))
-                    .with_title("Noema")
-                    .with_description("由 OpenCode 驱动的文本知识库服务"),
-            )
-            .with_instructions(
-                "每个工具都必须显式传入 library_id；内容库彼此隔离。文件摄入必须使用 noema-cli Skill 调用 noema-cli；MCP 不接受文件内容。kb_list_documents 只返回文档元数据，kb_delete_document 触发维护作业，kb_job_status 用于核验作业终态，kb_query 用于查询知识库。省略 session_id 时，kb_query 创建新的 OpenCode 会话；传入同一内容库此前成功查询的 session_id 时继续该会话。",
-            )
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_server_info(
+            Implementation::new("noema", env!("CARGO_PKG_VERSION"))
+                .with_title("Noema")
+                .with_description("由 OpenCode 驱动的文本知识库服务"),
+        )
     }
 }
 
